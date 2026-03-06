@@ -1,43 +1,68 @@
-use mp4::{Result, TrackType};
 use std::env;
 use std::fs::File;
-use std::io::BufReader;
+use std::process;
 
-fn main() -> Result<()> {
-    let path = env::args().nth(1).expect("Usage: muxl <file.mp4>");
-    let f = File::open(&path).unwrap();
-    let size = f.metadata()?.len();
-    let reader = BufReader::new(f);
+fn usage() -> ! {
+    eprintln!("Usage: muxl <command> [args...]");
+    eprintln!();
+    eprintln!("Commands:");
+    eprintln!("  canonicalize <input.mp4> <output.mp4>   Canonicalize an MP4 file");
+    eprintln!("  segment <input.mp4> <output>            Split into signable segments");
+    eprintln!("  concatenate <output.mp4> <seg1> [seg2...]  Combine segments into one MP4");
+    process::exit(1);
+}
 
-    let mp4 = mp4::Mp4Reader::read_header(reader, size)?;
-
-    // Print boxes.
-    println!("major brand: {}", mp4.ftyp.major_brand);
-    println!("timescale: {}", mp4.moov.mvhd.timescale);
-
-    // Use available methods.
-    println!("size: {}", mp4.size());
-
-    let mut compatible_brands = String::new();
-    for brand in mp4.compatible_brands().iter() {
-        compatible_brands.push_str(&brand.to_string());
-        compatible_brands.push_str(",");
+fn main() {
+    let args: Vec<String> = env::args().collect();
+    if args.len() < 2 {
+        usage();
     }
-    println!("compatible brands: {}", compatible_brands);
-    println!("duration: {:?}", mp4.duration());
 
-    // Track info.
-    for track in mp4.tracks().values() {
-        println!(
-            "track: #{}({}) {} : {}",
-            track.track_id(),
-            track.language(),
-            track.track_type()?,
-            track.box_type()?,
-        );
-        if track.track_type()? == TrackType::Audio {
-            println!("audio bitrate: {}", track.bitrate());
+    let result = match args[1].as_str() {
+        "canonicalize" => cmd_canonicalize(&args[2..]),
+        "segment" => cmd_segment(&args[2..]),
+        "concatenate" => cmd_concatenate(&args[2..]),
+        _ => {
+            eprintln!("Unknown command: {}", args[1]);
+            usage();
         }
+    };
+
+    if let Err(e) = result {
+        eprintln!("Error: {e}");
+        process::exit(1);
     }
-    Ok(())
+}
+
+fn cmd_canonicalize(args: &[String]) -> muxl::Result<()> {
+    if args.len() != 2 {
+        eprintln!("Usage: muxl canonicalize <input.mp4> <output.mp4>");
+        process::exit(1);
+    }
+    let input = File::open(&args[0])?;
+    let output = File::create(&args[1])?;
+    muxl::canonicalize(input, output)
+}
+
+fn cmd_segment(args: &[String]) -> muxl::Result<()> {
+    if args.len() != 2 {
+        eprintln!("Usage: muxl segment <input.mp4> <output>");
+        process::exit(1);
+    }
+    let input = File::open(&args[0])?;
+    let output = File::create(&args[1])?;
+    muxl::segment(input, output)
+}
+
+fn cmd_concatenate(args: &[String]) -> muxl::Result<()> {
+    if args.len() < 2 {
+        eprintln!("Usage: muxl concatenate <output.mp4> <seg1> [seg2...]");
+        process::exit(1);
+    }
+    let output = File::create(&args[0])?;
+    let mut inputs: Vec<File> = args[1..]
+        .iter()
+        .map(|p| File::open(p).map_err(muxl::Error::from))
+        .collect::<muxl::Result<Vec<_>>>()?;
+    muxl::concatenate(&mut inputs, output)
 }

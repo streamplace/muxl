@@ -1,10 +1,11 @@
-use mp4::Result;
+use mp4::{Result, TrackType};
+use std::env;
 use std::fs::File;
 use std::io::BufReader;
 
 fn main() -> Result<()> {
-    let f =
-        File::open("/home/iameli/testvids/RocketLeague_1h55m_1sGOP_1080p60_NoBframes.mp4").unwrap();
+    let path = env::args().nth(1).expect("Usage: muxl <file.mp4>");
+    let f = File::open(&path).unwrap();
     let size = f.metadata()?.len();
     let reader = BufReader::new(f);
 
@@ -34,6 +35,9 @@ fn main() -> Result<()> {
             track.track_type()?,
             track.box_type()?,
         );
+        if track.track_type()? == TrackType::Audio {
+            println!("audio bitrate: {}", track.bitrate());
+        }
     }
     Ok(())
 }

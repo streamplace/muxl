@@ -36,6 +36,44 @@ impl From<mp4::Error> for Error {
 
 pub type Result<T> = std::result::Result<T, Error>;
 
+// Resolve the sample_description_index for every sample from the stsc table.
+// The stsc table uses a run-length style encoding: each entry says "starting at
+// first_chunk, each chunk has N samples with description index D". We need to
+// expand this to per-sample values. In canonical form each chunk has 1 sample,
+// but input files may have arbitrary chunk layouts.
+fn resolve_sample_description_indices(stsc_entries: &[mp4::StscEntry], sample_count: u32) -> Vec<u32> {
+    if stsc_entries.is_empty() || sample_count == 0 {
+        return vec![1; sample_count as usize]; // default to index 1
+    }
+
+    let mut result = Vec::with_capacity(sample_count as usize);
+    let mut sample_idx = 0u32;
+
+    for (i, entry) in stsc_entries.iter().enumerate() {
+        let next_first_chunk = if i + 1 < stsc_entries.len() {
+            stsc_entries[i + 1].first_chunk
+        } else {
+            // Last entry extends to cover remaining samples.
+            // Calculate how many chunks we need.
+            let remaining = sample_count - sample_idx;
+            let chunks_needed = (remaining + entry.samples_per_chunk - 1) / entry.samples_per_chunk;
+            entry.first_chunk + chunks_needed
+        };
+
+        for _chunk in entry.first_chunk..next_first_chunk {
+            for _s in 0..entry.samples_per_chunk {
+                if sample_idx >= sample_count {
+                    return result;
+                }
+                result.push(entry.sample_description_index);
+                sample_idx += 1;
+            }
+        }
+    }
+
+    result
+}
+
 // Canonical ftyp: isom, minor version 0, compatible brands [isom, iso2, avc1, mp41].
 // Spec: canonical-form.md § ftyp
 fn canonical_ftyp() -> FtypBox {
@@ -311,14 +349,41 @@ fn canonicalize_from_reader<RS: Read + Seek, WS: Write + Seek>(
             .find(|t| t.tkhd.track_id == track_id)
             .unwrap();
 
-        // stsc: single entry — every chunk has 1 sample
+        // stsc: one sample per chunk, preserving sample_description_index changes.
+        // Spec: canonical-form.md § Multiple Sample Descriptions
+        // Walk the original stsc to find what sample_description_index each sample uses,
+        // then emit a new stsc entry at each index transition.
+        let sample_desc_indices = resolve_sample_description_indices(
+            &trak.mdia.minf.stbl.stsc.entries,
+            sample_count,
+        );
         trak.mdia.minf.stbl.stsc.entries.clear();
-        trak.mdia.minf.stbl.stsc.entries.push(mp4::StscEntry {
-            first_chunk: 1,
-            samples_per_chunk: 1,
-            sample_description_index: 1,
-            first_sample: 1,
-        });
+        let mut current_desc_idx = 0u32;
+        let mut first_sample_in_run = 1u32;
+        for (i, &desc_idx) in sample_desc_indices.iter().enumerate() {
+            let sample_num = (i as u32) + 1; // 1-based
+            if desc_idx != current_desc_idx {
+                if current_desc_idx != 0 {
+                    trak.mdia.minf.stbl.stsc.entries.push(mp4::StscEntry {
+                        first_chunk: first_sample_in_run, // chunk == sample in 1-sample-per-chunk layout
+                        samples_per_chunk: 1,
+                        sample_description_index: current_desc_idx,
+                        first_sample: first_sample_in_run,
+                    });
+                }
+                current_desc_idx = desc_idx;
+                first_sample_in_run = sample_num;
+            }
+        }
+        // Emit final run
+        if current_desc_idx != 0 {
+            trak.mdia.minf.stbl.stsc.entries.push(mp4::StscEntry {
+                first_chunk: first_sample_in_run,
+                samples_per_chunk: 1,
+                sample_description_index: current_desc_idx,
+                first_sample: first_sample_in_run,
+            });
+        }
 
         // Use stco (32-bit) if all offsets fit, otherwise co64
         let max_offset = chunk_offsets.iter().copied().max().unwrap_or(0);

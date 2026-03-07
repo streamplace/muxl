@@ -115,9 +115,35 @@ Unknown boxes (sgpd, sbgp, etc.) are currently dropped during round-trip through
 
 ## mdat (Media Data Box)
 
+### Flat MP4
+
 Samples are written sequentially per track, in track_id order. All samples for track 1, then all samples for track 2, etc. Each sample is its own chunk.
 
 Rationale: This is the simplest deterministic layout. Not optimal for streaming (interleaved would be better), but trivially reproducible.
+
+### Fragmented MP4 (fMP4)
+
+In the canonical fMP4 form, each segment is a `moof+mdat` pair. The segmentation rule is deterministic: each segment begins at a sync sample (keyframe), as identified by stss in a flat MP4 or sample_flags in fMP4 trun boxes. Segments contain all tracks' samples for that time range.
+
+Segment structure:
+- `moof`: contains `mfhd` (sequence_number, 1-based) and one `traf` per track (sorted by track_id)
+- Each `traf` contains: `tfhd` (track_id, default values), `tfdt` (base decode time), `trun` (sample table for this segment)
+- `mdat`: sample data for all tracks in this segment, in track_id order within the segment
+
+The canonical fMP4 file layout is: `ftyp`, then repeating `moof+mdat` pairs. No top-level `moov` (the moof boxes carry all metadata). No `free`, `skip`, or `udta` boxes.
+
+Round-trip property: a canonical flat MP4 can be deterministically segmented into canonical fMP4 (using the keyframe-based segmentation rule), and a canonical fMP4 can be deterministically flattened into canonical flat MP4. The sample bytes in mdat are identical in both representations.
+
+## Multiple Sample Descriptions (stsd)
+
+When codec parameters change mid-stream (e.g., resolution/orientation change from a mobile WebRTC/WHIP source causing new H.264 SPS/PPS), the stsd box contains multiple sample entries. The stsc table maps chunks to sample description indices.
+
+In canonical form:
+- `stsd` entries are preserved from input in order
+- `stsc` entries track sample description index changes: a new stsc entry is emitted whenever the sample_description_index changes
+- In fMP4, `tfhd.sample_description_index` indicates which stsd entry applies to a given fragment
+
+This means our canonical stsc is NOT always a single `(1, 1, 1)` entry — it's one entry per sample-description-index run, with samples_per_chunk=1.
 
 ## udta (User Data Box)
 

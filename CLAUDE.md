@@ -28,12 +28,24 @@ cargo check          # type-check without building
 
 ## Architecture
 
-Currently a single-file binary (`src/main.rs`) that reads an MP4 file and prints metadata (ftyp, moov, tracks, duration, etc.). Uses a local fork of `mp4-rust` at `../mp4-rust` (path dependency in Cargo.toml).
+Library (`src/lib.rs`) + CLI (`src/main.rs`). Uses a local fork of `mp4-rust` at `../mp4-rust` (path dependency in Cargo.toml). Targets Rust/WASM.
 
-The project is early-stage. The reference implementation targets Rust/WASM and will eventually support:
-- **Canonicalization**: arbitrary MP4 → MUXL canonical form (deterministic atom ordering, timestamp bases, chunk layout)
-- **Concatenation**: combining MUXL segments while preserving per-segment signatures
-- **Segmentation**: splitting MUXL files back into segments
+**Archival format**: canonical fMP4 (fragmented MP4). Each segment is a `moof+mdat` pair, segmented at keyframe boundaries. Segments are independently signable via S2PA. Concatenation is trivial (append segments). This is the source of truth.
+
+**Playback format**: canonical flat MP4 (single moov + mdat). Generated on-demand from canonical fMP4 for compatibility with players that don't handle fMP4 well.
+
+**Round-trip property**: flat MP4 → fMP4 → flat MP4 produces identical bytes. The segmentation rule (keyframe boundaries) is deterministic and derivable from the sample tables alone.
+
+Three public functions:
+- **`canonicalize()`**: arbitrary MP4 → canonical flat MP4 (currently implemented)
+- **`segment()`**: canonical flat MP4 → canonical fMP4 segments (todo)
+- **`concatenate()`**: combine canonical fMP4 segments → canonical fMP4 (todo, trivial — just append)
+
+**Key design constraints**:
+- Livestreaming ingest via WebRTC/WHIP — segments arrive as 1-second chunks
+- Must handle dynamic resolution/orientation changes (new SPS/PPS at keyframes)
+- 24-hour streams — no finalization step, fMP4 is always valid
+- Per-segment S2PA signatures must survive flat MP4 round-trip
 
 ## Key Details
 

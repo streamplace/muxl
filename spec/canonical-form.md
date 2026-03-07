@@ -14,9 +14,9 @@ Rationale: mdat-before-moov is the simplest layout (avoids offset chicken-and-eg
 
 - **major_brand**: `isom`
 - **minor_version**: `0`
-- **compatible_brands**: `[isom, iso2, avc1, mp41]`
+- **compatible_brands**: `[isom, iso2]`
 
-Rationale: `isom` is the most universal major brand. Muxer outputs vary widely (isom/512, isom/1, mp42/0). We pick the minimal universal set.
+Rationale: `isom` is the most universal major brand. We use only codec-agnostic brands — codec-specific brands like `avc1` or `av01` are omitted since players determine codec support from `stsd` entries, not ftyp. This keeps ftyp static regardless of whether the file contains H.264, AV1, AAC, or Opus.
 
 ## moov (Movie Box)
 

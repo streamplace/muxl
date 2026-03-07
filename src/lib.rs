@@ -83,8 +83,6 @@ fn canonical_ftyp() -> FtypBox {
         compatible_brands: vec![
             str::parse("isom").unwrap(),
             str::parse("iso2").unwrap(),
-            str::parse("avc1").unwrap(),
-            str::parse("mp41").unwrap(),
         ],
     }
 }

@@ -28,7 +28,7 @@ cargo check          # type-check without building
 
 ## Architecture
 
-Library (`src/lib.rs`) + CLI (`src/main.rs`). Uses a local fork of `mp4-rust` at `../mp4-rust` (path dependency in Cargo.toml). Targets Rust/WASM.
+Library (`src/lib.rs`) + CLI (`src/main.rs`). Uses a vendored fork of `mp4-rust` at `crates/mp4` (git subtree). Targets Rust/WASM.
 
 **Archival format**: canonical fMP4 (fragmented MP4). Each segment is a `moof+mdat` pair, segmented at keyframe boundaries. Segments are independently signable via S2PA. Concatenation is trivial (append segments). This is the source of truth.
 
@@ -50,7 +50,7 @@ Three public functions:
 ## Key Details
 
 - Rust edition 2024
-- Depends on a local `mp4` crate at `../mp4-rust` — this must be present to build
+- Depends on a vendored `mp4` crate at `crates/mp4` (git subtree from alfg/mp4-rust)
 - `samples/file.mp4` is a test fixture
 
 ## Comparison Tooling

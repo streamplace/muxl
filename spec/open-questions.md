@@ -54,11 +54,10 @@ Questions:
 2. **How does the S2PA manifest reference init changes?** Could version the init metadata, with each segment referencing which init version it uses.
 3. **Does the flat MP4 export need to handle multi-init?** In flat MP4, multiple stsd entries in a single moov handle this naturally. The question is whether the init→flat→re-segment round trip is lossless when init changes mid-stream.
 
-## S2PA manifest structure
+## Content hashing details
 
-The S2PA manifest contains track initialization metadata (codec config, timescales, handler types) as CBOR, plus references to segment signatures. This is defined by S2PA, not MUXL, but MUXL needs to be able to derive the init segment from it.
+When computing per-track content hashes for signing (by S2PA or any other system), the hash input is each track's moof+mdat bytes within a MUXL segment.
 
 Questions:
-1. **What CBOR schema?** The manifest needs to carry enough information to reconstruct the moov box deterministically. This is roughly: for each track, the full stsd entry (opaque codec config), timescale, handler type, track dimensions, and edit list.
-2. **How are per-track hashes computed?** Hash covers the moof+mdat bytes for one track within one segment. Need to nail down whether this includes just the box payloads or the full boxes with headers.
-3. **Hash algorithm?** BLAKE3 is the natural choice for content addressing (used elsewhere in DASL/AT Protocol ecosystem), but S2PA may have its own requirements.
+1. **Hash boundary**: does the hash cover the full box bytes (headers included) or just payloads? Full box bytes is simpler and more robust.
+2. **Hash algorithm**: BLAKE3 is the natural choice for content addressing (used elsewhere in DASL/AT Protocol ecosystem), but this is ultimately a decision for the signing layer, not MUXL.

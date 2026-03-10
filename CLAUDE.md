@@ -30,9 +30,9 @@ cargo check          # type-check without building
 
 Library (`src/lib.rs`) + CLI (`src/main.rs`). Uses a vendored fork of `mp4-rust` at `crates/mp4` (git subtree). Targets Rust/WASM.
 
-**MUXL segment** (signing unit): `uuid(c2pa) + [moof+mdat per track]` — one GoP of content with per-track moof+mdat pairs and an S2PA provenance box. Blindly concatenatable. Track init metadata lives in S2PA manifest, not in the segment.
+**MUXL segment** (canonical byte sequence): `[moof+mdat per track]` — one GoP of content with per-track moof+mdat pairs. Blindly concatenatable. Track init metadata is out-of-band (archive file header or external source).
 
-**Canonical fMP4** (archive): `ftyp + moov (init) + [MUXL segments...]` — valid fMP4 file, appendable, crash-safe. The init segment is derived from the S2PA manifest's track metadata.
+**MUXL archive fMP4** (storage): `ftyp + moov (init) + [MUXL segments...]` — valid fMP4 file, appendable, crash-safe.
 
 **Flat MP4** (export): `ftyp + mdat + moov` — generated on-demand for universal playback. Round-trips back to MUXL segments via re-segmentation at keyframe boundaries.
 
@@ -46,8 +46,8 @@ Public functions:
 - Livestreaming ingest via WebRTC/WHIP — segments arrive as 1-second chunks
 - Must handle dynamic resolution/orientation changes (new SPS/PPS at keyframes)
 - 24-hour streams — no finalization step, fMP4 is always valid
-- Per-track S2PA signatures must survive flat MP4 round-trip
-- Multiple synced video/audio tracks; individual tracks independently verifiable
+- Per-track content hashes must survive flat MP4 round-trip
+- Multiple synced video/audio tracks; individual tracks independently hashable
 
 ## Key Details
 

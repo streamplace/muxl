@@ -6,10 +6,9 @@ All choices are provisional and subject to revision after playback testing.
 
 ## MUXL Segment Structure
 
-A MUXL segment contains one GoP of content. Each track has its own moof+mdat pair within the segment. The segment is preceded by a uuid box carrying S2PA provenance data.
+A MUXL segment contains one GoP of content. Each track has its own moof+mdat pair. Track initialization metadata (codec config, timescales) is out-of-band — it comes from the archive file's init segment or an external source.
 
 ```
-uuid(c2pa)                              ← S2PA signature + per-track hashes
 moof(track 1) + mdat(track 1)           ← one track's samples for this GoP
 moof(track 2) + mdat(track 2)           ← another track's samples
 ...
@@ -191,12 +190,6 @@ In canonical form:
 - In fMP4, `tfhd.sample_description_index` indicates which stsd entry applies to a given fragment
 
 This means our canonical stsc is NOT always a single `(1, 1, 1)` entry — it's one entry per sample-description-index run, with samples_per_chunk=1.
-
-## uuid(c2pa) (S2PA Provenance Box)
-
-A UUID box using the C2PA UUID identifier, carrying S2PA provenance data for the segment. Appears once per MUXL segment, before the track moof+mdat pairs.
-
-Contents are defined by the S2PA specification (CBOR-encoded signature and per-track content hashes).
 
 ## udta (User Data Box)
 

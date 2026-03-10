@@ -4,15 +4,16 @@ This document describes the relationship between MUXL's format representations, 
 
 ## Core Principle
 
-Deterministic canonicalization decouples transport, storage, and signing. The same source frames can exist in three different container formats, all derivable from each other, because the canonicalization rules are fully deterministic. Content bytes (encoded video/audio samples) never change — only the container structure around them.
+Deterministic canonicalization decouples transport, storage, and signing. The same source frames can exist in multiple container formats, all derivable from each other, because the canonicalization rules are fully deterministic. Content bytes (encoded video/audio samples) never change — only the container structure around them.
 
 ## Format Representations
 
 ```
 source frames
-  ├─ Hang CMAF (per-frame moof+mdat) → MoQ transport, minimal latency
-  ├─ canonical fMP4 (per-GoP segments) → S2PA signing, verification
-  └─ flat MP4 (moov+mdat)             → archival, export, playback
+  ├─ Hang CMAF (per-frame moof+mdat)     → MoQ transport, minimal latency
+  ├─ MUXL segment (uuid+moof+mdat ×N)    → signing, verification, storage
+  ├─ canonical fMP4 (ftyp+moov+segments)  → archival, appendable storage
+  └─ flat MP4 (ftyp+mdat+moov)           → export, universal playback
 ```
 
 ### Hang CMAF — Transport Format
@@ -23,49 +24,76 @@ This is the lowest-latency representation. No sample tables, no init segment, no
 
 MUXL does not define this format — it is defined by the [Hang specification](https://doc.moq.dev/concept/layer/hang). MUXL only needs to be able to consume it.
 
-### Canonical fMP4 — Signing Format
+### MUXL Segment — Signing Format
 
-Each segment is a `moof+mdat` pair containing one GoP's worth of samples across all tracks. Segments are the unit of S2PA signing — each segment carries a cryptographic signature over its canonical bytes.
+A MUXL segment represents one GoP of content across one or more tracks. It is the unit of S2PA signing. Each track within the segment is independently hashable, allowing individual tracks to be verified, added, or dropped without invalidating the others.
 
-Structure per segment:
-- `moof`: `mfhd` (sequence number) + one `traf` per track (sorted by track_id), each containing `tfhd`, `tfdt`, `trun`
-- `mdat`: sample data for all tracks in this segment, in track_id order
+Structure of a MUXL segment:
 
-File layout: `ftyp` followed by repeating `moof+mdat` pairs. No top-level `moov`.
+```
+uuid(c2pa)                          ← S2PA signature/provenance box
+moof(track 1) + mdat(track 1)      ← video frames for this GoP
+moof(track 2) + mdat(track 2)      ← audio packets for this GoP
+moof(track 3) + mdat(track 3)      ← second audio track, etc.
+```
+
+Key properties:
+- **Per-track moof+mdat pairs**: each track gets its own moof+mdat within the segment, making each track independently hashable without parsing
+- **uuid box first**: the S2PA provenance data (signature, per-track content hashes) appears before the media data; streaming consumers see the signature before the content
+- **Blindly concatenatable**: multiple segments can be concatenated by simple byte appending, since there is no ftyp or moov to conflict
+- **Not self-contained**: track initialization metadata (codec config, timescales) lives in the S2PA manifest as CBOR, not in the segment itself; an S2PA-aware consumer reconstructs the init data from the manifest
+
+The per-track content hashes in the uuid box reference the bytes of each track's moof+mdat pair. The S2PA manifest (stored separately) contains the track initialization metadata and signs over the per-track hashes.
 
 Segmentation rule: each segment begins at a video sync sample (keyframe). Audio samples are grouped with the video GoP they temporally overlap. This rule is deterministic — given the same samples with the same timestamps, the segment boundaries are always identical.
 
-See `canonical-form.md` for detailed box-level specification.
+### Canonical fMP4 — Archive Format
 
-### Flat MP4 — Archival/Export Format
+For storage, the canonical fMP4 prepends an init segment (ftyp + moov with empty sample tables) to a sequence of MUXL segments:
 
-Standard MP4 with a single `moov` containing complete sample tables (`stts`, `stsz`, `stco`, `stsc`, `stss`, `ctts`) and a single `mdat` containing all sample data.
+```
+ftyp + moov (init, empty sample tables)
+uuid + moof+mdat + moof+mdat ...       ← GoP 1
+uuid + moof+mdat + moof+mdat ...       ← GoP 2
+...
+```
 
-Layout: `ftyp`, `mdat`, `moov`. Maximally compatible with players, editors, and media tools.
+This is a valid fMP4 file — players skip unknown uuid boxes and process the moof+mdat pairs normally. New GoPs are appended without modifying existing data (crash-safe, no finalization step).
 
-This format is generated on demand from canonical fMP4 and can be deterministically converted back. The round-trip property (flat → fMP4 → flat produces identical bytes) is a hard requirement.
+The init segment (ftyp+moov) is stable as long as the track configuration doesn't change. When codec parameters change (e.g., resolution switch), a new init segment is emitted at the point of change.
+
+The init segment is deterministic: given the same track configuration, any MUXL implementation produces identical init bytes. It can be derived from the S2PA manifest's track metadata.
+
+### Flat MP4 — Export Format
+
+Standard MP4 with a single `moov` containing complete sample tables and a single `mdat` containing all sample data. Layout: `ftyp`, `mdat`, `moov`.
+
+Maximally compatible with players, editors, and media tools. Generated on demand from canonical fMP4. Can be deterministically converted back to canonical fMP4 by re-segmenting at keyframe boundaries.
 
 See `canonical-form.md` for detailed box-level specification.
 
 ## Round-Trip Properties
 
-The three representations are connected by deterministic transformations:
+The representations are connected by deterministic transformations:
 
 ```
-Hang CMAF ──canonicalize──► canonical fMP4 ◄──segment──── flat MP4
-                                │                            ▲
-                                └──────────flatten───────────┘
+Hang CMAF ──canonicalize──► MUXL segments ──prepend init──► canonical fMP4
+                                │                                │
+                                │                           flatten ↓
+                                │                            flat MP4
+                                │                                │
+                                ◄────────── re-segment ──────────┘
 ```
 
-- **Hang CMAF → canonical fMP4**: Accumulate frames into GoP-sized segments. Move codec config from catalog into `stsd` entries. Construct `trun` sample tables from per-frame metadata. Apply canonical ordering and metadata normalization.
+- **Hang CMAF → MUXL segments**: Accumulate per-frame fragments into GoP-sized segments. Construct per-track moof+mdat pairs. Add uuid box with S2PA provenance.
 
-- **canonical fMP4 → flat MP4** (`flatten`): Consolidate all segment `trun` tables into `moov` sample tables (`stts`, `stsz`, `stco`, `stsc`, `ctts`, `stss`). Concatenate all `mdat` payloads. Write single `moov` at end.
+- **MUXL segments → canonical fMP4**: Derive init segment from track metadata. Prepend to concatenated segments.
 
-- **flat MP4 → canonical fMP4** (`segment`): Walk `moov` sample tables to find keyframe boundaries (`stss`). Slice samples into GoP-sized segments. Construct per-segment `moof` boxes from the sample table data. Each segment's bytes are identical to the original canonical fMP4 segment.
+- **canonical fMP4 → flat MP4** (`flatten`): Consolidate all moof/trun tables into moov sample tables. Concatenate all mdat payloads. Write single moov at end.
 
-The last transformation is what enables signature verification from a flat MP4 — re-segment, then verify each segment's S2PA signature against the reconstructed canonical bytes.
+- **flat MP4 → MUXL segments** (`segment`): Walk moov sample tables to find keyframe boundaries (stss). Slice samples into GoP-sized segments. Construct per-track moof+mdat pairs. Each segment's content bytes are identical to the original MUXL segment.
 
-**Hang CMAF → flat MP4** is not a direct path — it always goes through canonical fMP4. This ensures there is exactly one canonical representation that signatures are computed over.
+The last transformation enables signature verification from a flat MP4 export: re-segment, recompute per-track hashes, check against the S2PA manifest.
 
 ## Signing Pipeline
 
@@ -78,22 +106,48 @@ encoder → frames → MoQ transport (Hang CMAF, per-frame)
                         │
                    accumulate GoP
                         │
-                   canonicalize → canonical fMP4 segment
+                   build MUXL segment (per-track moof+mdat)
                         │
-                   S2PA sign segment
+                   hash each track's moof+mdat independently
                         │
-                   append to archive (canonical fMP4)
+                   S2PA sign (per-track hashes → signature → uuid box)
                         │
-                   publish signature via S2PA manifest
+                   append to archive fMP4
+                        │
+                   publish updated S2PA manifest
                         │
                    [verifiers can now check this GoP]
 ```
 
-Key property: **signing is not on the hot path**. Frames are transmitted immediately via Hang CMAF. The signer runs ~1 GoP behind, accumulating frames, canonicalizing, signing, and publishing. This means:
-
+Key properties:
+- **Signing is not on the hot path**: frames are transmitted immediately via Hang CMAF; the signer runs ~1 GoP behind
 - **Zero additional latency** for viewers who don't need real-time verification
 - **~1 GoP latency** (typically 1-2 seconds) for verifiers who want to check signatures inline
 - **Retroactive verification** is always possible from the archive
+- **Per-track independence**: a translator dubbing new audio doesn't invalidate the video provenance; tracks can be added or dropped and remaining signatures still hold
+
+## Per-Track Signing Model
+
+Each track within a GoP segment is hashed independently:
+
+```
+GoP 1:
+  track 1 (video): moof+mdat bytes → hash_v1
+  track 2 (audio): moof+mdat bytes → hash_a1
+  track 3 (audio): moof+mdat bytes → hash_a2
+
+uuid box: { per_track_hashes: { 1: hash_v1, 2: hash_a1, 3: hash_a2 }, signature: ... }
+```
+
+The S2PA manifest contains:
+- Track initialization metadata (codec config, timescales, handler types) as CBOR
+- References to segment signatures
+- Enough information to reconstruct the init segment (ftyp+moov) for playback
+
+This model supports:
+- **Subset verification**: verify only the video track without touching audio
+- **Track independence**: drop or replace a track without invalidating the others
+- **Multi-track streams**: multiple synced video and audio tracks
 
 ## Dynamic Stream Changes
 
@@ -101,16 +155,19 @@ Mobile WebRTC/WHIP sources may change resolution or orientation mid-stream (phon
 
 In the signing pipeline:
 1. Resolution change always aligns with a keyframe (codec requirement)
-2. Keyframe starts a new GoP → new canonical fMP4 segment
-3. New segment's `traf.tfhd` references a new `sample_description_index`
-4. In flat MP4, `stsd` accumulates multiple entries; `stsc` tracks the transitions
+2. Keyframe starts a new GoP → new MUXL segment
+3. New segment references updated codec parameters
+4. S2PA manifest records the track configuration change
+5. A new init segment is derivable from the updated manifest
 
-Because segment boundaries align with codec parameter changes, each segment is self-consistent — it references exactly one set of codec parameters.
+Because segment boundaries align with codec parameter changes, each segment is self-consistent — it references exactly one set of codec parameters per track.
 
 ## Relationship to S2PA
 
-S2PA (Simple Standard for Provenance and Authenticity) defines how signatures are attached to content. MUXL defines what bytes are signed.
+MUXL defines what bytes are signed. S2PA defines how signatures are attached and verified.
 
-S2PA is agnostic to container format — it signs arbitrary byte ranges. MUXL's role is to ensure those byte ranges are deterministically reproducible. Given the same source frames, any implementation of MUXL must produce identical canonical fMP4 segment bytes, which means S2PA signatures computed by one implementation can be verified by any other.
+- **MUXL segments** contain a `uuid(c2pa)` box with S2PA provenance data (signature, per-track content hashes)
+- **S2PA manifest** contains track initialization metadata, segment references, and signer identity — stored and transmitted separately (e.g., in a MoQ catalog track, or as a sidecar file)
+- **MUXL segment format depends on S2PA**: the uuid box is part of the canonical segment structure; a MUXL segment without provenance is not a defined format
 
-The S2PA manifest maps segments to signatures. It is stored and transmitted separately from the media data (e.g., in a MoQ catalog track, or as a sidecar file alongside a flat MP4 export).
+Given the same source frames, any MUXL implementation must produce identical per-track moof+mdat bytes, which means S2PA signatures computed by one implementation can be verified by any other.

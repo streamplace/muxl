@@ -30,22 +30,24 @@ cargo check          # type-check without building
 
 Library (`src/lib.rs`) + CLI (`src/main.rs`). Uses a vendored fork of `mp4-rust` at `crates/mp4` (git subtree). Targets Rust/WASM.
 
-**Archival format**: canonical fMP4 (fragmented MP4). Each segment is a `moof+mdat` pair, segmented at keyframe boundaries. Segments are independently signable via S2PA. Concatenation is trivial (append segments). This is the source of truth.
+**MUXL segment** (signing unit): `uuid(c2pa) + [moof+mdat per track]` — one GoP of content with per-track moof+mdat pairs and an S2PA provenance box. Blindly concatenatable. Track init metadata lives in S2PA manifest, not in the segment.
 
-**Playback format**: canonical flat MP4 (single moov + mdat). Generated on-demand from canonical fMP4 for compatibility with players that don't handle fMP4 well.
+**Canonical fMP4** (archive): `ftyp + moov (init) + [MUXL segments...]` — valid fMP4 file, appendable, crash-safe. The init segment is derived from the S2PA manifest's track metadata.
 
-**Round-trip property**: flat MP4 → fMP4 → flat MP4 produces identical bytes. The segmentation rule (keyframe boundaries) is deterministic and derivable from the sample tables alone.
+**Flat MP4** (export): `ftyp + mdat + moov` — generated on-demand for universal playback. Round-trips back to MUXL segments via re-segmentation at keyframe boundaries.
 
-Three public functions:
-- **`canonicalize()`**: arbitrary MP4 → canonical flat MP4 (currently implemented)
-- **`segment()`**: canonical flat MP4 → canonical fMP4 segments (todo)
-- **`concatenate()`**: combine canonical fMP4 segments → canonical fMP4 (todo, trivial — just append)
+Public functions:
+- **`canonicalize()`**: arbitrary MP4 → canonical flat MP4 (implemented)
+- **`fragment()`**: flat MP4 → per-frame Hang CMAF fragments (implemented)
+- **`segment()`**: flat MP4 → MUXL segments (todo)
+- **`flatten()`**: canonical fMP4 → flat MP4 (todo)
 
 **Key design constraints**:
 - Livestreaming ingest via WebRTC/WHIP — segments arrive as 1-second chunks
 - Must handle dynamic resolution/orientation changes (new SPS/PPS at keyframes)
 - 24-hour streams — no finalization step, fMP4 is always valid
-- Per-segment S2PA signatures must survive flat MP4 round-trip
+- Per-track S2PA signatures must survive flat MP4 round-trip
+- Multiple synced video/audio tracks; individual tracks independently verifiable
 
 ## Key Details
 

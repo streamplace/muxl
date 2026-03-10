@@ -40,9 +40,25 @@ Mobile devices sending via WebRTC (WHIP) can change resolution and orientation m
 
 In the MP4 container, this means multiple `stsd` sample entries (each `avc1` with its own `avcC` containing different SPS/PPS). The `stsc` table maps chunks to sample description indices.
 
-Current canonical stsc assumes a single entry `(1, 1, 1)`. This needs to generalize to track sample_description_index changes across chunks.
-
 Questions:
 1. **Should we normalize SPS/PPS?** Some encoders include redundant parameters. Could canonicalize the binary SPS/PPS representation, but risk is high (any bit flip breaks decoding).
 2. **Segment boundaries vs resolution changes** — in fMP4, should a resolution change force a new segment? Probably yes, since tfhd carries a single sample_description_index per fragment. This aligns naturally with keyframe boundaries.
 3. **Orientation via tkhd matrix vs actual pixel dimensions** — some sources signal rotation via the track header matrix while keeping pixel dimensions constant. Others actually rotate the pixels. Need to decide how to canonicalize this distinction.
+
+## Init segment evolution over long streams
+
+For 24-hour livestreams, the init segment (ftyp+moov) is stable as long as the track configuration doesn't change. When codec parameters change (new SPS/PPS from resolution switch), a new init segment is needed.
+
+Questions:
+1. **Where does the new init appear in the archive fMP4?** Could emit a new ftyp+moov inline in the file at the point of change, but multi-moov fMP4 files are unusual. Alternatively, the S2PA manifest tracks init segment versions and the archive file just has one init at the start covering the initial config.
+2. **How does the S2PA manifest reference init changes?** Could version the init metadata, with each segment referencing which init version it uses.
+3. **Does the flat MP4 export need to handle multi-init?** In flat MP4, multiple stsd entries in a single moov handle this naturally. The question is whether the init→flat→re-segment round trip is lossless when init changes mid-stream.
+
+## S2PA manifest structure
+
+The S2PA manifest contains track initialization metadata (codec config, timescales, handler types) as CBOR, plus references to segment signatures. This is defined by S2PA, not MUXL, but MUXL needs to be able to derive the init segment from it.
+
+Questions:
+1. **What CBOR schema?** The manifest needs to carry enough information to reconstruct the moov box deterministically. This is roughly: for each track, the full stsd entry (opaque codec config), timescale, handler type, track dimensions, and edit list.
+2. **How are per-track hashes computed?** Hash covers the moof+mdat bytes for one track within one segment. Need to nail down whether this includes just the box payloads or the full boxes with headers.
+3. **Hash algorithm?** BLAKE3 is the natural choice for content addressing (used elsewhere in DASL/AT Protocol ecosystem), but S2PA may have its own requirements.

@@ -4,11 +4,47 @@ This document defines the canonical MP4 box structure produced by MUXL. Each sec
 
 All choices are provisional and subject to revision after playback testing.
 
-## Top-Level Box Ordering
+## MUXL Segment Structure
 
-Canonical order: `ftyp`, `mdat`, `moov`. No `free`, `skip`, or `udta` boxes at top level.
+A MUXL segment contains one GoP of content. Each track has its own moof+mdat pair within the segment. The segment is preceded by a uuid box carrying S2PA provenance data.
 
-Rationale: mdat-before-moov is the simplest layout (avoids offset chicken-and-egg problems). We may switch to moov-first (faststart) later for streaming, but mdat-first is deterministic without two-pass writing.
+```
+uuid(c2pa)                              ← S2PA signature + per-track hashes
+moof(track 1) + mdat(track 1)           ← one track's samples for this GoP
+moof(track 2) + mdat(track 2)           ← another track's samples
+...
+```
+
+Within each moof:
+- `mfhd`: sequence_number (1-based, global across the stream)
+- `traf`: exactly one per moof (one track per moof+mdat pair)
+  - `tfhd`: track_id, flags include `default_base_is_moof`; `sample_description_index` set if not 1
+  - `tfdt`: base_media_decode_time for this track in this segment
+  - `trun`: per-sample duration, size, flags, composition time offset; `data_offset` points to mdat payload
+
+Track ordering within a segment: tracks are ordered by track_id (ascending).
+
+Segments are blindly concatenatable by byte appending.
+
+## Canonical fMP4 (Archive Format)
+
+The archive file prepends an init segment to concatenated MUXL segments:
+
+```
+ftyp                                     ← file type
+moov (empty sample tables)               ← init segment: track config only
+[MUXL segment 1]                         ← uuid + per-track moof+mdat
+[MUXL segment 2]
+...
+```
+
+This is a valid fMP4 file. Players skip uuid boxes and process moof+mdat pairs.
+
+## Flat MP4 (Export Format)
+
+For maximum compatibility. Layout: `ftyp`, `mdat`, `moov`.
+
+Generated from canonical fMP4 by consolidating all moof/trun data into moov sample tables and concatenating all mdat payloads.
 
 ## ftyp (File Type Box)
 
@@ -19,6 +55,8 @@ Rationale: mdat-before-moov is the simplest layout (avoids offset chicken-and-eg
 Rationale: `isom` is the most universal major brand. We use only codec-agnostic brands — codec-specific brands like `avc1` or `av01` are omitted since players determine codec support from `stsd` entries, not ftyp. This keeps ftyp static regardless of whether the file contains H.264, AV1, AAC, or Opus.
 
 ## moov (Movie Box)
+
+In canonical fMP4, the moov appears in the init segment with empty sample tables (no samples, just track configuration). In flat MP4, the moov contains complete sample tables.
 
 ### Box Ordering Within moov
 
@@ -31,7 +69,7 @@ Rationale: `isom` is the most universal major brand. We use only codec-agnostic 
 - **creation_time**: 0
 - **modification_time**: 0
 - **timescale**: 1000
-- **duration**: max of track durations, in movie timescale
+- **duration**: max of track durations, in movie timescale (0 in init segment)
 - **rate**: 1.0 (0x00010000)
 - **volume**: 1.0 (0x0100)
 - **matrix**: identity
@@ -49,7 +87,7 @@ Tracks are ordered by track_id (ascending). No trak-level `meta` or `udta`.
 - **flags**: 3 (track_enabled | track_in_movie)
 - **creation_time**: 0
 - **modification_time**: 0
-- **duration**: derived from mdhd duration, scaled to movie timescale
+- **duration**: derived from mdhd duration, scaled to movie timescale (0 in init segment)
 - **matrix**: preserved from input
 - **width/height**: preserved from input
 - **layer, alternate_group, volume**: preserved from input
@@ -71,7 +109,7 @@ Edit lists are content-meaningful (audio priming, A/V sync).
 - **creation_time**: 0
 - **modification_time**: 0
 - **timescale**: normalized to canonical value per track type (see below)
-- **duration**: recomputed after timescale normalization
+- **duration**: recomputed after timescale normalization (0 in init segment)
 - **language**: preserved from input
 
 Canonical media timescales:
@@ -103,36 +141,45 @@ Preserved from input (always a self-referencing dref).
 
 ###### stbl (Sample Table Box)
 
+In the init segment (canonical fMP4), sample tables are empty — all sample data is in the moof/trun boxes.
+
+In flat MP4 export:
 - **stsd**: preserved from input (codec configuration is content)
 - **stts**: sample deltas rescaled to canonical media timescale (structure preserved)
 - **stss**: preserved from input (keyframe table is content)
 - **ctts**: sample offsets rescaled to canonical media timescale (structure preserved)
 - **stsz**: preserved from input (sample sizes are content)
-- **stsc**: canonical — one sample per chunk: `[(first_chunk=1, samples_per_chunk=1, sample_description_index=1)]`
+- **stsc**: canonical — one sample per chunk, with entries tracking sample_description_index changes
 - **stco/co64**: recomputed from canonical mdat layout. Use stco (32-bit) when all offsets fit in u32, otherwise co64.
 
 Unknown boxes (sgpd, sbgp, etc.) are currently dropped during round-trip through mp4-rust.
 
+## moof (Movie Fragment Box)
+
+Each moof covers exactly one track for one GoP segment.
+
+- **mfhd**: sequence_number, 1-based, incrementing globally across the stream
+- **traf**: exactly one per moof
+  - **tfhd**: track_id, flags = `default_base_is_moof`; `sample_description_index` set if != 1
+  - **tfdt**: base_media_decode_time in canonical media timescale; version 0 if fits in u32, else version 1
+  - **trun**: flags include `data_offset`, `sample_duration`, `sample_size`, `sample_flags`; `sample_cts` included if any sample has a non-zero composition time offset
+
+### trun Sample Flags
+
+- Sync sample: `0x02000000` (sample_depends_on = 2: depends on no other sample)
+- Non-sync sample: `0x01010000` (sample_depends_on = 1: depends on others; sample_is_non_sync = 1)
+
 ## mdat (Media Data Box)
 
-### Flat MP4
+### In MUXL Segments
+
+Each moof+mdat pair contains one track's samples for one GoP. Samples are written sequentially in decode order within the mdat.
+
+### In Flat MP4
 
 Samples are written sequentially per track, in track_id order. All samples for track 1, then all samples for track 2, etc. Each sample is its own chunk.
 
 Rationale: This is the simplest deterministic layout. Not optimal for streaming (interleaved would be better), but trivially reproducible.
-
-### Fragmented MP4 (fMP4)
-
-In the canonical fMP4 form, each segment is a `moof+mdat` pair. The segmentation rule is deterministic: each segment begins at a sync sample (keyframe), as identified by stss in a flat MP4 or sample_flags in fMP4 trun boxes. Segments contain all tracks' samples for that time range.
-
-Segment structure:
-- `moof`: contains `mfhd` (sequence_number, 1-based) and one `traf` per track (sorted by track_id)
-- Each `traf` contains: `tfhd` (track_id, default values), `tfdt` (base decode time), `trun` (sample table for this segment)
-- `mdat`: sample data for all tracks in this segment, in track_id order within the segment
-
-The canonical fMP4 file layout is: `ftyp`, then repeating `moof+mdat` pairs. No top-level `moov` (the moof boxes carry all metadata). No `free`, `skip`, or `udta` boxes.
-
-Round-trip property: a canonical flat MP4 can be deterministically segmented into canonical fMP4 (using the keyframe-based segmentation rule), and a canonical fMP4 can be deterministically flattened into canonical flat MP4. The sample bytes in mdat are identical in both representations.
 
 ## Multiple Sample Descriptions (stsd)
 
@@ -144,6 +191,12 @@ In canonical form:
 - In fMP4, `tfhd.sample_description_index` indicates which stsd entry applies to a given fragment
 
 This means our canonical stsc is NOT always a single `(1, 1, 1)` entry — it's one entry per sample-description-index run, with samples_per_chunk=1.
+
+## uuid(c2pa) (S2PA Provenance Box)
+
+A UUID box using the C2PA UUID identifier, carrying S2PA provenance data for the segment. Appears once per MUXL segment, before the track moof+mdat pairs.
+
+Contents are defined by the S2PA specification (CBOR-encoded signature and per-track content hashes).
 
 ## udta (User Data Box)
 

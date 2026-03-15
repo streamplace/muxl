@@ -374,7 +374,7 @@ fn build_video_trak(config: &VideoTrackConfig) -> Result<Trak> {
             },
             hdlr: Hdlr {
                 handler: b"vide".into(),
-                name: "VideoHandler".into(),
+                name: String::new(),
             },
             minf: Minf {
                 vmhd: Some(Vmhd::default()),
@@ -449,7 +449,7 @@ fn build_audio_trak(config: &AudioTrackConfig) -> Result<Trak> {
             },
             hdlr: Hdlr {
                 handler: b"soun".into(),
-                name: "SoundHandler".into(),
+                name: String::new(),
             },
             minf: Minf {
                 vmhd: None,

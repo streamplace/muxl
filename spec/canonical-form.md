@@ -130,8 +130,8 @@ Sorted by track_id ascending. No udta, meta, or iods.
 
 - **version**: 0
 - **flags**: 0
-- **handler_type**: from track config
-- **name**: `"VideoHandler"` / `"SoundHandler"` / `"SubtitleHandler"` / empty
+- **handler_type**: `"vide"` for video, `"soun"` for audio
+- **name**: empty string (name is cosmetic and varies across muxers)
 
 ### minf
 

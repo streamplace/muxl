@@ -13,8 +13,8 @@
 use std::io::{Read, Seek, SeekFrom, Write};
 
 use mp4_atom::{
-    Atom, CttsEntry, Encode, Header, Mfhd, Moof, Moov, ReadAtom, ReadFrom, StscEntry,
-    StszSamples, SttsEntry, Tfdt, Tfhd, Traf, Trun, TrunEntry,
+    Atom, CttsEntry, Encode, Header, Mfhd, Moof, Moov, ReadAtom, ReadFrom, StscEntry, StszSamples,
+    SttsEntry, Tfdt, Tfhd, Traf, Trun, TrunEntry,
 };
 
 use crate::catalog::Catalog;
@@ -254,8 +254,7 @@ impl<R: Read> FMP4Reader<R> {
 
             if header.kind == Moof::KIND {
                 let moof_box_size = header.size.unwrap_or(0) + 8;
-                let moof =
-                    Moof::read_atom(&header, &mut self.reader).map_err(mp4_err)?;
+                let moof = Moof::read_atom(&header, &mut self.reader).map_err(mp4_err)?;
 
                 // Next box must be mdat
                 let mdat_header = <Option<Header> as ReadFrom>::read_from(&mut self.reader)
@@ -292,9 +291,9 @@ impl<R: Read> FMP4Reader<R> {
                 }
             } else {
                 // Skip non-moof boxes (styp, sidx, free, etc.)
-                let size = header.size.ok_or_else(|| {
-                    Error::InvalidMp4("box with unknown size in stream".into())
-                })?;
+                let size = header
+                    .size
+                    .ok_or_else(|| Error::InvalidMp4("box with unknown size in stream".into()))?;
                 let mut skip = vec![0u8; size];
                 self.reader.read_exact(&mut skip)?;
             }
@@ -366,9 +365,7 @@ fn process_moof_mdat(
         let track_id = traf.tfhd.track_id;
         let trex = trex_defaults(moov, track_id);
 
-        let (decode_time, seq) = track_state
-            .entry(track_id)
-            .or_insert((0u64, 0u32));
+        let (decode_time, seq) = track_state.entry(track_id).or_insert((0u64, 0u32));
 
         // Base decode time from tfdt (if present), otherwise continue from where we left off
         if let Some(ref tfdt) = traf.tfdt {
@@ -466,8 +463,10 @@ fn extract_flat_track_info(trak: &mp4_atom::Trak) -> Result<Vec<FlatSampleInfo>>
     };
 
     // Sync samples from stss (None = all sync)
-    let sync_set: Option<std::collections::HashSet<u32>> =
-        stbl.stss.as_ref().map(|stss| stss.entries.iter().copied().collect());
+    let sync_set: Option<std::collections::HashSet<u32>> = stbl
+        .stss
+        .as_ref()
+        .map(|stss| stss.entries.iter().copied().collect());
 
     // Chunk offsets from stco or co64
     let chunk_offsets: Vec<u64> = if let Some(ref stco) = stbl.stco {
@@ -762,7 +761,8 @@ mod tests {
             Read::read_exact(&mut cursor, &mut mdat_payload).unwrap();
 
             assert_eq!(
-                mdat_payload, original,
+                mdat_payload,
+                original,
                 "sample {} data mismatch in track {}",
                 i + 1,
                 track_id
@@ -922,10 +922,7 @@ mod tests {
                 orig.len(),
                 "track {track_id}: data length mismatch"
             );
-            assert_eq!(
-                ours, orig,
-                "track {track_id}: sample data content mismatch"
-            );
+            assert_eq!(ours, orig, "track {track_id}: sample data content mismatch");
         }
     }
 

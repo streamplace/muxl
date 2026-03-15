@@ -543,11 +543,7 @@ mod tests {
         let mut cursor = Cursor::new(&init[..]);
         let h1 = Header::read_from(&mut cursor).unwrap();
         assert_eq!(h1.kind, Ftyp::KIND);
-        std::io::Read::read_exact(
-            &mut cursor,
-            &mut vec![0u8; h1.size.unwrap()],
-        )
-        .unwrap();
+        std::io::Read::read_exact(&mut cursor, &mut vec![0u8; h1.size.unwrap()]).unwrap();
 
         let h2 = Header::read_from(&mut cursor).unwrap();
         assert_eq!(h2.kind, Moov::KIND);
@@ -665,7 +661,11 @@ mod tests {
                 Ok(catalog) => {
                     assert!(!catalog.video.is_empty(), "{name}: no video tracks");
                     let video = catalog.video.values().next().unwrap();
-                    assert!(video.codec.starts_with("av01."), "{name}: got {}", video.codec);
+                    assert!(
+                        video.codec.starts_with("av01."),
+                        "{name}: got {}",
+                        video.codec
+                    );
                 }
                 Err(e) => {
                     // AV1 support depends on mp4-atom's parsing

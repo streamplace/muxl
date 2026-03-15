@@ -104,7 +104,11 @@ mod tests {
         // Segments should be numbered sequentially
         for (i, seg) in segments.iter().enumerate() {
             assert_eq!(seg.number, (i + 1) as u32);
-            assert!(!seg.data.is_empty(), "segment {} should have data", seg.number);
+            assert!(
+                !seg.data.is_empty(),
+                "segment {} should have data",
+                seg.number
+            );
         }
     }
 
@@ -185,8 +189,7 @@ mod tests {
         })
         .unwrap();
 
-        let video_track_ids: HashSet<u32> =
-            catalog.video.values().map(|v| v.track_id).collect();
+        let video_track_ids: HashSet<u32> = catalog.video.values().map(|v| v.track_id).collect();
 
         for seg in &segments {
             // Parse the segment's moof+mdat pairs to find the first video frame

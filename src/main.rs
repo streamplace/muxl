@@ -49,13 +49,21 @@ fn cmd_catalog(args: &[String]) -> muxl::Result<()> {
     for (name, v) in &catalog.video {
         eprintln!(
             "video \"{name}\": {} {}x{} (track {}, {} desc bytes)",
-            v.codec, v.coded_width, v.coded_height, v.track_id, v.description.len()
+            v.codec,
+            v.coded_width,
+            v.coded_height,
+            v.track_id,
+            v.description.len()
         );
     }
     for (name, a) in &catalog.audio {
         eprintln!(
             "audio \"{name}\": {} {}Hz {}ch (track {}, {} desc bytes)",
-            a.codec, a.sample_rate, a.number_of_channels, a.track_id, a.description.len()
+            a.codec,
+            a.sample_rate,
+            a.number_of_channels,
+            a.track_id,
+            a.description.len()
         );
     }
 
@@ -112,11 +120,7 @@ fn cmd_segment_dir(input: &mut impl Read, output_dir: &str) -> muxl::Result<()> 
     let catalog = muxl::segment_fmp4(input, |seg| {
         let filename = output_dir.join(format!("segment_{:04}.m4s", seg.number));
         fs::write(&filename, &seg.data)?;
-        eprintln!(
-            "segment {:4}: {} bytes",
-            seg.number,
-            seg.data.len()
-        );
+        eprintln!("segment {:4}: {} bytes", seg.number, seg.data.len());
         Ok(())
     })?;
 
@@ -133,11 +137,7 @@ fn cmd_segment_archive(input: &mut impl Read, output_path: &str) -> muxl::Result
     let mut segments: Vec<Vec<u8>> = Vec::new();
 
     let catalog = muxl::segment_fmp4(input, |seg| {
-        eprintln!(
-            "segment {:4}: {} bytes",
-            seg.number,
-            seg.data.len()
-        );
+        eprintln!("segment {:4}: {} bytes", seg.number, seg.data.len());
         segments.push(seg.data);
         Ok(())
     })?;

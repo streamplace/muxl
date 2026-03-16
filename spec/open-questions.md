@@ -80,6 +80,17 @@ Questions:
 2. **How does the S2PA manifest reference init changes?** Could version the init metadata, with each segment referencing which init version it uses.
 3. **Does the flat MP4 export need to handle multi-init?** In flat MP4, multiple stsd entries in a single moov handle this naturally. The question is whether the init→flat→re-segment round trip is lossless when init changes mid-stream.
 
+## Audio-only segmentation
+
+Segment boundaries are currently driven by video keyframes. For audio-only streams (e.g., podcast ingest, audio-only WHIP), there are no keyframes to split on.
+
+Options:
+1. **Fixed duration** (e.g., 1 second): simple, predictable segment sizes. Need to pick a duration that aligns cleanly with common audio frame sizes (20ms Opus, ~21.3ms AAC).
+2. **Fixed sample count**: e.g., 50 Opus packets per segment (= 1 second). Simpler alignment but duration varies if frame size changes.
+3. **Codec-frame-aligned duration target**: pick a target duration (e.g., 1s) and round to the nearest codec frame boundary. Avoids splitting mid-frame (which we'd never do anyway since each sample is atomic).
+
+Not urgent — current use case is always video+audio — but worth defining before audio-only ingest is supported.
+
 ## Content hashing details
 
 When computing per-track content hashes for signing (by S2PA or any other system), the hash input is each track's moof+mdat bytes within a MUXL segment.

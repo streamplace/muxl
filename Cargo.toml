@@ -4,5 +4,10 @@ version = "0.1.0"
 edition = "2024"
 license = "Apache-2.0"
 
+[features]
+wasm = ["wasm-bindgen", "js-sys"]
+
 [dependencies]
 mp4-atom = { git = "https://github.com/streamplace/mp4-atom.git", branch = "streamplace" }
+wasm-bindgen = { version = "0.2", optional = true }
+js-sys = { version = "0.3", optional = true }

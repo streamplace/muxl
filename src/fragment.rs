@@ -348,7 +348,7 @@ fn read_moov_streaming<R: Read>(reader: &mut R) -> Result<Moov> {
 ///
 /// `moof_box_size` is the total size of the original moof box (header + body),
 /// needed because trun data_offset values are relative to the moof start.
-fn process_moof_mdat(
+pub(crate) fn process_moof_mdat(
     moov: &Moov,
     moof: &Moof,
     moof_box_size: usize,

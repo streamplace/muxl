@@ -5,4 +5,4 @@ edition = "2024"
 license = "Apache-2.0"
 
 [dependencies]
-mp4-atom = "0.10.1"
+mp4-atom = { git = "https://github.com/streamplace/mp4-atom.git", branch = "streamplace" }

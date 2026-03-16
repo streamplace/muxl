@@ -124,6 +124,7 @@ pub fn build_init_segment(catalog: &Catalog) -> Result<Vec<u8>> {
         }),
         trak: traks,
         udta: None,
+        ainf: None,
     };
     moov.write_to(&mut buf).map_err(mp4_err)?;
 
@@ -337,6 +338,7 @@ fn build_video_trak(config: &VideoTrackConfig) -> Result<Trak> {
             },
             av1c,
             btrt: None,
+            ccst: None,
             colr: None,
             pasp: None,
             taic: None,
@@ -357,6 +359,8 @@ fn build_video_trak(config: &VideoTrackConfig) -> Result<Trak> {
             layer: 0,
             alternate_group: 0,
             enabled: true,
+            in_movie: true,
+            in_preview: false,
             volume: 0u8.into(),
             matrix: Default::default(),
             width: (config.coded_width as u16).into(),
@@ -381,6 +385,7 @@ fn build_video_trak(config: &VideoTrackConfig) -> Result<Trak> {
                 smhd: None,
                 nmhd: None,
                 sthd: None,
+                hmhd: None,
                 dinf: canonical_dinf(),
                 stbl: empty_stbl(Stsd {
                     codecs: vec![codec],
@@ -388,6 +393,7 @@ fn build_video_trak(config: &VideoTrackConfig) -> Result<Trak> {
             },
         },
         senc: None,
+        tref: None,
         udta: None,
     })
 }
@@ -432,6 +438,8 @@ fn build_audio_trak(config: &AudioTrackConfig) -> Result<Trak> {
             layer: 0,
             alternate_group: 0,
             enabled: true,
+            in_movie: true,
+            in_preview: false,
             volume: 1u8.into(), // audio tracks get volume 1.0
             matrix: Default::default(),
             width: 0u16.into(),
@@ -456,6 +464,7 @@ fn build_audio_trak(config: &AudioTrackConfig) -> Result<Trak> {
                 smhd: Some(Default::default()),
                 nmhd: None,
                 sthd: None,
+                hmhd: None,
                 dinf: canonical_dinf(),
                 stbl: empty_stbl(Stsd {
                     codecs: vec![codec],
@@ -463,6 +472,7 @@ fn build_audio_trak(config: &AudioTrackConfig) -> Result<Trak> {
             },
         },
         senc: None,
+        tref: None,
         udta: None,
     })
 }

@@ -57,12 +57,6 @@ moov (init — track config, empty sample tables)
 
 Valid fMP4 file. Players process moof+mdat pairs after the init.
 
-## Flat MP4
-
-Export format for maximum compatibility. Layout: `ftyp`, `mdat`, `moov`.
-
-Generated from MUXL segments + init data by consolidating all trun tables into moov sample tables and concatenating all mdat payloads. Mdat layout: all samples for track 1, then all samples for track 2, etc. (sequential per track, track_id order). Each sample is its own chunk.
-
 ## ftyp
 
 - **major_brand**: `isom`
@@ -73,7 +67,7 @@ Codec-agnostic. Players use stsd entries for codec detection.
 
 ## Init Segment moov
 
-The moov in the init segment describes track configuration with empty sample tables. It uses the same canonical field values as the flat MP4 moov, but with zero durations and no sample entries.
+The moov in the init segment describes track configuration with empty sample tables, zero durations, and no sample entries.
 
 Required child boxes: `mvhd`, `trak` (one per track), `mvex` (with `trex` per track).
 
@@ -84,7 +78,7 @@ Required child boxes: `mvhd`, `trak` (one per track), `mvex` (with `trex` per tr
 - **creation_time**: 0
 - **modification_time**: 0
 - **timescale**: 1000
-- **duration**: 0 (init segment) or max of track durations (flat MP4)
+- **duration**: 0
 - **rate**: 1.0
 - **volume**: 1.0
 - **matrix**: identity
@@ -113,7 +107,7 @@ Sorted by track_id ascending. No udta, meta, or iods.
 - **flags**: 3 (track_enabled | track_in_movie)
 - **creation_time**: 0
 - **modification_time**: 0
-- **duration**: 0 (init segment) or derived from mdhd (flat MP4)
+- **duration**: 0
 - **matrix, width/height, layer, alternate_group, volume**: from track config
 
 ### mdhd
@@ -123,7 +117,7 @@ Sorted by track_id ascending. No udta, meta, or iods.
 - **creation_time**: 0
 - **modification_time**: 0
 - **timescale**: preserved from source track (passthrough)
-- **duration**: 0 (init segment) or recomputed (flat MP4)
+- **duration**: 0
 - **language**: `"und"`
 
 ### hdlr
@@ -142,17 +136,7 @@ Sorted by track_id ascending. No udta, meta, or iods.
 
 ### stbl (Sample Table)
 
-In init segment: stsd populated with codec config, all other tables empty.
-
-In flat MP4:
-
-- **stsd**: codec configuration from track config
-- **stts**: from trun sample durations
-- **stss**: derived from trun sample flags (sync samples)
-- **ctts**: from trun composition time offsets
-- **stsz**: from trun sample sizes
-- **stsc**: one sample per chunk, entries track sample_description_index changes
-- **stco/co64**: recomputed from mdat layout; stco if all offsets fit in u32
+stsd populated with codec config, all other tables empty.
 
 ### edts / elst
 

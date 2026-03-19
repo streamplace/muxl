@@ -42,7 +42,7 @@ Pros:
 
 Cons:
 
-- Need to decide whether `muxl` means "canonical archive fMP4", "canonical flat MP4", or both — possibly separate brands (`mxla` archive, `mxlf` flat?)
+- Need to decide exactly what `muxl` brand promises about the file's structure
 - A brand is a promise — need to be confident the spec is stable enough before stamping files with it
 
 ## Audio priming sample handling
@@ -99,7 +99,6 @@ Questions:
 
 1. **Where does the new init appear in the archive fMP4?** Could emit a new ftyp+moov inline in the file at the point of change, but multi-moov fMP4 files are unusual. Alternatively, the S2PA manifest tracks init segment versions and the archive file just has one init at the start covering the initial config.
 2. **How does the S2PA manifest reference init changes?** Could version the init metadata, with each segment referencing which init version it uses.
-3. **Does the flat MP4 export need to handle multi-init?** In flat MP4, multiple stsd entries in a single moov handle this naturally. The question is whether the init→flat→re-segment round trip is lossless when init changes mid-stream.
 
 ## Audio-only segmentation
 
@@ -121,3 +120,11 @@ Questions:
 
 1. **Hash boundary**: does the hash cover the full box bytes (headers included) or just payloads? Full box bytes is simpler and more robust.
 2. **Hash algorithm**: BLAKE3 is the natural choice for content addressing (used elsewhere in DASL/AT Protocol ecosystem), but this is ultimately a decision for the signing layer, not MUXL.
+
+## Export format (flat MP4)
+
+MUXL currently only defines fMP4-based formats (segments and archives). A canonical flat MP4 format (ftyp+mdat+moov with complete sample tables) would provide maximum compatibility with players, editors, and media tools that don't support fMP4.
+
+A flat MP4 could be deterministically generated from a MUXL archive by consolidating trun tables into moov sample tables and concatenating mdat payloads. The reverse (flat MP4 → MUXL segments via re-segmentation at keyframe boundaries) would enable signature verification from an export.
+
+Not shipping in v1 — fMP4 is simpler to canonicalize and sufficient for streaming use cases. Revisit when export/download workflows need it.

@@ -34,13 +34,12 @@ Library (`src/lib.rs`) + CLI (`src/main.rs`). Uses a vendored fork of `mp4-rust`
 
 **MUXL archive fMP4** (storage): `ftyp + moov (init) + [MUXL segments...]` — valid fMP4 file, appendable, crash-safe.
 
-**Flat MP4** (export): `ftyp + mdat + moov` — generated on-demand for universal playback. Round-trips back to MUXL segments via re-segmentation at keyframe boundaries.
-
 Public functions:
-- **`canonicalize()`**: arbitrary MP4 → canonical flat MP4 (implemented)
-- **`fragment()`**: flat MP4 → per-frame Hang CMAF fragments (implemented)
-- **`segment()`**: flat MP4 → MUXL segments (todo)
-- **`flatten()`**: canonical fMP4 → flat MP4 (todo)
+- **`catalog_from_mp4()`**: extract track configuration metadata from MP4/fMP4
+- **`build_init_segment()`**: catalog → canonical ftyp+moov init segment
+- **`fragment_fmp4()`**: fMP4 → per-frame Hang CMAF fragments (streaming, Read only)
+- **`segment_fmp4()`**: fMP4 → MUXL segments (streaming, Read only)
+- **`Segmenter`**: push-based segmenter for WASM/async (feed chunks, get events)
 
 **Key design constraints**:
 - Livestreaming ingest via WebRTC/WHIP — segments arrive as 1-second chunks

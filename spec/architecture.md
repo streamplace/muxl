@@ -11,9 +11,8 @@ Deterministic canonicalization decouples transport, storage, and signing. The sa
 ```
 source frames
   ├─ Hang CMAF (per-frame moof+mdat)            → MoQ transport, minimal latency
-  ├─ MUXL segment (per-track moof+mdat ×N)      → canonical byte sequence, signing unit
-  ├─ MUXL archive fMP4 (ftyp+moov+segments)     → appendable storage, playback
-  └─ flat MP4 (ftyp+mdat+moov)                  → export, universal playback
+  ├─ MUXL segment (per-GoP moof+mdat pairs)     → canonical byte sequence, signing unit
+  └─ MUXL archive fMP4 (ftyp+moov+segments)     → appendable storage, playback
 ```
 
 ### Hang CMAF — Transport Format
@@ -62,34 +61,15 @@ The init segment is stable as long as the track configuration doesn't change. Wh
 
 The init segment is deterministic: given the same track configuration, any MUXL implementation produces identical init bytes.
 
-### Flat MP4 — Export Format
-
-Standard MP4 with a single `moov` containing complete sample tables and a single `mdat` containing all sample data. Layout: `ftyp`, `mdat`, `moov`.
-
-Maximally compatible with players, editors, and media tools. Generated on demand from MUXL archive fMP4 or segments + init data.
-
-Can be deterministically converted back to MUXL segments by re-segmenting at keyframe boundaries. This is what enables signature verification from a flat MP4 export.
-
-See `canonical-form.md` for detailed box-level specification.
-
 ## Round-Trip Properties
 
 ```
 Hang CMAF ──canonicalize──► MUXL segments ──prepend init──► archive fMP4
-                                │                                │
-                                │                           flatten ↓
-                                │                            flat MP4
-                                │                                │
-                                ◄────────── re-segment ──────────┘
 ```
 
-- **Hang CMAF → MUXL segments**: Accumulate per-frame fragments into GoP-sized segments. Construct per-track moof+mdat pairs. Apply canonical ordering and metadata normalization.
+- **Hang CMAF → MUXL segments**: Accumulate per-frame fragments into GoP-sized segments. Apply canonical ordering and metadata normalization.
 
 - **MUXL segments → archive fMP4**: Derive init segment from track metadata. Prepend to concatenated segments.
-
-- **archive fMP4 → flat MP4** (`flatten`): Consolidate all moof/trun tables into moov sample tables. Concatenate all mdat payloads. Write single moov at end.
-
-- **flat MP4 → MUXL segments** (`segment`): Walk moov sample tables to find keyframe boundaries (stss). Slice samples into GoP-sized segments. Construct per-track moof+mdat pairs. Each segment's content bytes are identical to the original.
 
 ## Signing Pipeline
 
@@ -150,6 +130,5 @@ In the pipeline:
 1. Resolution change always aligns with a keyframe (codec requirement)
 2. Keyframe starts a new GoP → new MUXL segment
 3. New segment references updated codec parameters via the init data
-4. In flat MP4, `stsd` accumulates multiple entries; `stsc` tracks the transitions
 
 Because segment boundaries align with codec parameter changes, each segment is self-consistent — it references exactly one set of codec parameters per track.

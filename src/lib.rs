@@ -1,4 +1,5 @@
 pub mod catalog;
+pub mod cbor;
 mod error;
 mod fragment;
 mod init;

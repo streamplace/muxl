@@ -11,6 +11,7 @@ fn usage() -> ! {
     eprintln!("  init <input.mp4> <output_init.mp4>        Build canonical init segment");
     eprintln!("  segment <input> --dir <output_dir>        Segment fMP4 into directory");
     eprintln!("  segment <input> --archive <output.mp4>    Segment fMP4 into archive file");
+    eprintln!("  segment <input> --stdout                  Stream segments to stdout (framed)");
     eprintln!();
     eprintln!("  <input> can be a file path or \"-\" for stdin");
     process::exit(1);
@@ -84,16 +85,16 @@ fn cmd_init(args: &[String]) -> muxl::Result<()> {
 }
 
 fn cmd_segment(args: &[String]) -> muxl::Result<()> {
-    if args.len() != 3 {
+    if args.len() < 2 {
         eprintln!("Usage: muxl segment <input> --dir <output_dir>");
         eprintln!("       muxl segment <input> --archive <output.mp4>");
+        eprintln!("       muxl segment <input> --stdout");
         eprintln!("  <input> can be a file path or \"-\" for stdin");
         process::exit(1);
     }
 
     let input_path = &args[0];
     let mode = &args[1];
-    let output_path = &args[2];
 
     // Open input: file or stdin
     let mut input: Box<dyn Read> = if input_path == "-" {
@@ -103,11 +104,24 @@ fn cmd_segment(args: &[String]) -> muxl::Result<()> {
     };
 
     match mode.as_str() {
-        "--dir" => cmd_segment_dir(&mut input, output_path),
-        "--archive" => cmd_segment_archive(&mut input, output_path),
+        "--dir" => {
+            let output_path = args.get(2).unwrap_or_else(|| {
+                eprintln!("Missing output directory");
+                process::exit(1);
+            });
+            cmd_segment_dir(&mut input, output_path)
+        }
+        "--archive" => {
+            let output_path = args.get(2).unwrap_or_else(|| {
+                eprintln!("Missing output file");
+                process::exit(1);
+            });
+            cmd_segment_archive(&mut input, output_path)
+        }
+        "--stdout" => cmd_segment_stdout(&mut input),
         _ => {
             eprintln!("Unknown segment mode: {mode}");
-            eprintln!("Use --dir or --archive");
+            eprintln!("Use --dir, --archive, or --stdout");
             process::exit(1);
         }
     }
@@ -130,6 +144,49 @@ fn cmd_segment_dir(input: &mut impl Read, output_dir: &str) -> muxl::Result<()> 
     fs::write(&init_path, &init)?;
     eprintln!("init: {} bytes", init.len());
 
+    Ok(())
+}
+
+/// Stream segments to stdout as CBOR (DRISL) events.
+///
+/// Each event is a separate CBOR value in the stream:
+///   {"type": "init", "data": <bstr>}
+///   {"type": "segment", "number": <uint>, "data": <bstr>}
+///
+/// Uses the push-based segmenter so init is emitted first (before segments).
+fn cmd_segment_stdout(input: &mut impl Read) -> muxl::Result<()> {
+    let mut stdout = io::stdout().lock();
+    let mut buf = [0u8; 64 * 1024];
+    let mut segmenter = muxl::Segmenter::new();
+
+    loop {
+        let n = input.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        for event in segmenter.feed(&buf[..n])? {
+            write_cbor_event(&mut stdout, &event)?;
+        }
+    }
+    for event in segmenter.flush()? {
+        write_cbor_event(&mut stdout, &event)?;
+    }
+    Ok(())
+}
+
+fn write_cbor_event(w: &mut impl io::Write, event: &muxl::SegmenterEvent) -> muxl::Result<()> {
+    let cbor_event = muxl::cbor::CborEvent::from_event(event);
+    dasl::drisl::to_writer(&mut *w, &cbor_event)
+        .map_err(|e| muxl::Error::Io(io::Error::new(io::ErrorKind::Other, e.to_string())))?;
+    w.flush()?;
+    match event {
+        muxl::SegmenterEvent::InitSegment { data, .. } => {
+            eprintln!("init: {} bytes", data.len());
+        }
+        muxl::SegmenterEvent::Segment(seg) => {
+            eprintln!("segment: {} bytes", seg.data.len());
+        }
+    }
     Ok(())
 }
 

@@ -1,4 +1,4 @@
-# Open Questions
+# Sources of Nondeterminism
 
 Issues that need further investigation before the canonical form is finalized.
 
@@ -10,7 +10,7 @@ Neither ffmpeg nor GStreamer use this field during demuxing; the ISOBMFF spec sa
 
 Options:
 
-1. **Zero all sequence numbers**: simplest, maximally deterministic. Risk: some proprietary decoder or player might reject or mishandle moof with sequence_number=0.
+1. **Zero all sequence numbers**: simplest, maximally deterministic. Risk: some proprietary decoder or player might reject or mishandle repeated moof with sequence_number=0.
 2. **Per-segment numbering** (reset to 1 at each segment boundary): each segment is independently numbered starting at 1. Maintains monotonicity within a playback session for any given segment. Segments are identical regardless of position in the stream.
 3. **Global numbering** (current): simple, spec-compliant, but prevents content-identical segments from being byte-identical.
 

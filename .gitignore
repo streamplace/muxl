@@ -1,4 +1,4 @@
 /target
 output
 .claude
-/go-wasi
+**/go-wasi

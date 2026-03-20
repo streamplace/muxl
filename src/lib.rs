@@ -1,5 +1,6 @@
 pub mod catalog;
 pub mod cbor;
+pub mod concat;
 mod error;
 mod fragment;
 mod init;
@@ -14,5 +15,6 @@ pub use fragment::{
     fragment_track,
 };
 pub use init::{build_init_segment, catalog_from_moov, catalog_from_mp4, read_moov};
+pub use concat::Concatenator;
 pub use push::{Segmenter, SegmenterEvent};
 pub use segment::{Segment, segment_fmp4};

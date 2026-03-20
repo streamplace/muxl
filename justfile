@@ -137,6 +137,17 @@ show-changes file: build
     diff <(python3 scripts/mp4dump.py --flat "{{file}}") \
          <(python3 scripts/mp4dump.py --flat "$tmpdir/canonical.mp4") || true
 
+# Build WASI binary (for Go/wazero embedding)
+build-wasi:
+    cargo build --target wasm32-wasip1 --release
+
+# Build browser WASM library (with wasm-bindgen)
+build-wasm:
+    cargo build --target wasm32-unknown-unknown --lib --features wasm --release
+
+# Build all WASM targets
+build-wasm-all: build-wasi build-wasm
+
 # Clean build artifacts
 clean:
     cargo clean

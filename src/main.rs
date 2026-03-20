@@ -12,6 +12,7 @@ fn usage() -> ! {
     eprintln!("  segment <input> --dir <output_dir>        Segment fMP4 into directory");
     eprintln!("  segment <input> --archive <output.mp4>    Segment fMP4 into archive file");
     eprintln!("  segment <input> --stdout                  Stream segments to stdout (framed)");
+    eprintln!("  concat                                    Concatenate MUXL archives from stdin (CBOR out)");
     eprintln!();
     eprintln!("  <input> can be a file path or \"-\" for stdin");
     process::exit(1);
@@ -27,6 +28,7 @@ fn main() {
         "catalog" => cmd_catalog(&args[2..]),
         "init" => cmd_init(&args[2..]),
         "segment" => cmd_segment(&args[2..]),
+        "concat" => cmd_concat(),
         _ => {
             eprintln!("Unknown command: {}", args[1]);
             usage();
@@ -186,6 +188,32 @@ fn write_cbor_event(w: &mut impl io::Write, event: &muxl::SegmenterEvent) -> mux
         muxl::SegmenterEvent::Segment(seg) => {
             eprintln!("segment: {} bytes", seg.data.len());
         }
+    }
+    Ok(())
+}
+
+/// Concatenate MUXL archives from stdin, emit CBOR events to stdout.
+///
+/// Reads concatenated MUXL fMP4 archives from stdin. Emits init events only
+/// when the catalog changes between archives. UUID atoms delimit segments
+/// and are passed through in the segment data.
+fn cmd_concat() -> muxl::Result<()> {
+    let mut stdin = io::stdin().lock();
+    let mut stdout = io::stdout().lock();
+    let mut buf = [0u8; 64 * 1024];
+    let mut concat = muxl::Concatenator::new();
+
+    loop {
+        let n = stdin.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        for event in concat.feed(&buf[..n])? {
+            write_cbor_event(&mut stdout, &event)?;
+        }
+    }
+    for event in concat.flush()? {
+        write_cbor_event(&mut stdout, &event)?;
     }
     Ok(())
 }

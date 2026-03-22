@@ -18,3 +18,6 @@ pub use init::{build_init_segment, catalog_from_moov, catalog_from_mp4, read_moo
 pub use concat::Concatenator;
 pub use push::{Segmenter, SegmenterEvent};
 pub use segment::{Segment, segment_fmp4};
+
+mod cli;
+pub use cli::cli_main;

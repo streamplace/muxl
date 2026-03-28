@@ -35,6 +35,10 @@ pub struct GopSegment {
     pub number: u32,
     /// Per-track moof+mdat data, keyed by track_id (ordered ascending).
     pub tracks: BTreeMap<u32, Vec<u8>>,
+    /// Per-track total duration in timescale ticks.
+    pub durations: BTreeMap<u32, u64>,
+    /// Per-track sample (frame) count.
+    pub sample_counts: BTreeMap<u32, u32>,
 }
 
 /// Segment an fMP4 stream into per-track, GOP-aligned MUXL segments.
@@ -55,6 +59,8 @@ pub fn segment_fmp4<R: Read>(
 
     // Per-track buffers, ordered by track_id
     let mut track_bufs: BTreeMap<u32, Vec<u8>> = BTreeMap::new();
+    let mut track_durations: BTreeMap<u32, u64> = BTreeMap::new();
+    let mut track_sample_counts: BTreeMap<u32, u32> = BTreeMap::new();
     let mut segment_number: u32 = 0;
     let mut seen_first_keyframe = false;
 
@@ -63,7 +69,7 @@ pub fn segment_fmp4<R: Read>(
 
         if is_video_keyframe && seen_first_keyframe {
             segment_number += 1;
-            if let Some(gop) = flush_track_bufs(&mut track_bufs, segment_number) {
+            if let Some(gop) = flush_track_bufs(&mut track_bufs, &mut track_durations, &mut track_sample_counts, segment_number) {
                 on_gop(gop)?;
             }
         }
@@ -72,6 +78,8 @@ pub fn segment_fmp4<R: Read>(
             seen_first_keyframe = true;
         }
 
+        *track_durations.entry(frame.track_id).or_default() += frame.duration as u64;
+        *track_sample_counts.entry(frame.track_id).or_default() += 1;
         track_bufs
             .entry(frame.track_id)
             .or_default()
@@ -80,7 +88,7 @@ pub fn segment_fmp4<R: Read>(
 
     // Flush remaining data
     segment_number += 1;
-    if let Some(gop) = flush_track_bufs(&mut track_bufs, segment_number) {
+    if let Some(gop) = flush_track_bufs(&mut track_bufs, &mut track_durations, &mut track_sample_counts, segment_number) {
         on_gop(gop)?;
     }
 
@@ -92,20 +100,31 @@ pub fn segment_fmp4<R: Read>(
 /// Returns `None` if all buffers are empty.
 pub(crate) fn flush_track_bufs(
     track_bufs: &mut BTreeMap<u32, Vec<u8>>,
+    track_durations: &mut BTreeMap<u32, u64>,
+    track_sample_counts: &mut BTreeMap<u32, u32>,
     segment_number: u32,
 ) -> Option<GopSegment> {
     let mut tracks = BTreeMap::new();
+    let mut durations = BTreeMap::new();
+    let mut sample_counts = BTreeMap::new();
     for (&track_id, buf) in track_bufs.iter_mut() {
         if !buf.is_empty() {
             tracks.insert(track_id, std::mem::take(buf));
+            durations.insert(track_id, track_durations.remove(&track_id).unwrap_or(0));
+            sample_counts.insert(track_id, track_sample_counts.remove(&track_id).unwrap_or(0));
         }
     }
+    // Clear any remaining entries for tracks that had no data
+    track_durations.clear();
+    track_sample_counts.clear();
     if tracks.is_empty() {
         None
     } else {
         Some(GopSegment {
             number: segment_number,
             tracks,
+            durations,
+            sample_counts,
         })
     }
 }

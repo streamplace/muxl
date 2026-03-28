@@ -53,6 +53,10 @@ pub struct Concatenator {
     state: ConcatState,
     /// Per-track segment buffers, ordered by track_id.
     track_bufs: BTreeMap<u32, Vec<u8>>,
+    /// Per-track accumulated duration in timescale ticks.
+    track_durations: BTreeMap<u32, u64>,
+    /// Per-track accumulated sample count.
+    track_sample_counts: BTreeMap<u32, u32>,
     segment_number: u32,
 }
 
@@ -86,6 +90,8 @@ impl Concatenator {
             pending_uuid: None,
             state: ConcatState::WaitingForInit,
             track_bufs: BTreeMap::new(),
+            track_durations: BTreeMap::new(),
+            track_sample_counts: BTreeMap::new(),
             segment_number: 0,
         }
     }
@@ -238,6 +244,8 @@ impl Concatenator {
                             ss.seen_first_keyframe = true;
                         }
 
+                        *self.track_durations.entry(frame.track_id).or_default() += frame.duration as u64;
+                        *self.track_sample_counts.entry(frame.track_id).or_default() += 1;
                         self.track_bufs
                             .entry(frame.track_id)
                             .or_default()
@@ -267,6 +275,8 @@ impl Concatenator {
         self.segment_number += 1;
         let uuid = self.current_uuid.clone();
         let mut tracks = BTreeMap::new();
+        let mut durations = BTreeMap::new();
+        let mut sample_counts = BTreeMap::new();
         for (&track_id, buf) in self.track_bufs.iter_mut() {
             if !buf.is_empty() {
                 let mut data = Vec::new();
@@ -275,12 +285,18 @@ impl Concatenator {
                 }
                 data.append(buf);
                 tracks.insert(track_id, data);
+                durations.insert(track_id, self.track_durations.remove(&track_id).unwrap_or(0));
+                sample_counts.insert(track_id, self.track_sample_counts.remove(&track_id).unwrap_or(0));
             }
         }
+        self.track_durations.clear();
+        self.track_sample_counts.clear();
         if !tracks.is_empty() {
             events.push(SegmenterEvent::Segment(GopSegment {
                 number: self.segment_number,
                 tracks,
+                durations,
+                sample_counts,
             }));
         }
     }

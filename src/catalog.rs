@@ -9,8 +9,10 @@
 
 use std::collections::BTreeMap;
 
+use serde::{Deserialize, Serialize};
+
 /// Complete catalog describing all tracks in a presentation.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Catalog {
     /// Video tracks, keyed by rendition name.
     pub video: BTreeMap<String, VideoTrackConfig>,
@@ -19,12 +21,13 @@ pub struct Catalog {
 }
 
 /// Configuration for a video track.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VideoTrackConfig {
     /// WebCodecs codec string, e.g. "avc1.64001f", "av01.0.08M.08".
     pub codec: String,
     /// Raw codec-specific description bytes (avcC record for H.264, av1C for AV1).
     /// This is the WebCodecs VideoDecoderConfig.description content.
+    #[serde(with = "serde_bytes")]
     pub description: Vec<u8>,
     /// Coded pixel width.
     pub coded_width: u32,
@@ -38,11 +41,12 @@ pub struct VideoTrackConfig {
 }
 
 /// Configuration for an audio track.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AudioTrackConfig {
     /// WebCodecs codec string, e.g. "opus", "mp4a.40.2".
     pub codec: String,
     /// Raw codec-specific description bytes (dOps content for Opus, esds content for AAC).
+    #[serde(with = "serde_bytes")]
     pub description: Vec<u8>,
     /// Sample rate in Hz.
     pub sample_rate: u32,

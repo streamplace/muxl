@@ -199,6 +199,8 @@ pub struct Frame {
     pub track_id: u32,
     /// Whether this is a sync (key) frame.
     pub is_sync: bool,
+    /// Duration of this sample in timescale ticks.
+    pub duration: u32,
     /// Encoded moof+mdat bytes for this single frame.
     pub data: Vec<u8>,
 }
@@ -419,6 +421,7 @@ pub(crate) fn process_moof_mdat(
                 on_frame(Frame {
                     track_id,
                     is_sync: frame.is_sync,
+                    duration: frame.duration,
                     data: frag_buf,
                 })?;
 

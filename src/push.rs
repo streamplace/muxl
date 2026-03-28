@@ -68,6 +68,10 @@ struct StreamingState {
     track_state: HashMap<u32, (u64, u32)>,
     /// Per-track segment buffers, ordered by track_id.
     track_bufs: BTreeMap<u32, Vec<u8>>,
+    /// Per-track accumulated duration in timescale ticks.
+    track_durations: BTreeMap<u32, u64>,
+    /// Per-track accumulated sample count.
+    track_sample_counts: BTreeMap<u32, u32>,
     segment_number: u32,
     seen_first_keyframe: bool,
     /// A parsed moof waiting for its following mdat.
@@ -137,6 +141,8 @@ impl Segmenter {
                             video_track_ids,
                             track_state: HashMap::new(),
                             track_bufs: BTreeMap::new(),
+                            track_durations: BTreeMap::new(),
+                            track_sample_counts: BTreeMap::new(),
                             segment_number: 0,
                             seen_first_keyframe: false,
                             pending_moof: None,
@@ -187,7 +193,7 @@ impl Segmenter {
                                 if is_video_keyframe && ss.seen_first_keyframe {
                                     ss.segment_number += 1;
                                     if let Some(gop) =
-                                        flush_track_bufs(&mut ss.track_bufs, ss.segment_number)
+                                        flush_track_bufs(&mut ss.track_bufs, &mut ss.track_durations, &mut ss.track_sample_counts, ss.segment_number)
                                     {
                                         events.push(SegmenterEvent::Segment(gop));
                                     }
@@ -197,6 +203,8 @@ impl Segmenter {
                                     ss.seen_first_keyframe = true;
                                 }
 
+                                *ss.track_durations.entry(frame.track_id).or_default() += frame.duration as u64;
+                                *ss.track_sample_counts.entry(frame.track_id).or_default() += 1;
                                 ss.track_bufs
                                     .entry(frame.track_id)
                                     .or_default()
@@ -221,7 +229,7 @@ impl Segmenter {
         let mut events = Vec::new();
         if let State::Streaming(ss) = &mut self.state {
             ss.segment_number += 1;
-            if let Some(gop) = flush_track_bufs(&mut ss.track_bufs, ss.segment_number) {
+            if let Some(gop) = flush_track_bufs(&mut ss.track_bufs, &mut ss.track_durations, &mut ss.track_sample_counts, ss.segment_number) {
                 events.push(SegmenterEvent::Segment(gop));
             }
         }

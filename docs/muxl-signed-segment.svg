@@ -1,0 +1,147 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 880 520" font-family="'Inter', 'SF Pro', -apple-system, system-ui, sans-serif" font-size="13">
+  <style>
+    .title { font-size: 18px; font-weight: 700; fill: #111; }
+    .subtitle { font-size: 11.5px; fill: #666; }
+    .box-label { font-size: 11px; font-weight: 600; fill: #fff; }
+    .box-sublabel { font-size: 9.5px; fill: rgba(255,255,255,0.85); }
+    .section-label { font-size: 13px; font-weight: 600; fill: #333; }
+    .note { font-size: 10px; fill: #555; }
+    .mono { font-family: 'SF Mono', 'Fira Code', 'Consolas', monospace; }
+    .hash { font-family: 'SF Mono', monospace; font-size: 9px; fill: #2d8a56; }
+    .dim { fill: #999; }
+    .byte-label { font-family: 'SF Mono', monospace; font-size: 8.5px; fill: #888; }
+  </style>
+
+  <!-- Title -->
+  <text x="440" y="30" text-anchor="middle" class="title">Signed MUXL Segment</text>
+  <text x="440" y="47" text-anchor="middle" class="subtitle">A single signed fMP4: init + 1 video GoP + 1 audio GoP + C2PA manifest</text>
+
+  <!-- ═══════════════════════════════════════════ -->
+  <!-- Full signed segment container -->
+  <!-- ═══════════════════════════════════════════ -->
+  <rect x="20" y="65" width="840" height="108" rx="10" fill="#fafafa" stroke="#ccc" stroke-width="1.5"/>
+  <text x="30" y="82" class="section-label">Signed fMP4 file</text>
+
+  <!-- ftyp -->
+  <rect x="30" y="92" width="52" height="68" rx="5" fill="#888"/>
+  <text x="56" y="118" text-anchor="middle" class="box-label" font-size="10">ftyp</text>
+  <text x="56" y="131" text-anchor="middle" class="box-sublabel">isom</text>
+  <text x="56" y="165" class="byte-label" text-anchor="middle">24 B</text>
+
+  <!-- moov (init) -->
+  <rect x="88" y="92" width="115" height="68" rx="5" fill="#666"/>
+  <text x="145" y="112" text-anchor="middle" class="box-label" font-size="10">moov</text>
+  <text x="145" y="125" text-anchor="middle" class="box-sublabel">mvhd + trak×2</text>
+  <text x="145" y="138" text-anchor="middle" class="box-sublabel">empty stbl, mvex</text>
+  <text x="145" y="165" class="byte-label" text-anchor="middle">~1.1 KB</text>
+
+  <!-- Video GoP (track 1) -->
+  <rect x="210" y="92" width="220" height="68" rx="5" fill="#5b5fc7" opacity="0.9"/>
+  <text x="320" y="110" text-anchor="middle" class="box-label" font-size="10">Track 1 — Video GoP</text>
+  <text x="235" y="128" class="box-sublabel mono" font-size="8.5">moof+mdat</text>
+  <text x="295" y="128" class="box-sublabel mono" font-size="8.5">moof+mdat</text>
+  <text x="355" y="128" class="box-sublabel mono" font-size="8.5">moof+mdat</text>
+  <text x="235" y="141" class="box-sublabel mono" font-size="8.5">moof+mdat</text>
+  <text x="295" y="141" class="box-sublabel mono" font-size="8.5">moof+mdat</text>
+  <text x="355" y="141" class="box-sublabel" font-size="8.5">···</text>
+  <text x="250" y="153" class="box-sublabel" font-size="8">60 frames @ 60fps = 1s GoP</text>
+  <text x="320" y="165" class="byte-label" text-anchor="middle">~45 KB</text>
+
+  <!-- Audio GoP (track 2) -->
+  <rect x="436" y="92" width="155" height="68" rx="5" fill="#7c5bbf" opacity="0.9"/>
+  <text x="513" y="110" text-anchor="middle" class="box-label" font-size="10">Track 2 — Audio GoP</text>
+  <text x="456" y="128" class="box-sublabel mono" font-size="8.5">moof+mdat</text>
+  <text x="516" y="128" class="box-sublabel mono" font-size="8.5">moof+mdat</text>
+  <text x="456" y="141" class="box-sublabel mono" font-size="8.5">moof+mdat</text>
+  <text x="516" y="141" class="box-sublabel" font-size="8.5">···</text>
+  <text x="470" y="153" class="box-sublabel" font-size="8">~50 Opus packets = 1s</text>
+  <text x="513" y="165" class="byte-label" text-anchor="middle">~8 KB</text>
+
+  <!-- C2PA manifest (uuid box) -->
+  <rect x="597" y="92" width="115" height="68" rx="5" fill="#2d8a56" opacity="0.9"/>
+  <text x="654" y="110" text-anchor="middle" class="box-label" font-size="10">C2PA Manifest</text>
+  <text x="654" y="125" text-anchor="middle" class="box-sublabel">uuid box</text>
+  <text x="654" y="138" text-anchor="middle" class="box-sublabel">JUMBF payload</text>
+  <text x="654" y="165" class="byte-label" text-anchor="middle">~4 KB</text>
+
+  <!-- Signing key box -->
+  <rect x="718" y="92" width="135" height="68" rx="5" fill="#2d8a56" opacity="0.7"/>
+  <text x="785" y="110" text-anchor="middle" class="box-label" font-size="10">Signing Key</text>
+  <text x="785" y="126" text-anchor="middle" class="box-sublabel mono" font-size="8">ES256K / secp256k1</text>
+  <text x="785" y="140" text-anchor="middle" class="box-sublabel mono" font-size="8">did:key:zQ3sh...</text>
+  <text x="785" y="165" class="byte-label" text-anchor="middle">in manifest</text>
+
+  <!-- ═══════════════════════════════════════════ -->
+  <!-- Exploded view: what the signing covers -->
+  <!-- ═══════════════════════════════════════════ -->
+  <text x="30" y="210" class="section-label">What gets signed</text>
+  <text x="165" y="210" class="note">(C2PA content binding — hash assertions over canonical segment bytes)</text>
+
+  <!-- Video segment hash -->
+  <rect x="30" y="225" width="380" height="70" rx="8" fill="#f0f0ff" stroke="#5b5fc7" stroke-width="1.5"/>
+  <rect x="40" y="233" width="18" height="18" rx="3" fill="#5b5fc7"/>
+  <text x="65" y="247" class="section-label" font-size="12" fill="#5b5fc7">Video segment bytes (track 1)</text>
+
+  <text x="40" y="268" class="mono note" font-size="9.5">moof₁+mdat₁ | moof₂+mdat₂ | moof₃+mdat₃ | ··· | moof₆₀+mdat₆₀</text>
+  <text x="40" y="282" class="hash">BLAKE-3 → baeafiav2w...</text>
+
+  <!-- Audio segment hash -->
+  <rect x="430" y="225" width="380" height="70" rx="8" fill="#f5f0ff" stroke="#7c5bbf" stroke-width="1.5"/>
+  <rect x="440" y="233" width="18" height="18" rx="3" fill="#7c5bbf"/>
+  <text x="465" y="247" class="section-label" font-size="12" fill="#7c5bbf">Audio segment bytes (track 2)</text>
+
+  <text x="440" y="268" class="mono note" font-size="9.5">moof₁+mdat₁ | moof₂+mdat₂ | ··· | moof₅₀+mdat₅₀</text>
+  <text x="440" y="282" class="hash">BLAKE-3 → baeafibkrq...</text>
+
+  <!-- Arrows to manifest -->
+  <line x1="220" y1="297" x2="220" y2="330" stroke="#2d8a56" stroke-width="1.5" marker-end="url(#arrow-green)"/>
+  <line x1="620" y1="297" x2="620" y2="330" stroke="#2d8a56" stroke-width="1.5" marker-end="url(#arrow-green)"/>
+
+  <defs>
+    <marker id="arrow-green" viewBox="0 0 10 7" refX="10" refY="3.5" markerWidth="8" markerHeight="6" orient="auto-start-auto">
+      <polygon points="0 0, 10 3.5, 0 7" fill="#2d8a56"/>
+    </marker>
+  </defs>
+
+  <!-- C2PA Manifest detail -->
+  <rect x="30" y="335" width="820" height="105" rx="10" fill="#f0faf3" stroke="#2d8a56" stroke-width="1.5"/>
+  <text x="45" y="356" class="section-label" font-size="12" fill="#2d8a56">C2PA Manifest (JUMBF in uuid box)</text>
+
+  <!-- Assertion boxes -->
+  <rect x="45" y="366" width="230" height="60" rx="5" fill="#2d8a56" opacity="0.15" stroke="#2d8a56" stroke-width="1"/>
+  <text x="55" y="383" class="mono note" font-size="9" fill="#2d8a56" font-weight="600">Hash assertion (video)</text>
+  <text x="55" y="397" class="mono note" font-size="8.5" fill="#2d8a56">algorithm: blake3</text>
+  <text x="55" y="410" class="mono note" font-size="8.5" fill="#2d8a56">hash: baeafiav2w...</text>
+  <text x="55" y="420" class="mono note" font-size="8.5" fill="#2d8a56">track_id: 1</text>
+
+  <rect x="290" y="366" width="230" height="60" rx="5" fill="#2d8a56" opacity="0.15" stroke="#2d8a56" stroke-width="1"/>
+  <text x="300" y="383" class="mono note" font-size="9" fill="#2d8a56" font-weight="600">Hash assertion (audio)</text>
+  <text x="300" y="397" class="mono note" font-size="8.5" fill="#2d8a56">algorithm: blake3</text>
+  <text x="300" y="410" class="mono note" font-size="8.5" fill="#2d8a56">hash: baeafibkrq...</text>
+  <text x="300" y="420" class="mono note" font-size="8.5" fill="#2d8a56">track_id: 2</text>
+
+  <rect x="535" y="366" width="155" height="60" rx="5" fill="#2d8a56" opacity="0.15" stroke="#2d8a56" stroke-width="1"/>
+  <text x="545" y="383" class="mono note" font-size="9" fill="#2d8a56" font-weight="600">Signature</text>
+  <text x="545" y="397" class="mono note" font-size="8.5" fill="#2d8a56">algorithm: ES256K</text>
+  <text x="545" y="410" class="mono note" font-size="8.5" fill="#2d8a56">key: secp256k1</text>
+  <text x="545" y="420" class="mono note" font-size="8.5" fill="#2d8a56">sig: 0x3045...</text>
+
+  <rect x="705" y="366" width="135" height="60" rx="5" fill="#2d8a56" opacity="0.15" stroke="#2d8a56" stroke-width="1"/>
+  <text x="715" y="383" class="mono note" font-size="9" fill="#2d8a56" font-weight="600">Identity</text>
+  <text x="715" y="397" class="mono note" font-size="8.5" fill="#2d8a56">did:key:zQ3sh...</text>
+  <text x="715" y="410" class="mono note" font-size="8.5" fill="#2d8a56">action: c2pa.published</text>
+  <text x="715" y="420" class="mono note" font-size="8.5" fill="#2d8a56">time: 2026-03-28T...</text>
+
+  <!-- ═══════════════════════════════════════════ -->
+  <!-- Footer -->
+  <!-- ═══════════════════════════════════════════ -->
+  <rect x="20" y="458" width="840" height="48" rx="8" fill="#f8f8f8" stroke="#ddd" stroke-width="1"/>
+  <text x="35" y="476" class="note" font-weight="600" fill="#333">Verification:</text>
+  <text x="115" y="476" class="note">1. Extract manifest from uuid box</text>
+  <text x="340" y="476" class="note">2. BLAKE-3 hash each track's segment bytes</text>
+  <text x="610" y="476" class="note">3. Compare hashes to manifest assertions</text>
+  <text x="35" y="493" class="note" font-weight="600" fill="#333">Properties:</text>
+  <text x="115" y="493" class="note">Verify video without touching audio</text>
+  <text x="340" y="493" class="note">DID-based identity (no certificate authority)</text>
+  <text x="610" y="493" class="note">~1 GoP latency from capture to signed</text>
+</svg>

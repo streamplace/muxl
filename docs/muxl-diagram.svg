@@ -1,0 +1,211 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 900 680" font-family="'Inter', 'SF Pro', -apple-system, system-ui, sans-serif" font-size="13">
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 7" refX="10" refY="3.5" markerWidth="8" markerHeight="6" orient="auto-start-auto">
+      <polygon points="0 0, 10 3.5, 0 7" fill="#444"/>
+    </marker>
+    <marker id="arrow-green" viewBox="0 0 10 7" refX="10" refY="3.5" markerWidth="8" markerHeight="6" orient="auto-start-auto">
+      <polygon points="0 0, 10 3.5, 0 7" fill="#2d8a56"/>
+    </marker>
+  </defs>
+
+  <style>
+    .title { font-size: 20px; font-weight: 700; fill: #111; }
+    .subtitle { font-size: 12px; fill: #666; }
+    .box-label { font-size: 12px; font-weight: 600; fill: #fff; }
+    .box-sublabel { font-size: 10px; fill: rgba(255,255,255,0.85); }
+    .section-label { font-size: 14px; font-weight: 600; fill: #333; }
+    .note { font-size: 10.5px; fill: #555; }
+    .mono { font-family: 'SF Mono', 'Fira Code', 'Consolas', monospace; font-size: 11px; }
+    .hash { font-family: 'SF Mono', monospace; font-size: 9.5px; fill: #2d8a56; }
+  </style>
+
+  <!-- Title -->
+  <text x="450" y="32" text-anchor="middle" class="title">MUXL Architecture</text>
+  <text x="450" y="50" text-anchor="middle" class="subtitle">Deterministic MP4 canonicalization for content-addressed video</text>
+
+  <!-- ═══════════════════════════════════════════ -->
+  <!-- CATALOG (top left) -->
+  <!-- ═══════════════════════════════════════════ -->
+  <g transform="translate(30, 75)">
+    <text x="0" y="0" class="section-label">Catalog</text>
+    <text x="0" y="16" class="note">Track configuration metadata (out-of-band)</text>
+
+    <rect x="0" y="28" width="250" height="90" rx="6" fill="#5b5fc7" opacity="0.95"/>
+    <text x="12" y="48" class="box-label">Video Track 1</text>
+    <text x="12" y="62" class="box-sublabel mono">codec: avc1.64002A</text>
+    <text x="12" y="75" class="box-sublabel mono">1920x1080 @ 60fps</text>
+    <text x="12" y="88" class="box-sublabel mono">timescale: 60000</text>
+    <text x="12" y="101" class="box-sublabel mono">track_id: 1</text>
+
+    <rect x="260" y="28" width="250" height="90" rx="6" fill="#7c5bbf" opacity="0.95"/>
+    <text x="272" y="48" class="box-label">Audio Track 2</text>
+    <text x="272" y="62" class="box-sublabel mono">codec: opus</text>
+    <text x="272" y="75" class="box-sublabel mono">48000 Hz, 2ch</text>
+    <text x="272" y="88" class="box-sublabel mono">timescale: 48000</text>
+    <text x="272" y="101" class="box-sublabel mono">track_id: 2</text>
+  </g>
+
+  <!-- Arrow: catalog → init segments -->
+  <line x1="285" y1="198" x2="285" y2="228" stroke="#444" stroke-width="1.5" marker-end="url(#arrow)" stroke-dasharray="4,3"/>
+  <text x="292" y="218" class="note" font-style="italic">derives</text>
+
+  <!-- ═══════════════════════════════════════════ -->
+  <!-- INIT SEGMENTS -->
+  <!-- ═══════════════════════════════════════════ -->
+  <g transform="translate(30, 235)">
+    <text x="0" y="0" class="section-label">Init Segments</text>
+    <text x="0" y="16" class="note">ftyp + moov (empty sample tables) — deterministic from catalog</text>
+
+    <!-- Multi-track init -->
+    <rect x="0" y="28" width="510" height="44" rx="6" fill="#e8e8e8" stroke="#bbb" stroke-width="1"/>
+    <rect x="4" y="32" width="60" height="36" rx="4" fill="#888"/>
+    <text x="34" y="55" text-anchor="middle" class="box-label" font-size="11">ftyp</text>
+    <rect x="68" y="32" width="438" height="36" rx="4" fill="#666"/>
+    <text x="287" y="55" text-anchor="middle" class="box-label" font-size="11">moov (track 1 + track 2, empty stbl, mvex)</text>
+    <text x="520" y="55" class="note">Multi-track init (archive)</text>
+
+    <!-- Per-track inits -->
+    <rect x="0" y="82" width="245" height="38" rx="6" fill="#e8e8e8" stroke="#5b5fc7" stroke-width="1.5"/>
+    <rect x="4" y="86" width="40" height="30" rx="4" fill="#888"/>
+    <text x="24" y="105" text-anchor="middle" class="box-label" font-size="10">ftyp</text>
+    <rect x="48" y="86" width="193" height="30" rx="4" fill="#5b5fc7"/>
+    <text x="144" y="105" text-anchor="middle" class="box-label" font-size="10">moov (track 1 only)</text>
+
+    <rect x="260" y="82" width="250" height="38" rx="6" fill="#e8e8e8" stroke="#7c5bbf" stroke-width="1.5"/>
+    <rect x="264" y="86" width="40" height="30" rx="4" fill="#888"/>
+    <text x="284" y="105" text-anchor="middle" class="box-label" font-size="10">ftyp</text>
+    <rect x="308" y="86" width="198" height="30" rx="4" fill="#7c5bbf"/>
+    <text x="407" y="105" text-anchor="middle" class="box-label" font-size="10">moov (track 2 only)</text>
+
+    <text x="520" y="105" class="note">Per-track inits (HLS CMAF)</text>
+  </g>
+
+  <!-- Arrow: init → archive -->
+  <line x1="285" y1="365" x2="285" y2="395" stroke="#444" stroke-width="1.5" marker-end="url(#arrow)"/>
+
+  <!-- ═══════════════════════════════════════════ -->
+  <!-- MUXL SEGMENTS -->
+  <!-- ═══════════════════════════════════════════ -->
+  <g transform="translate(545, 235)">
+    <text x="0" y="0" class="section-label">MUXL Segments</text>
+    <text x="0" y="16" class="note">Per-track, per-GoP canonical bytes</text>
+
+    <!-- Video segments -->
+    <rect x="0" y="28" width="320" height="32" rx="5" fill="#5b5fc7" opacity="0.85"/>
+    <text x="8" y="49" class="box-label" font-size="10">Track 1 GoP 1: moof+mdat moof+mdat moof+mdat ...</text>
+
+    <rect x="0" y="64" width="320" height="32" rx="5" fill="#5b5fc7" opacity="0.7"/>
+    <text x="8" y="85" class="box-label" font-size="10">Track 1 GoP 2: moof+mdat moof+mdat moof+mdat ...</text>
+
+    <!-- Audio segments -->
+    <rect x="0" y="106" width="320" height="32" rx="5" fill="#7c5bbf" opacity="0.85"/>
+    <text x="8" y="127" class="box-label" font-size="10">Track 2 GoP 1: moof+mdat moof+mdat ...</text>
+
+    <rect x="0" y="142" width="320" height="32" rx="5" fill="#7c5bbf" opacity="0.7"/>
+    <text x="8" y="163" class="box-label" font-size="10">Track 2 GoP 2: moof+mdat moof+mdat ...</text>
+
+    <!-- Hash annotations -->
+    <text x="328" y="49" class="hash">BLAKE-3 → CID</text>
+    <text x="328" y="85" class="hash">BLAKE-3 → CID</text>
+    <text x="328" y="127" class="hash">BLAKE-3 → CID</text>
+    <text x="328" y="163" class="hash">BLAKE-3 → CID</text>
+
+    <text x="0" y="192" class="note">Each segment is independently hashable,</text>
+    <text x="0" y="205" class="note">signable, and blindly concatenatable.</text>
+  </g>
+
+  <!-- Arrow: segments → archive -->
+  <line x1="700" y1="440" x2="560" y2="410" stroke="#444" stroke-width="1.5" marker-end="url(#arrow)"/>
+
+  <!-- ═══════════════════════════════════════════ -->
+  <!-- ARCHIVE fMP4 -->
+  <!-- ═══════════════════════════════════════════ -->
+  <g transform="translate(30, 400)">
+    <text x="0" y="0" class="section-label">MUXL Archive fMP4</text>
+    <text x="0" y="16" class="note">Valid fMP4 file — per-track byte-range addressable</text>
+
+    <rect x="0" y="28" width="835" height="52" rx="8" fill="#f5f5f5" stroke="#ccc" stroke-width="1.5"/>
+
+    <!-- Init -->
+    <rect x="4" y="32" width="90" height="44" rx="5" fill="#666"/>
+    <text x="49" y="50" text-anchor="middle" class="box-label" font-size="10">ftyp+moov</text>
+    <text x="49" y="63" text-anchor="middle" class="box-sublabel" font-size="9">(init)</text>
+
+    <!-- Track 1 segments -->
+    <rect x="100" y="32" width="140" height="44" rx="5" fill="#5b5fc7" opacity="0.85"/>
+    <text x="170" y="50" text-anchor="middle" class="box-label" font-size="10">Track 1 GoP 1</text>
+    <text x="170" y="63" text-anchor="middle" class="box-sublabel" font-size="9">moof+mdat...</text>
+
+    <rect x="244" y="32" width="140" height="44" rx="5" fill="#5b5fc7" opacity="0.7"/>
+    <text x="314" y="50" text-anchor="middle" class="box-label" font-size="10">Track 1 GoP 2</text>
+    <text x="314" y="63" text-anchor="middle" class="box-sublabel" font-size="9">moof+mdat...</text>
+
+    <text x="390" y="58" font-size="16" fill="#999">···</text>
+
+    <!-- Track 2 segments -->
+    <rect x="420" y="32" width="120" height="44" rx="5" fill="#7c5bbf" opacity="0.85"/>
+    <text x="480" y="50" text-anchor="middle" class="box-label" font-size="10">Track 2 GoP 1</text>
+    <text x="480" y="63" text-anchor="middle" class="box-sublabel" font-size="9">moof+mdat...</text>
+
+    <rect x="544" y="32" width="120" height="44" rx="5" fill="#7c5bbf" opacity="0.7"/>
+    <text x="604" y="50" text-anchor="middle" class="box-label" font-size="10">Track 2 GoP 2</text>
+    <text x="604" y="63" text-anchor="middle" class="box-sublabel" font-size="9">moof+mdat...</text>
+
+    <text x="670" y="58" font-size="16" fill="#999">···</text>
+
+    <!-- Byte range brackets -->
+    <line x1="100" y1="82" x2="100" y2="92" stroke="#5b5fc7" stroke-width="1.5"/>
+    <line x1="100" y1="92" x2="410" y2="92" stroke="#5b5fc7" stroke-width="1.5"/>
+    <line x1="410" y1="82" x2="410" y2="92" stroke="#5b5fc7" stroke-width="1.5"/>
+    <text x="255" y="104" text-anchor="middle" class="note" fill="#5b5fc7" font-weight="600">video byte range</text>
+
+    <line x1="420" y1="82" x2="420" y2="92" stroke="#7c5bbf" stroke-width="1.5"/>
+    <line x1="420" y1="92" x2="700" y2="92" stroke="#7c5bbf" stroke-width="1.5"/>
+    <line x1="700" y1="82" x2="700" y2="92" stroke="#7c5bbf" stroke-width="1.5"/>
+    <text x="560" y="104" text-anchor="middle" class="note" fill="#7c5bbf" font-weight="600">audio byte range</text>
+  </g>
+
+  <!-- ═══════════════════════════════════════════ -->
+  <!-- SIGNING (bottom) -->
+  <!-- ═══════════════════════════════════════════ -->
+  <g transform="translate(30, 530)">
+    <text x="0" y="0" class="section-label">C2PA / S2PA Signing</text>
+    <text x="0" y="16" class="note">Signatures computed over canonical segment bytes — MUXL is signing-system agnostic</text>
+
+    <rect x="0" y="28" width="835" height="48" rx="8" fill="#f0faf3" stroke="#2d8a56" stroke-width="1.5" stroke-dasharray="6,3"/>
+
+    <rect x="12" y="36" width="180" height="32" rx="5" fill="#2d8a56" opacity="0.9"/>
+    <text x="102" y="57" text-anchor="middle" class="box-label" font-size="10">GoP 1 segment hashes</text>
+
+    <text x="200" y="56" font-size="14" fill="#2d8a56" font-weight="700">→</text>
+
+    <rect x="218" y="36" width="120" height="32" rx="5" fill="#2d8a56" opacity="0.8"/>
+    <text x="278" y="57" text-anchor="middle" class="box-label" font-size="10">ES256K sign</text>
+
+    <text x="346" y="56" font-size="14" fill="#2d8a56" font-weight="700">→</text>
+
+    <rect x="366" y="36" width="180" height="32" rx="5" fill="#2d8a56" opacity="0.7"/>
+    <text x="456" y="57" text-anchor="middle" class="box-label" font-size="10">C2PA manifest (inline)</text>
+
+    <text x="560" y="56" class="note" fill="#2d8a56">secp256k1 / DID:key</text>
+
+    <!-- Per-track hash detail -->
+    <text x="620" y="40" class="hash">track 1 → hash_v</text>
+    <text x="620" y="55" class="hash">track 2 → hash_a</text>
+    <text x="620" y="70" class="hash" font-style="italic">independently verifiable</text>
+  </g>
+
+  <!-- ═══════════════════════════════════════════ -->
+  <!-- KEY PROPERTIES (bottom right) -->
+  <!-- ═══════════════════════════════════════════ -->
+  <g transform="translate(30, 615)">
+    <rect x="0" y="0" width="835" height="52" rx="8" fill="#f8f8f8" stroke="#ddd" stroke-width="1"/>
+    <text x="16" y="18" class="note" font-weight="600" fill="#333">Key properties:</text>
+    <text x="16" y="34" class="note">Deterministic — same source → identical bytes.</text>
+    <text x="290" y="34" class="note">Per-track hashing — verify video without touching audio.</text>
+    <text x="16" y="48" class="note">Blindly concatenatable — append segments by byte cat.</text>
+    <text x="290" y="48" class="note">Content-addressed — BLAKE-3 CIDs for every segment.</text>
+    <text x="600" y="34" class="note">Format-agnostic signing — MUXL + S2PA are independent.</text>
+    <text x="600" y="48" class="note">Zero extra latency — frames transmit before signing.</text>
+  </g>
+</svg>

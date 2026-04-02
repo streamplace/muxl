@@ -1,4 +1,3 @@
-use std::collections::BTreeMap;
 use std::env;
 use std::fs;
 use std::io::{self, Cursor, Read};
@@ -235,198 +234,501 @@ fn cmd_concat() -> crate::Result<()> {
     Ok(())
 }
 
-fn cmd_hls(args: &[String]) -> crate::Result<()> {
-    if args.len() < 2 {
-        eprintln!("Usage: muxl hls <archive.mp4> <output_dir> [--blobs <blobs_dir>]");
-        process::exit(1);
+/// Per-track info extracted from an archive, with byte offsets and blob CID.
+struct HlsTrack {
+    track_id: u32,
+    track_type: String, // "video" or "audio"
+    codec: String,
+    timescale: u32,
+    init_cid: String,
+    init_data: Vec<u8>,
+    blob_cid: String,
+    blob_size: u64,
+    segments: Vec<HlsSegment>,
+    // video-specific
+    width: u32,
+    height: u32,
+    // audio-specific
+    channels: u32,
+    sample_rate: u32,
+}
+
+struct HlsSegment {
+    offset: u64,
+    size: u64,
+    duration_ticks: u64,
+    sample_count: u32,
+}
+
+/// Convert a flat MP4 into a MUXL archive (ftyp+moov + per-track fMP4 segments).
+///
+/// Fragments the flat MP4 per-track, then feeds frames through the push-based
+/// segmenter to produce GOP-aligned MUXL segments. The segmenter needs frames
+/// in interleaved order (by presentation time), so we collect all per-track
+/// fragments first and merge-sort them.
+fn flat_mp4_to_archive(data: &[u8]) -> crate::Result<Vec<u8>> {
+    use std::io::Cursor as C;
+
+    let catalog = crate::catalog_from_mp4(C::new(data))?;
+    let init = crate::build_init_segment(&catalog)?;
+
+    // Fragment each track separately, collecting the raw fMP4 bytes per track
+    let moov = crate::read_moov(&mut C::new(data))?;
+    let mut track_ids: Vec<u32> = moov.trak.iter().map(|t| t.tkhd.track_id).collect();
+    track_ids.sort();
+
+    let mut per_track_fmp4: std::collections::BTreeMap<u32, Vec<u8>> = std::collections::BTreeMap::new();
+    for &tid in &track_ids {
+        let mut buf = Vec::new();
+        crate::fragment_track(C::new(data), tid, &mut buf)?;
+        per_track_fmp4.insert(tid, buf);
     }
-    let archive_path = &args[0];
-    let output_dir = Path::new(&args[1]);
 
-    // Parse optional --blobs flag
-    let mut blobs_dir: Option<&Path> = None;
-    let mut i = 2;
-    while i < args.len() {
-        if args[i] == "--blobs" {
-            blobs_dir = Some(Path::new(args.get(i + 1).unwrap_or_else(|| {
-                eprintln!("Missing blobs directory after --blobs");
-                process::exit(1);
-            })));
-            i += 2;
-        } else {
-            i += 1;
-        }
+    // Build an interleaved fMP4 stream by reading frames from each track's
+    // fragment stream and feeding them to the segmenter in track order.
+    // Since the segmenter splits on video keyframes and accumulates per-track
+    // buffers, we just need to feed it: init + all track fragments.
+    // The key is that we need to interleave so the segmenter sees video
+    // keyframes interspersed with audio frames.
+    //
+    // Strategy: parse each track's moof+mdat pairs, tag them with decode_time,
+    // then merge-sort and write to the segmenter input.
+
+    struct TaggedFragment {
+        track_id: u32,
+        decode_time: u64,
+        data: Vec<u8>, // moof+mdat bytes
     }
 
-    let data = fs::read(archive_path)?;
+    let mut all_fragments: Vec<TaggedFragment> = Vec::new();
 
-    // Compute BLAKE3 CID and determine archive filename for playlists
-    let archive_filename = if let Some(bd) = blobs_dir {
-        fs::create_dir_all(bd)?;
-        let cid = bdasl_cid(&data);
-        let blob_name = format!("{cid}.mp4");
-        let blob_path = bd.join(&blob_name);
-        if !blob_path.exists() {
-            // Try hardlink first, fall back to copy
-            if fs::hard_link(archive_path, &blob_path).is_err() {
-                fs::copy(archive_path, &blob_path)?;
+    for (&tid, fmp4_data) in &per_track_fmp4 {
+        let mut pos = 0;
+        let mut decode_time: u64 = 0;
+        while pos + 8 <= fmp4_data.len() {
+            let size = u32::from_be_bytes([
+                fmp4_data[pos], fmp4_data[pos+1], fmp4_data[pos+2], fmp4_data[pos+3]
+            ]) as usize;
+            let box_type = &fmp4_data[pos+4..pos+8];
+            if size == 0 || pos + size > fmp4_data.len() { break; }
+
+            if box_type == b"moof" {
+                let moof_end = pos + size;
+                // Get duration from this moof for sorting
+                let (dur, _) = parse_moof_duration(&fmp4_data[pos..moof_end]);
+
+                // Expect mdat after moof
+                if moof_end + 8 <= fmp4_data.len() && &fmp4_data[moof_end+4..moof_end+8] == b"mdat" {
+                    let mdat_size = u32::from_be_bytes([
+                        fmp4_data[moof_end], fmp4_data[moof_end+1],
+                        fmp4_data[moof_end+2], fmp4_data[moof_end+3]
+                    ]) as usize;
+                    let frag_end = moof_end + mdat_size;
+                    all_fragments.push(TaggedFragment {
+                        track_id: tid,
+                        decode_time,
+                        data: fmp4_data[pos..frag_end].to_vec(),
+                    });
+                    decode_time += dur;
+                    pos = frag_end;
+                    continue;
+                }
             }
+            pos += size;
         }
-        // Compute relative path from output_dir to blob
-        let rel = pathdiff(bd, output_dir)
-            .map(|p| p.join(&blob_name))
-            .unwrap_or_else(|| blob_path.to_path_buf());
-        eprintln!("blob: {cid} ({} bytes)", data.len());
-        rel.to_string_lossy().into_owned()
-    } else {
-        Path::new(archive_path)
-            .file_name()
-            .unwrap_or_default()
-            .to_string_lossy()
-            .into_owned()
-    };
+    }
 
-    let mut cursor = Cursor::new(&data);
+    // Sort by decode_time, then by track_id for stability
+    all_fragments.sort_by_key(|f| (f.decode_time, f.track_id));
 
-    // Extract catalog and build per-track init segments
-    let catalog = crate::catalog_from_mp4(Cursor::new(&data))?;
-    let track_inits = crate::init::build_track_init_segments(&catalog)?;
+    // Feed interleaved fragments through the segmenter
+    let mut segmenter_input = Vec::new();
+    segmenter_input.extend_from_slice(&init);
+    for frag in &all_fragments {
+        segmenter_input.extend_from_slice(&frag.data);
+    }
 
-    // Compute init segment size (ftyp+moov) by finding the first moof
-    let init_size = find_first_moof_offset(&data);
-
-    // Segment the archive to get per-track, per-GOP durations and sample counts
-    let mut gops: Vec<crate::GopSegment> = Vec::new();
-    crate::segment_fmp4(&mut cursor, |gop| {
+    let mut gops = Vec::new();
+    crate::segment_fmp4(&mut C::new(&segmenter_input), |gop| {
         gops.push(gop);
         Ok(())
     })?;
 
-    // Build a track_id → timescale map
-    let mut timescales: BTreeMap<u32, u32> = BTreeMap::new();
-    for v in catalog.video.values() {
-        timescales.insert(v.track_id, v.timescale);
-    }
-    for a in catalog.audio.values() {
-        timescales.insert(a.track_id, a.timescale);
-    }
-
-    // Collect all track IDs
-    let mut track_ids: Vec<u32> = gops
-        .iter()
-        .flat_map(|g| g.tracks.keys().copied())
-        .collect::<std::collections::HashSet<_>>()
-        .into_iter()
-        .collect();
-    track_ids.sort();
-
-    // Compute byte offsets for each track's GOPs in the archive.
-    // Archive layout: init + [track1 gop1, gop2, ...] + [track2 gop1, gop2, ...]
-    let mut track_gop_offsets: BTreeMap<u32, Vec<(u64, u64, u64, u32)>> = BTreeMap::new(); // (offset, size, duration_ticks, sample_count)
-    let mut offset = init_size as u64;
+    // Build archive: init + [track1 segments] + [track2 segments]
+    let mut archive = Vec::new();
+    archive.extend_from_slice(&init);
     for &tid in &track_ids {
-        let mut entries = Vec::new();
         for gop in &gops {
             if let Some(seg_data) = gop.tracks.get(&tid) {
-                let size = seg_data.len() as u64;
-                let dur = gop.durations.get(&tid).copied().unwrap_or(0);
-                let sc = gop.sample_counts.get(&tid).copied().unwrap_or(0);
-                entries.push((offset, size, dur, sc));
-                offset += size;
+                archive.extend_from_slice(seg_data);
             }
         }
-        track_gop_offsets.insert(tid, entries);
     }
 
+    eprintln!("converted flat MP4 → MUXL archive ({} bytes, {} GOPs)", archive.len(), gops.len());
+    Ok(archive)
+}
+
+/// Analyze an archive file and return per-track HLS metadata.
+/// Accepts both fMP4 archives and flat MP4 files (auto-detected).
+fn analyze_archive(path: &str, blobs_dir: Option<&Path>) -> crate::Result<Vec<HlsTrack>> {
+    let raw_data = fs::read(path)?;
+
+    // Detect flat MP4: no moof boxes before end of file
+    let first_moof = find_first_moof_offset(&raw_data);
+    let is_flat = first_moof >= raw_data.len();
+
+    let data;
+    if is_flat {
+        eprintln!("detected flat MP4, converting...");
+        data = flat_mp4_to_archive(&raw_data)?;
+    } else {
+        data = raw_data;
+    };
+
+    let blob_cid = bdasl_cid(&data);
+    let blob_size = data.len() as u64;
+
+    // Store blob
+    if let Some(bd) = blobs_dir {
+        let blob_path = bd.join(format!("{blob_cid}.mp4"));
+        if !blob_path.exists() {
+            if is_flat {
+                // Converted archive — write directly
+                fs::write(&blob_path, &data)?;
+            } else if fs::hard_link(path, &blob_path).is_err() {
+                fs::copy(path, &blob_path)?;
+            }
+        }
+    }
+
+    let catalog = crate::catalog_from_mp4(Cursor::new(&data))?;
+    let track_inits = crate::init::build_track_init_segments(&catalog)?;
+    let init_size = find_first_moof_offset(&data) as u64;
+    let is_audio_only = catalog.video.is_empty();
+
+    let mut tracks = Vec::new();
+
+    if is_audio_only {
+        // Audio-only archive: parse moof+mdat boxes directly and merge into ~2s segments.
+        let fragments = parse_moof_mdat_fragments(&data, init_size);
+        let mut track_ids: Vec<u32> = catalog.audio.values().map(|a| a.track_id).collect();
+        track_ids.sort();
+
+        for &tid in &track_ids {
+            let ts = catalog.audio.values().find(|a| a.track_id == tid)
+                .map(|a| a.timescale).unwrap_or(1);
+            let target_ticks = ts as u64 * 2; // ~2 seconds
+
+            // Merge fragments into segments
+            let mut segments = Vec::new();
+            let mut cur_offset = 0u64;
+            let mut cur_size = 0u64;
+            let mut cur_dur = 0u64;
+            let mut cur_samples = 0u32;
+
+            for frag in &fragments {
+                if cur_size == 0 {
+                    cur_offset = frag.offset;
+                }
+                cur_size += frag.size;
+                cur_dur += frag.duration_ticks;
+                cur_samples += frag.sample_count;
+
+                if cur_dur >= target_ticks {
+                    segments.push(HlsSegment {
+                        offset: cur_offset,
+                        size: cur_size,
+                        duration_ticks: cur_dur,
+                        sample_count: cur_samples,
+                    });
+                    cur_size = 0;
+                    cur_dur = 0;
+                    cur_samples = 0;
+                }
+            }
+            if cur_size > 0 {
+                segments.push(HlsSegment {
+                    offset: cur_offset,
+                    size: cur_size,
+                    duration_ticks: cur_dur,
+                    sample_count: cur_samples,
+                });
+            }
+
+            let init_data = track_inits.get(&tid).cloned().unwrap_or_default();
+            let init_cid = bdasl_cid(&init_data);
+            if let Some(bd) = blobs_dir {
+                let p = bd.join(format!("{init_cid}.mp4"));
+                if !p.exists() { fs::write(&p, &init_data)?; }
+            }
+
+            let a = catalog.audio.values().find(|a| a.track_id == tid);
+            tracks.push(HlsTrack {
+                track_id: tid,
+                track_type: "audio".to_string(),
+                codec: a.map(|a| a.codec.clone()).unwrap_or_default(),
+                timescale: ts,
+                init_cid,
+                init_data,
+                blob_cid: blob_cid.clone(),
+                blob_size,
+                segments,
+                width: 0, height: 0,
+                channels: a.map(|a| a.number_of_channels).unwrap_or(0),
+                sample_rate: a.map(|a| a.sample_rate).unwrap_or(0),
+            });
+        }
+    } else {
+        // Normal archive with video: use GOP-based segmenter
+        let mut gops: Vec<crate::GopSegment> = Vec::new();
+        crate::segment_fmp4(&mut Cursor::new(&data), |gop| {
+            gops.push(gop);
+            Ok(())
+        })?;
+
+        let mut track_ids: Vec<u32> = gops
+            .iter()
+            .flat_map(|g| g.tracks.keys().copied())
+            .collect::<std::collections::HashSet<_>>()
+            .into_iter()
+            .collect();
+        track_ids.sort();
+
+        let mut offset = init_size;
+        for &tid in &track_ids {
+            let mut segments = Vec::new();
+            for gop in &gops {
+                if let Some(seg_data) = gop.tracks.get(&tid) {
+                    segments.push(HlsSegment {
+                        offset,
+                        size: seg_data.len() as u64,
+                        duration_ticks: gop.durations.get(&tid).copied().unwrap_or(0),
+                        sample_count: gop.sample_counts.get(&tid).copied().unwrap_or(0),
+                    });
+                    offset += seg_data.len() as u64;
+                }
+            }
+
+            let init_data = track_inits.get(&tid).cloned().unwrap_or_default();
+            let init_cid = bdasl_cid(&init_data);
+
+            // Store init blob
+            if let Some(bd) = blobs_dir {
+                let p = bd.join(format!("{init_cid}.mp4"));
+                if !p.exists() {
+                    fs::write(&p, &init_data)?;
+                }
+            }
+
+            let (track_type, codec, width, height, channels, sample_rate, timescale) =
+                if let Some(v) = catalog.video.values().find(|v| v.track_id == tid) {
+                    ("video", v.codec.clone(), v.coded_width, v.coded_height, 0, 0, v.timescale)
+                } else if let Some(a) = catalog.audio.values().find(|a| a.track_id == tid) {
+                    ("audio", a.codec.clone(), 0, 0, a.number_of_channels, a.sample_rate, a.timescale)
+                } else {
+                    ("unknown", String::new(), 0, 0, 0, 0, 1)
+                };
+
+            tracks.push(HlsTrack {
+                track_id: tid,
+                track_type: track_type.to_string(),
+                codec,
+                timescale,
+                init_cid,
+                init_data,
+                blob_cid: blob_cid.clone(),
+                blob_size,
+                segments,
+                width,
+                height,
+                channels,
+                sample_rate,
+            });
+        }
+    }
+
+    eprintln!(
+        "blob: {blob_cid} ({blob_size} bytes, {} tracks)",
+        tracks.len(),
+    );
+
+    Ok(tracks)
+}
+
+fn cmd_hls(args: &[String]) -> crate::Result<()> {
+    if args.is_empty() || args.len() < 2 || args[0] == "--help" || args[0] == "-h" {
+        eprintln!("Generate HLS playlists from an MP4 file.");
+        eprintln!();
+        eprintln!("Usage: muxl hls <input.mp4> <output_dir> [options]");
+        eprintln!();
+        eprintln!("Arguments:");
+        eprintln!("  <input.mp4>       Input MP4 file (flat or fragmented)");
+        eprintln!("  <output_dir>      Directory for playlists, init segments, and metadata.json");
+        eprintln!();
+        eprintln!("Options:");
+        eprintln!("  --blobs <dir>     Write content-addressed blobs (archives + init segments)");
+        eprintln!("                    to this directory. Files are named by their BLAKE3 CID.");
+        eprintln!("                    Playlists reference blobs via relative path.");
+        eprintln!("  --sidecar <file>  Add an alternate rendition from another MP4 file.");
+        eprintln!("                    Can be repeated. Each sidecar gets its own blob.");
+        eprintln!("                    Example: --sidecar aac-audio.mp4 --sidecar 720p.mp4");
+        eprintln!();
+        eprintln!("Output:");
+        eprintln!("  <output_dir>/master.m3u8       HLS master playlist");
+        eprintln!("  <output_dir>/video-N.m3u8      Per-track video media playlists");
+        eprintln!("  <output_dir>/audio-N.m3u8      Per-track audio media playlists");
+        eprintln!("  <output_dir>/init-N.mp4        Per-track init segments");
+        eprintln!("  <output_dir>/metadata.json     Track metadata for programmatic use");
+        eprintln!("  <blobs_dir>/CID.mp4            Content-addressed archive + init blobs");
+        process::exit(if args.first().is_some_and(|a| a == "--help" || a == "-h") { 0 } else { 1 });
+    }
+    let archive_path = &args[0];
+    let output_dir = Path::new(&args[1]);
+
+    // Parse flags
+    let mut blobs_dir: Option<&Path> = None;
+    let mut sidecar_paths: Vec<&str> = Vec::new();
+    let mut i = 2;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--blobs" => {
+                blobs_dir = Some(Path::new(args.get(i + 1).unwrap_or_else(|| {
+                    eprintln!("Missing directory after --blobs");
+                    process::exit(1);
+                })));
+                i += 2;
+            }
+            "--sidecar" => {
+                sidecar_paths.push(args.get(i + 1).unwrap_or_else(|| {
+                    eprintln!("Missing file after --sidecar");
+                    process::exit(1);
+                }));
+                i += 2;
+            }
+            _ => { i += 1; }
+        }
+    }
+
+    if let Some(bd) = blobs_dir {
+        fs::create_dir_all(bd)?;
+    }
     fs::create_dir_all(output_dir)?;
 
-    // Write per-track init segments
-    let mut track_init_filenames: BTreeMap<u32, String> = BTreeMap::new();
-    let mut track_init_cids: BTreeMap<u32, String> = BTreeMap::new();
-    for (&tid, init_data) in &track_inits {
-        let init_cid = bdasl_cid(init_data);
-        track_init_cids.insert(tid, init_cid.clone());
+    // Analyze main archive and all sidecars
+    let mut all_tracks: Vec<HlsTrack> = analyze_archive(archive_path, blobs_dir)?;
+    let primary_blob_cid = all_tracks.first().map(|t| t.blob_cid.clone()).unwrap_or_default();
+    let primary_blob_size = all_tracks.first().map(|t| t.blob_size).unwrap_or(0);
 
+    for sidecar_path in &sidecar_paths {
+        let sidecar_tracks = analyze_archive(sidecar_path, blobs_dir)?;
+        all_tracks.extend(sidecar_tracks);
+    }
+
+    // Assign unique track keys — use "{blob_cid_prefix}.{track_id}" for sidecars
+    // to avoid collisions with primary track IDs.
+    // Primary tracks keep simple IDs, sidecar tracks get prefixed.
+    struct TrackEntry {
+        key: String,      // unique key for playlists/metadata
+        track: HlsTrack,
+        is_primary: bool,
+    }
+
+    let mut entries: Vec<TrackEntry> = Vec::new();
+    for track in all_tracks {
+        let is_primary = track.blob_cid == primary_blob_cid;
+        let key = if is_primary {
+            track.track_id.to_string()
+        } else {
+            // Use first 8 chars of blob CID + track_id to disambiguate
+            format!("{}.{}", &track.blob_cid[..track.blob_cid.len().min(16)], track.track_id)
+        };
+        entries.push(TrackEntry { key, track, is_primary });
+    }
+
+    // Write init segments
+    for entry in &entries {
+        let filename = format!("init-{}.mp4", entry.key);
+        fs::write(output_dir.join(&filename), &entry.track.init_data)?;
+    }
+
+    // Compute blob filename helper (relative path from output_dir to blobs)
+    let blob_filename = |cid: &str| -> String {
         if let Some(bd) = blobs_dir {
-            let blob_path = bd.join(format!("{init_cid}.mp4"));
-            if !blob_path.exists() {
-                fs::write(&blob_path, init_data)?;
-            }
+            pathdiff(bd, output_dir)
+                .map(|p| p.join(format!("{cid}.mp4")).to_string_lossy().into_owned())
+                .unwrap_or_else(|| format!("{cid}.mp4"))
+        } else {
+            format!("{cid}.mp4")
         }
-
-        let filename = format!("init-{tid}.mp4");
-        fs::write(output_dir.join(&filename), init_data)?;
-        track_init_filenames.insert(tid, filename);
-    }
-
-    // Build track type map
-    let mut track_types: BTreeMap<u32, &str> = BTreeMap::new();
-    for v in catalog.video.values() {
-        track_types.insert(v.track_id, "video");
-    }
-    for a in catalog.audio.values() {
-        track_types.insert(a.track_id, "audio");
-    }
+    };
 
     // Generate master playlist
     let mut master = String::new();
     master.push_str("#EXTM3U\n#EXT-X-VERSION:6\n\n");
 
-    for a in catalog.audio.values() {
-        let tid = a.track_id;
+    // Audio renditions — prefer AAC as DEFAULT for Safari compatibility
+    let default_audio_key = entries.iter()
+        .find(|e| e.track.track_type == "audio" && e.track.codec.starts_with("mp4a"))
+        .or_else(|| entries.iter().find(|e| e.track.track_type == "audio"))
+        .map(|e| e.key.clone());
+
+    for entry in &entries {
+        if entry.track.track_type != "audio" {
+            continue;
+        }
+        let is_default = default_audio_key.as_deref() == Some(&entry.key);
+        let default = if is_default { "YES" } else { "NO" };
         master.push_str(&format!(
-            "#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"audio\",NAME=\"audio{tid}\",\
-             DEFAULT=YES,AUTOSELECT=YES,CHANNELS=\"{}\",URI=\"audio-{tid}.m3u8\"\n",
-            a.number_of_channels
+            "#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"audio\",NAME=\"{}\",\
+             DEFAULT={default},AUTOSELECT=YES,CHANNELS=\"{}\",URI=\"audio-{}.m3u8\"\n",
+            entry.track.codec,
+            entry.track.channels,
+            entry.key,
         ));
     }
     master.push('\n');
 
-    for v in catalog.video.values() {
-        let tid = v.track_id;
-        let entries = track_gop_offsets.get(&tid).unwrap_or(&Vec::new()).clone();
-        let total_bytes: u64 = entries.iter().map(|(_, s, _, _)| s).sum();
-        let total_ticks: u64 = entries.iter().map(|(_, _, d, _)| d).sum();
-        let ts = v.timescale as f64;
+    // Collect audio codec for CODECS string — prefer AAC for Safari compatibility
+    let audio_codec = entries
+        .iter()
+        .find(|e| e.track.track_type == "audio" && e.track.codec.starts_with("mp4a"))
+        .or_else(|| entries.iter().find(|e| e.track.track_type == "audio"))
+        .map(|e| e.track.codec.as_str())
+        .unwrap_or("mp4a.40.2");
+
+    // Video variants
+    for entry in &entries {
+        if entry.track.track_type != "video" {
+            continue;
+        }
+        let t = &entry.track;
+        let total_bytes: u64 = t.segments.iter().map(|s| s.size).sum();
+        let total_ticks: u64 = t.segments.iter().map(|s| s.duration_ticks).sum();
+        let total_samples: u32 = t.segments.iter().map(|s| s.sample_count).sum();
+        let ts = t.timescale as f64;
         let total_dur = total_ticks as f64 / ts;
-        let bandwidth = if total_dur > 0.0 {
-            (total_bytes as f64 * 8.0 / total_dur) as u64
-        } else {
-            0
-        };
-        let total_samples: u32 = entries.iter().map(|(_, _, _, sc)| sc).sum();
-        let frame_rate = if total_dur > 0.0 {
-            total_samples as f64 / total_dur
-        } else {
-            0.0
-        };
+        let bandwidth = if total_dur > 0.0 { (total_bytes as f64 * 8.0 / total_dur) as u64 } else { 0 };
+        let frame_rate = if total_dur > 0.0 { total_samples as f64 / total_dur } else { 0.0 };
 
         master.push_str(&format!(
             "#EXT-X-STREAM-INF:AUDIO=\"audio\",BANDWIDTH={bandwidth},\
-             CODECS=\"{},{}\",RESOLUTION={}x{},FRAME-RATE={frame_rate:.3}\n",
-            v.codec,
-            catalog.audio.values().next().map(|a| a.codec.as_str()).unwrap_or("mp4a.40.2"),
-            v.coded_width,
-            v.coded_height,
+             CODECS=\"{},{audio_codec}\",RESOLUTION={}x{},FRAME-RATE={frame_rate:.3}\n",
+            t.codec, t.width, t.height,
         ));
-        master.push_str(&format!("video-{tid}.m3u8\n"));
+        master.push_str(&format!("video-{}.m3u8\n", entry.key));
     }
 
     fs::write(output_dir.join("master.m3u8"), &master)?;
 
     // Generate per-track media playlists
-    for &tid in &track_ids {
-        let entries = track_gop_offsets.get(&tid).unwrap_or(&Vec::new()).clone();
-        let ts = *timescales.get(&tid).unwrap_or(&1) as f64;
-        let track_type = *track_types.get(&tid).unwrap_or(&"unknown");
-        let init_filename = track_init_filenames
-            .get(&tid)
-            .cloned()
-            .unwrap_or_else(|| archive_filename.clone());
+    for entry in &entries {
+        let t = &entry.track;
+        let ts = t.timescale as f64;
+        let archive_file = blob_filename(&t.blob_cid);
 
-        let max_dur: f64 = entries
-            .iter()
-            .map(|(_, _, d, _)| *d as f64 / ts)
+        let max_dur: f64 = t.segments.iter()
+            .map(|s| s.duration_ticks as f64 / ts)
             .fold(0.0, f64::max);
         let target_dur = (max_dur.ceil() as u64).max(1);
 
@@ -437,79 +739,59 @@ fn cmd_hls(args: &[String]) -> crate::Result<()> {
         playlist.push_str("#EXT-X-INDEPENDENT-SEGMENTS\n");
         playlist.push_str(&format!("#EXT-X-TARGETDURATION:{target_dur}\n"));
         playlist.push_str("#EXT-X-MEDIA-SEQUENCE:0\n");
-        playlist.push_str(&format!("#EXT-X-MAP:URI=\"{init_filename}\"\n\n"));
+        playlist.push_str(&format!("#EXT-X-MAP:URI=\"init-{}.mp4\"\n\n", entry.key));
 
-        for (seg_offset, seg_size, dur_ticks, _) in &entries {
-            let dur_sec = *dur_ticks as f64 / ts;
+        for seg in &t.segments {
+            let dur_sec = seg.duration_ticks as f64 / ts;
             playlist.push_str(&format!("#EXTINF:{dur_sec:.6},\n"));
-            playlist.push_str(&format!(
-                "#EXT-X-BYTERANGE:{seg_size}@{seg_offset}\n"
-            ));
-            playlist.push_str(&archive_filename);
+            playlist.push_str(&format!("#EXT-X-BYTERANGE:{}@{}\n", seg.size, seg.offset));
+            playlist.push_str(&archive_file);
             playlist.push('\n');
         }
 
         playlist.push_str("#EXT-X-ENDLIST\n");
+        let prefix = if t.track_type == "video" { "video" } else { "audio" };
         fs::write(
-            output_dir.join(format!("{track_type}-{tid}.m3u8")),
+            output_dir.join(format!("{prefix}-{}.m3u8", entry.key)),
             &playlist,
         )?;
     }
 
-    // Write metadata JSON for programmatic consumers (e.g. Cloudflare worker)
-    let blob_cid = bdasl_cid(&data);
+    // Write metadata JSON
     let mut meta_tracks = serde_json::Map::new();
-    for &tid in &track_ids {
-        let entries = track_gop_offsets.get(&tid).unwrap_or(&Vec::new()).clone();
-        let ts = *timescales.get(&tid).unwrap_or(&1);
-        let track_type = *track_types.get(&tid).unwrap_or(&"unknown");
-
-        let segments: Vec<serde_json::Value> = entries
-            .iter()
-            .map(|(offset, size, dur_ticks, sample_count)| {
-                serde_json::json!({
-                    "offset": offset,
-                    "size": size,
-                    "durationTicks": dur_ticks,
-                    "sampleCount": sample_count,
-                })
-            })
+    for entry in &entries {
+        let t = &entry.track;
+        let segments: Vec<serde_json::Value> = t.segments.iter()
+            .map(|s| serde_json::json!({
+                "offset": s.offset,
+                "size": s.size,
+                "durationTicks": s.duration_ticks,
+                "sampleCount": s.sample_count,
+            }))
             .collect();
 
-        let init_cid = track_init_cids.get(&tid).cloned();
-
-        let track_info = match track_type {
-            "video" => {
-                let v = catalog.video.values().find(|v| v.track_id == tid);
-                serde_json::json!({
-                    "type": "video",
-                    "codec": v.map(|v| v.codec.as_str()).unwrap_or(""),
-                    "width": v.map(|v| v.coded_width).unwrap_or(0),
-                    "height": v.map(|v| v.coded_height).unwrap_or(0),
-                    "timescale": ts,
-                    "initCid": init_cid,
-                    "segments": segments,
-                })
-            }
-            _ => {
-                let a = catalog.audio.values().find(|a| a.track_id == tid);
-                serde_json::json!({
-                    "type": "audio",
-                    "codec": a.map(|a| a.codec.as_str()).unwrap_or(""),
-                    "channels": a.map(|a| a.number_of_channels).unwrap_or(0),
-                    "sampleRate": a.map(|a| a.sample_rate).unwrap_or(0),
-                    "timescale": ts,
-                    "initCid": init_cid,
-                    "segments": segments,
-                })
-            }
-        };
-        meta_tracks.insert(tid.to_string(), track_info);
+        let mut info = serde_json::json!({
+            "type": t.track_type,
+            "codec": t.codec,
+            "timescale": t.timescale,
+            "initCid": t.init_cid,
+            "blobCid": t.blob_cid,
+            "blobSize": t.blob_size,
+            "segments": segments,
+        });
+        if t.track_type == "video" {
+            info["width"] = serde_json::json!(t.width);
+            info["height"] = serde_json::json!(t.height);
+        } else {
+            info["channels"] = serde_json::json!(t.channels);
+            info["sampleRate"] = serde_json::json!(t.sample_rate);
+        }
+        meta_tracks.insert(entry.key.clone(), info);
     }
 
     let metadata = serde_json::json!({
-        "blobCid": blob_cid,
-        "blobSize": data.len(),
+        "blobCid": primary_blob_cid,
+        "blobSize": primary_blob_size,
         "tracks": meta_tracks,
     });
     fs::write(
@@ -517,11 +799,11 @@ fn cmd_hls(args: &[String]) -> crate::Result<()> {
         serde_json::to_string_pretty(&metadata).unwrap_or_default(),
     )?;
 
+    let total_tracks = entries.len();
+    let total_blobs: std::collections::HashSet<_> = entries.iter().map(|e| &e.track.blob_cid).collect();
     eprintln!(
-        "HLS: master.m3u8 + {} track playlists, {} GOPs, blob {}",
-        track_ids.len(),
-        gops.len(),
-        blob_cid,
+        "HLS: master.m3u8 + {total_tracks} track playlists, {} blobs",
+        total_blobs.len(),
     );
     Ok(())
 }
@@ -582,13 +864,137 @@ fn pathdiff(target: &Path, base: &Path) -> Option<std::path::PathBuf> {
     Some(result)
 }
 
+/// A single moof+mdat fragment with byte offset and duration metadata.
+struct MoofFragment {
+    offset: u64,
+    size: u64,
+    duration_ticks: u64,
+    sample_count: u32,
+}
+
+/// Parse moof+mdat pairs directly from raw bytes, returning byte offsets and durations.
+/// Used for audio-only archives where the keyframe-based segmenter can't split.
+fn parse_moof_mdat_fragments(data: &[u8], start_offset: u64) -> Vec<MoofFragment> {
+    let mut fragments = Vec::new();
+    let mut pos = start_offset as usize;
+
+    while pos + 8 <= data.len() {
+        let size = u32::from_be_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]) as usize;
+        let box_type = &data[pos + 4..pos + 8];
+
+        if size == 0 || pos + size > data.len() {
+            break;
+        }
+
+        if box_type == b"moof" {
+            let moof_offset = pos as u64;
+            let moof_size = size;
+
+            // Parse trun inside moof → traf → trun for duration
+            let (dur, samples) = parse_moof_duration(&data[pos..pos + size]);
+
+            // Expect mdat immediately after
+            let mdat_pos = pos + moof_size;
+            if mdat_pos + 8 <= data.len() && &data[mdat_pos + 4..mdat_pos + 8] == b"mdat" {
+                let mdat_size = u32::from_be_bytes([
+                    data[mdat_pos], data[mdat_pos + 1], data[mdat_pos + 2], data[mdat_pos + 3],
+                ]) as usize;
+                fragments.push(MoofFragment {
+                    offset: moof_offset,
+                    size: (moof_size + mdat_size) as u64,
+                    duration_ticks: dur,
+                    sample_count: samples,
+                });
+                pos = mdat_pos + mdat_size;
+                continue;
+            }
+        }
+
+        pos += size;
+    }
+
+    fragments
+}
+
+/// Extract total duration and sample count from a moof box.
+fn parse_moof_duration(moof: &[u8]) -> (u64, u32) {
+    let mut total_dur: u64 = 0;
+    let mut total_samples: u32 = 0;
+
+    // Walk moof → traf → trun/tfhd
+    let mut pos = 8; // skip moof header
+    while pos + 8 <= moof.len() {
+        let bsize = u32::from_be_bytes([moof[pos], moof[pos + 1], moof[pos + 2], moof[pos + 3]]) as usize;
+        let btype = &moof[pos + 4..pos + 8];
+        if bsize == 0 || pos + bsize > moof.len() { break; }
+
+        if btype == b"traf" {
+            let traf_end = pos + bsize;
+            let mut tpos = pos + 8;
+            let mut default_duration: u32 = 0;
+
+            while tpos + 8 <= traf_end {
+                let tsize = u32::from_be_bytes([moof[tpos], moof[tpos + 1], moof[tpos + 2], moof[tpos + 3]]) as usize;
+                let ttype = &moof[tpos + 4..tpos + 8];
+                if tsize == 0 { break; }
+
+                if ttype == b"tfhd" && tpos + 16 <= traf_end {
+                    let flags = u32::from_be_bytes([0, moof[tpos + 9], moof[tpos + 10], moof[tpos + 11]]);
+                    let mut off = tpos + 16;
+                    if flags & 0x01 != 0 { off += 8; } // base_data_offset
+                    if flags & 0x02 != 0 { off += 4; } // sample_description_index
+                    if flags & 0x08 != 0 && off + 4 <= traf_end {
+                        default_duration = u32::from_be_bytes([moof[off], moof[off + 1], moof[off + 2], moof[off + 3]]);
+                    }
+                } else if ttype == b"trun" && tpos + 16 <= traf_end {
+                    let flags = u32::from_be_bytes([0, moof[tpos + 9], moof[tpos + 10], moof[tpos + 11]]);
+                    let sample_count = u32::from_be_bytes([moof[tpos + 12], moof[tpos + 13], moof[tpos + 14], moof[tpos + 15]]);
+                    total_samples += sample_count;
+
+                    let mut off = tpos + 16;
+                    if flags & 0x01 != 0 { off += 4; } // data_offset
+                    if flags & 0x04 != 0 { off += 4; } // first_sample_flags
+
+                    for _ in 0..sample_count {
+                        let dur = if flags & 0x100 != 0 && off + 4 <= traf_end {
+                            let d = u32::from_be_bytes([moof[off], moof[off + 1], moof[off + 2], moof[off + 3]]);
+                            off += 4;
+                            d
+                        } else {
+                            default_duration
+                        };
+                        total_dur += dur as u64;
+                        if flags & 0x200 != 0 { off += 4; } // sample_size
+                        if flags & 0x400 != 0 { off += 4; } // sample_flags
+                        if flags & 0x800 != 0 { off += 4; } // composition_time_offset
+                    }
+                }
+
+                tpos += tsize;
+            }
+        }
+
+        pos += bsize;
+    }
+
+    (total_dur, total_samples)
+}
+
 /// Find the byte offset of the first moof box (= end of init segment).
 fn find_first_moof_offset(data: &[u8]) -> usize {
     let mut pos = 0;
     while pos + 8 <= data.len() {
-        let size = u32::from_be_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]])
-            as usize;
+        let size32 = u32::from_be_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]);
         let box_type = &data[pos + 4..pos + 8];
+        let size = if size32 == 1 && pos + 16 <= data.len() {
+            // Extended size (64-bit)
+            u64::from_be_bytes([
+                data[pos+8], data[pos+9], data[pos+10], data[pos+11],
+                data[pos+12], data[pos+13], data[pos+14], data[pos+15],
+            ]) as usize
+        } else {
+            size32 as usize
+        };
         if box_type == b"moof" {
             return pos;
         }

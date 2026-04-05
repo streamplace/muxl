@@ -1,3 +1,5 @@
+#![cfg_attr(feature = "wasm", feature(stdarch_wasm_atomic_wait))]
+
 pub mod catalog;
 pub mod cbor;
 pub mod concat;

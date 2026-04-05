@@ -23,4 +23,4 @@ pub use push::{Segmenter, SegmenterEvent};
 pub use segment::{GopSegment, Segment, segment_fmp4};
 
 mod cli;
-pub use cli::{cli_main, flat_mp4_to_archive};
+pub use cli::{cli_main, flat_mp4_to_archive, ArchiveTrack, ArchiveSegment};

@@ -604,47 +604,44 @@ fn analyze_archive(path: &str, blobs_dir: Option<&Path>) -> crate::Result<Vec<Hl
 
 fn cmd_hls(args: &[String]) -> crate::Result<()> {
     if args.is_empty() || args.len() < 2 || args[0] == "--help" || args[0] == "-h" {
-        eprintln!("Generate HLS playlists from an MP4 file.");
+        eprintln!("Process an MP4 file into content-addressed blobs for the VOD worker.");
         eprintln!();
         eprintln!("Usage: muxl hls <input.mp4> <output_dir> [options]");
         eprintln!();
         eprintln!("Arguments:");
         eprintln!("  <input.mp4>       Input MP4 file (flat or fragmented)");
-        eprintln!("  <output_dir>      Directory for playlists, init segments, and metadata.json");
+        eprintln!("  <output_dir>      Output directory for content-addressed blobs");
         eprintln!();
         eprintln!("Options:");
-        eprintln!("  --blobs <dir>     Write content-addressed blobs (archives + init segments)");
-        eprintln!("                    to this directory. Files are named by their BLAKE3 CID.");
-        eprintln!("                    Playlists reference blobs via relative path.");
         eprintln!("  --sidecar <file>  Add an alternate rendition from another MP4 file.");
         eprintln!("                    Can be repeated. Each sidecar gets its own blob.");
         eprintln!("                    Example: --sidecar aac-audio.mp4 --sidecar 720p.mp4");
+        eprintln!("  --playlists       Also generate static HLS playlists (master.m3u8,");
+        eprintln!("                    per-track media playlists, init segments) for serving");
+        eprintln!("                    directly from a file server without the VOD worker.");
         eprintln!();
-        eprintln!("Output:");
+        eprintln!("Output (always):");
+        eprintln!("  <output_dir>/CID.mp4     Content-addressed archive + init segment blobs");
+        eprintln!("  <output_dir>/CID.json    Playback metadata (tracks, segments, byte offsets)");
+        eprintln!();
+        eprintln!("Output (with --playlists):");
         eprintln!("  <output_dir>/master.m3u8       HLS master playlist");
         eprintln!("  <output_dir>/video-N.m3u8      Per-track video media playlists");
         eprintln!("  <output_dir>/audio-N.m3u8      Per-track audio media playlists");
-        eprintln!("  <output_dir>/init-N.mp4        Per-track init segments");
-        eprintln!("  <output_dir>/metadata.json     Track metadata for programmatic use");
-        eprintln!("  <blobs_dir>/CID.mp4            Content-addressed archive + init blobs");
-        eprintln!("  <blobs_dir>/CID.json           Blob-keyed playback metadata");
         process::exit(if args.first().is_some_and(|a| a == "--help" || a == "-h") { 0 } else { 1 });
     }
     let archive_path = &args[0];
     let output_dir = Path::new(&args[1]);
 
     // Parse flags
-    let mut blobs_dir: Option<&Path> = None;
     let mut sidecar_paths: Vec<&str> = Vec::new();
+    let mut write_playlists = false;
     let mut i = 2;
     while i < args.len() {
         match args[i].as_str() {
-            "--blobs" => {
-                blobs_dir = Some(Path::new(args.get(i + 1).unwrap_or_else(|| {
-                    eprintln!("Missing directory after --blobs");
-                    process::exit(1);
-                })));
-                i += 2;
+            "--playlists" => {
+                write_playlists = true;
+                i += 1;
             }
             "--sidecar" => {
                 sidecar_paths.push(args.get(i + 1).unwrap_or_else(|| {
@@ -657,10 +654,9 @@ fn cmd_hls(args: &[String]) -> crate::Result<()> {
         }
     }
 
-    if let Some(bd) = blobs_dir {
-        fs::create_dir_all(bd)?;
-    }
     fs::create_dir_all(output_dir)?;
+    // output_dir is the blobs directory — all CID-addressed files go here
+    let blobs_dir = Some(output_dir);
 
     // Analyze main archive and all sidecars
     let mut all_tracks: Vec<HlsTrack> = analyze_archive(archive_path, blobs_dir)?;
@@ -678,130 +674,115 @@ fn cmd_hls(args: &[String]) -> crate::Result<()> {
     struct TrackEntry {
         key: String,      // unique key for playlists/metadata
         track: HlsTrack,
-        is_primary: bool,
     }
 
     let mut entries: Vec<TrackEntry> = Vec::new();
     for track in all_tracks {
-        let is_primary = track.blob_cid == primary_blob_cid;
-        let key = if is_primary {
+        let key = if track.blob_cid == primary_blob_cid {
             track.track_id.to_string()
         } else {
             // Use first 8 chars of blob CID + track_id to disambiguate
             format!("{}.{}", &track.blob_cid[..track.blob_cid.len().min(16)], track.track_id)
         };
-        entries.push(TrackEntry { key, track, is_primary });
+        entries.push(TrackEntry { key, track });
     }
 
-    // Write init segments
-    for entry in &entries {
-        let filename = format!("init-{}.mp4", entry.key);
-        fs::write(output_dir.join(&filename), &entry.track.init_data)?;
-    }
+    // Generate static HLS playlists if requested
+    if write_playlists {
 
-    // Compute blob filename helper (relative path from output_dir to blobs)
-    let blob_filename = |cid: &str| -> String {
-        if let Some(bd) = blobs_dir {
-            pathdiff(bd, output_dir)
-                .map(|p| p.join(format!("{cid}.mp4")).to_string_lossy().into_owned())
-                .unwrap_or_else(|| format!("{cid}.mp4"))
-        } else {
-            format!("{cid}.mp4")
+        // Generate master playlist
+        let mut master = String::new();
+        master.push_str("#EXTM3U\n#EXT-X-VERSION:6\n\n");
+
+        // Audio renditions — prefer AAC as DEFAULT for Safari compatibility
+        let default_audio_key = entries.iter()
+            .find(|e| e.track.track_type == "audio" && e.track.codec.starts_with("mp4a"))
+            .or_else(|| entries.iter().find(|e| e.track.track_type == "audio"))
+            .map(|e| e.key.clone());
+
+        for entry in &entries {
+            if entry.track.track_type != "audio" {
+                continue;
+            }
+            let is_default = default_audio_key.as_deref() == Some(&entry.key);
+            let default = if is_default { "YES" } else { "NO" };
+            master.push_str(&format!(
+                "#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"audio\",NAME=\"{}\",\
+                 DEFAULT={default},AUTOSELECT=YES,CHANNELS=\"{}\",URI=\"audio-{}.m3u8\"\n",
+                entry.track.codec,
+                entry.track.channels,
+                entry.key,
+            ));
         }
-    };
+        master.push('\n');
 
-    // Generate master playlist
-    let mut master = String::new();
-    master.push_str("#EXTM3U\n#EXT-X-VERSION:6\n\n");
+        // Collect audio codec for CODECS string — prefer AAC for Safari compatibility
+        let audio_codec = entries
+            .iter()
+            .find(|e| e.track.track_type == "audio" && e.track.codec.starts_with("mp4a"))
+            .or_else(|| entries.iter().find(|e| e.track.track_type == "audio"))
+            .map(|e| e.track.codec.as_str())
+            .unwrap_or("mp4a.40.2");
 
-    // Audio renditions — prefer AAC as DEFAULT for Safari compatibility
-    let default_audio_key = entries.iter()
-        .find(|e| e.track.track_type == "audio" && e.track.codec.starts_with("mp4a"))
-        .or_else(|| entries.iter().find(|e| e.track.track_type == "audio"))
-        .map(|e| e.key.clone());
+        // Video variants
+        for entry in &entries {
+            if entry.track.track_type != "video" {
+                continue;
+            }
+            let t = &entry.track;
+            let total_bytes: u64 = t.segments.iter().map(|s| s.size).sum();
+            let total_ticks: u64 = t.segments.iter().map(|s| s.duration_ticks).sum();
+            let total_samples: u32 = t.segments.iter().map(|s| s.sample_count).sum();
+            let ts = t.timescale as f64;
+            let total_dur = total_ticks as f64 / ts;
+            let bandwidth = if total_dur > 0.0 { (total_bytes as f64 * 8.0 / total_dur) as u64 } else { 0 };
+            let frame_rate = if total_dur > 0.0 { total_samples as f64 / total_dur } else { 0.0 };
 
-    for entry in &entries {
-        if entry.track.track_type != "audio" {
-            continue;
-        }
-        let is_default = default_audio_key.as_deref() == Some(&entry.key);
-        let default = if is_default { "YES" } else { "NO" };
-        master.push_str(&format!(
-            "#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"audio\",NAME=\"{}\",\
-             DEFAULT={default},AUTOSELECT=YES,CHANNELS=\"{}\",URI=\"audio-{}.m3u8\"\n",
-            entry.track.codec,
-            entry.track.channels,
-            entry.key,
-        ));
-    }
-    master.push('\n');
-
-    // Collect audio codec for CODECS string — prefer AAC for Safari compatibility
-    let audio_codec = entries
-        .iter()
-        .find(|e| e.track.track_type == "audio" && e.track.codec.starts_with("mp4a"))
-        .or_else(|| entries.iter().find(|e| e.track.track_type == "audio"))
-        .map(|e| e.track.codec.as_str())
-        .unwrap_or("mp4a.40.2");
-
-    // Video variants
-    for entry in &entries {
-        if entry.track.track_type != "video" {
-            continue;
-        }
-        let t = &entry.track;
-        let total_bytes: u64 = t.segments.iter().map(|s| s.size).sum();
-        let total_ticks: u64 = t.segments.iter().map(|s| s.duration_ticks).sum();
-        let total_samples: u32 = t.segments.iter().map(|s| s.sample_count).sum();
-        let ts = t.timescale as f64;
-        let total_dur = total_ticks as f64 / ts;
-        let bandwidth = if total_dur > 0.0 { (total_bytes as f64 * 8.0 / total_dur) as u64 } else { 0 };
-        let frame_rate = if total_dur > 0.0 { total_samples as f64 / total_dur } else { 0.0 };
-
-        master.push_str(&format!(
-            "#EXT-X-STREAM-INF:AUDIO=\"audio\",BANDWIDTH={bandwidth},\
-             CODECS=\"{},{audio_codec}\",RESOLUTION={}x{},FRAME-RATE={frame_rate:.3}\n",
-            t.codec, t.width, t.height,
-        ));
-        master.push_str(&format!("video-{}.m3u8\n", entry.key));
-    }
-
-    fs::write(output_dir.join("master.m3u8"), &master)?;
-
-    // Generate per-track media playlists
-    for entry in &entries {
-        let t = &entry.track;
-        let ts = t.timescale as f64;
-        let archive_file = blob_filename(&t.blob_cid);
-
-        let max_dur: f64 = t.segments.iter()
-            .map(|s| s.duration_ticks as f64 / ts)
-            .fold(0.0, f64::max);
-        let target_dur = (max_dur.ceil() as u64).max(1);
-
-        let mut playlist = String::new();
-        playlist.push_str("#EXTM3U\n");
-        playlist.push_str("#EXT-X-VERSION:6\n");
-        playlist.push_str("#EXT-X-PLAYLIST-TYPE:VOD\n");
-        playlist.push_str("#EXT-X-INDEPENDENT-SEGMENTS\n");
-        playlist.push_str(&format!("#EXT-X-TARGETDURATION:{target_dur}\n"));
-        playlist.push_str("#EXT-X-MEDIA-SEQUENCE:0\n");
-        playlist.push_str(&format!("#EXT-X-MAP:URI=\"init-{}.mp4\"\n\n", entry.key));
-
-        for seg in &t.segments {
-            let dur_sec = seg.duration_ticks as f64 / ts;
-            playlist.push_str(&format!("#EXTINF:{dur_sec:.6},\n"));
-            playlist.push_str(&format!("#EXT-X-BYTERANGE:{}@{}\n", seg.size, seg.offset));
-            playlist.push_str(&archive_file);
-            playlist.push('\n');
+            master.push_str(&format!(
+                "#EXT-X-STREAM-INF:AUDIO=\"audio\",BANDWIDTH={bandwidth},\
+                 CODECS=\"{},{audio_codec}\",RESOLUTION={}x{},FRAME-RATE={frame_rate:.3}\n",
+                t.codec, t.width, t.height,
+            ));
+            master.push_str(&format!("video-{}.m3u8\n", entry.key));
         }
 
-        playlist.push_str("#EXT-X-ENDLIST\n");
-        let prefix = if t.track_type == "video" { "video" } else { "audio" };
-        fs::write(
-            output_dir.join(format!("{prefix}-{}.m3u8", entry.key)),
-            &playlist,
-        )?;
+        fs::write(output_dir.join("master.m3u8"), &master)?;
+
+        // Generate per-track media playlists
+        for entry in &entries {
+            let t = &entry.track;
+            let ts = t.timescale as f64;
+            let archive_file = format!("{}.mp4", t.blob_cid);
+
+            let max_dur: f64 = t.segments.iter()
+                .map(|s| s.duration_ticks as f64 / ts)
+                .fold(0.0, f64::max);
+            let target_dur = (max_dur.ceil() as u64).max(1);
+
+            let mut playlist = String::new();
+            playlist.push_str("#EXTM3U\n");
+            playlist.push_str("#EXT-X-VERSION:6\n");
+            playlist.push_str("#EXT-X-PLAYLIST-TYPE:VOD\n");
+            playlist.push_str("#EXT-X-INDEPENDENT-SEGMENTS\n");
+            playlist.push_str(&format!("#EXT-X-TARGETDURATION:{target_dur}\n"));
+            playlist.push_str("#EXT-X-MEDIA-SEQUENCE:0\n");
+            playlist.push_str(&format!("#EXT-X-MAP:URI=\"{}.mp4\"\n\n", entry.track.init_cid));
+
+            for seg in &t.segments {
+                let dur_sec = seg.duration_ticks as f64 / ts;
+                playlist.push_str(&format!("#EXTINF:{dur_sec:.6},\n"));
+                playlist.push_str(&format!("#EXT-X-BYTERANGE:{}@{}\n", seg.size, seg.offset));
+                playlist.push_str(&archive_file);
+                playlist.push('\n');
+            }
+
+            playlist.push_str("#EXT-X-ENDLIST\n");
+            let prefix = if t.track_type == "video" { "video" } else { "audio" };
+            fs::write(
+                output_dir.join(format!("{prefix}-{}.m3u8", entry.key)),
+                &playlist,
+            )?;
+        }
     }
 
     // Write metadata JSON
@@ -842,19 +823,16 @@ fn cmd_hls(args: &[String]) -> crate::Result<()> {
         "tracks": meta_tracks,
     });
     let metadata_str = serde_json::to_string_pretty(&metadata).unwrap_or_default();
-    fs::write(output_dir.join("metadata.json"), &metadata_str)?;
-
-    // When --blobs is used, also write blob-keyed metadata so the playback
-    // worker can look it up by CID without knowing the record path.
-    if let Some(bd) = blobs_dir {
-        fs::write(bd.join(format!("{primary_blob_cid}.json")), &metadata_str)?;
-    }
+    // Write blob-keyed metadata — this is what the VOD worker uses
+    fs::write(output_dir.join(format!("{primary_blob_cid}.json")), &metadata_str)?;
 
     let total_tracks = entries.len();
     let total_blobs: std::collections::HashSet<_> = entries.iter().map(|e| &e.track.blob_cid).collect();
     eprintln!(
-        "HLS: master.m3u8 + {total_tracks} track playlists, {} blobs",
+        "  {} tracks, {} blobs{}",
+        total_tracks,
         total_blobs.len(),
+        if write_playlists { " + static playlists" } else { "" },
     );
     Ok(())
 }
@@ -902,34 +880,6 @@ fn base32_lower_encode(data: &[u8], out: &mut String) {
     if bits > 0 {
         out.push(ALPHABET[((buffer << (5 - bits)) & 0x1F) as usize] as char);
     }
-}
-
-/// Compute a relative path from `base` to `target`.
-fn pathdiff(target: &Path, base: &Path) -> Option<std::path::PathBuf> {
-    let target = fs::canonicalize(target).ok()?;
-    let base = fs::canonicalize(base).ok()?;
-
-    let mut target_parts = target.components().peekable();
-    let mut base_parts = base.components().peekable();
-
-    // Skip common prefix
-    while let (Some(t), Some(b)) = (target_parts.peek(), base_parts.peek()) {
-        if t == b {
-            target_parts.next();
-            base_parts.next();
-        } else {
-            break;
-        }
-    }
-
-    let mut result = std::path::PathBuf::new();
-    for _ in base_parts {
-        result.push("..");
-    }
-    for part in target_parts {
-        result.push(part);
-    }
-    Some(result)
 }
 
 /// A single moof+mdat fragment with byte offset and duration metadata.

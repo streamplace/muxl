@@ -269,20 +269,24 @@ struct HlsSegment {
 /// fragments first and merge-sort them.
 /// Convert a flat MP4 to a MUXL archive, writing directly to `output`.
 ///
-/// Uses seeking on the input to read one sample at a time — constant memory
-/// overhead regardless of file size. The archive layout is:
-///   init + [track1 per-frame moof+mdat ...] + [track2 per-frame moof+mdat ...]
+/// Uses [`ReadAt`] for positional reads — one sample at a time, constant
+/// memory overhead. Works with any `ReadAt` backend: native files, WASM
+/// SharedArrayBuffer, etc.
 ///
-/// Requires `Read + Seek` on the input (i.e. a file, not a pipe).
-fn flat_mp4_to_archive_file<RS: Read + Seek, W: Write>(
-    mut input: RS,
+/// The archive layout is:
+///   init + [track1 per-frame moof+mdat ...] + [track2 per-frame moof+mdat ...]
+pub fn flat_mp4_to_archive<R: crate::io::ReadAt + ?Sized, W: Write>(
+    input: &R,
     output: &mut W,
 ) -> crate::Result<()> {
     use crate::fragment::{extract_flat_track_info, write_frame_fragment};
+    use crate::io::ReadAtCursor;
 
-    let catalog = crate::catalog_from_mp4(&mut input)?;
+    let mut cursor = ReadAtCursor::new(input)
+        .map_err(|e| crate::Error::Io(e))?;
+    let catalog = crate::catalog_from_mp4(&mut cursor)?;
     let init = crate::build_init_segment(&catalog)?;
-    let moov = crate::read_moov(&mut input)?;
+    let moov = crate::read_moov(&mut cursor)?;
 
     let mut track_ids: Vec<u32> = moov.trak.iter().map(|t| t.tkhd.track_id).collect();
     track_ids.sort();
@@ -294,7 +298,7 @@ fn flat_mp4_to_archive_file<RS: Read + Seek, W: Write>(
     let mut total_gops = 0u32;
 
     // Write per-track fragments in track order. For each track, read
-    // samples from the flat MP4 via seeking and write moof+mdat directly.
+    // samples via positional reads and write moof+mdat directly.
     for &tid in &track_ids {
         let trak = moov.trak.iter().find(|t| t.tkhd.track_id == tid)
             .ok_or_else(|| crate::Error::InvalidMp4(format!("track {tid} not found")))?;
@@ -302,15 +306,14 @@ fn flat_mp4_to_archive_file<RS: Read + Seek, W: Write>(
         let mut decode_time: u64 = 0;
 
         for sample in &samples {
-            // Count GOPs by sync samples
             if sample.frame.is_sync {
                 total_gops += 1;
             }
 
-            // Read sample data from flat MP4 via seeking
-            input.seek(SeekFrom::Start(sample.file_offset))?;
+            // Read sample data via positional read
             let mut data = vec![0u8; sample.frame.size as usize];
-            input.read_exact(&mut data)?;
+            input.read_exact_at(sample.file_offset, &mut data)
+                .map_err(|e| crate::Error::Io(e))?;
 
             write_frame_fragment(
                 output,
@@ -345,9 +348,9 @@ fn analyze_archive(path: &str, blobs_dir: Option<&Path>) -> crate::Result<Vec<Hl
         eprintln!("detected flat MP4, converting...");
         let tmp = tempfile::NamedTempFile::new()?;
         {
-            let mut input = fs::File::open(path)?;
+            let input = crate::io::FileReadAt::open(Path::new(path))?;
             let mut output = BufWriter::new(tmp.as_file());
-            flat_mp4_to_archive_file(&mut input, &mut output)?;
+            flat_mp4_to_archive(&input, &mut output)?;
             output.flush()?;
         }
         archive_path = tmp.path().to_path_buf();

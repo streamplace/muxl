@@ -4,10 +4,13 @@ pub mod concat;
 mod error;
 mod fragment;
 mod init;
+pub mod io;
 pub mod push;
 mod segment;
 #[cfg(feature = "wasm")]
 mod wasm;
+#[cfg(feature = "wasm")]
+mod wasm_io;
 
 pub use error::{Error, Result};
 pub use fragment::{
@@ -20,4 +23,4 @@ pub use push::{Segmenter, SegmenterEvent};
 pub use segment::{GopSegment, Segment, segment_fmp4};
 
 mod cli;
-pub use cli::cli_main;
+pub use cli::{cli_main, flat_mp4_to_archive};

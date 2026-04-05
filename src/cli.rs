@@ -1,6 +1,7 @@
+use std::collections::BTreeMap;
 use std::env;
 use std::fs;
-use std::io::{self, Cursor, Read};
+use std::io::{self, BufWriter, Cursor, Read, Seek, SeekFrom, Write};
 use std::path::Path;
 use std::process;
 
@@ -266,141 +267,116 @@ struct HlsSegment {
 /// segmenter to produce GOP-aligned MUXL segments. The segmenter needs frames
 /// in interleaved order (by presentation time), so we collect all per-track
 /// fragments first and merge-sort them.
-fn flat_mp4_to_archive(data: &[u8]) -> crate::Result<Vec<u8>> {
-    use std::io::Cursor as C;
+/// Convert a flat MP4 to a MUXL archive, writing directly to `output`.
+///
+/// Uses seeking on the input to read one sample at a time — constant memory
+/// overhead regardless of file size. The archive layout is:
+///   init + [track1 per-frame moof+mdat ...] + [track2 per-frame moof+mdat ...]
+///
+/// Requires `Read + Seek` on the input (i.e. a file, not a pipe).
+fn flat_mp4_to_archive_file<RS: Read + Seek, W: Write>(
+    mut input: RS,
+    output: &mut W,
+) -> crate::Result<()> {
+    use crate::fragment::{extract_flat_track_info, write_frame_fragment};
 
-    let catalog = crate::catalog_from_mp4(C::new(data))?;
+    let catalog = crate::catalog_from_mp4(&mut input)?;
     let init = crate::build_init_segment(&catalog)?;
+    let moov = crate::read_moov(&mut input)?;
 
-    // Fragment each track separately, collecting the raw fMP4 bytes per track
-    let moov = crate::read_moov(&mut C::new(data))?;
     let mut track_ids: Vec<u32> = moov.trak.iter().map(|t| t.tkhd.track_id).collect();
     track_ids.sort();
 
-    let mut per_track_fmp4: std::collections::BTreeMap<u32, Vec<u8>> = std::collections::BTreeMap::new();
+    // Write init segment
+    output.write_all(&init)?;
+
+    let mut sequence_number: u32 = 1;
+    let mut total_gops = 0u32;
+
+    // Write per-track fragments in track order. For each track, read
+    // samples from the flat MP4 via seeking and write moof+mdat directly.
     for &tid in &track_ids {
-        let mut buf = Vec::new();
-        crate::fragment_track(C::new(data), tid, &mut buf)?;
-        per_track_fmp4.insert(tid, buf);
-    }
-
-    // Build an interleaved fMP4 stream by reading frames from each track's
-    // fragment stream and feeding them to the segmenter in track order.
-    // Since the segmenter splits on video keyframes and accumulates per-track
-    // buffers, we just need to feed it: init + all track fragments.
-    // The key is that we need to interleave so the segmenter sees video
-    // keyframes interspersed with audio frames.
-    //
-    // Strategy: parse each track's moof+mdat pairs, tag them with decode_time,
-    // then merge-sort and write to the segmenter input.
-
-    struct TaggedFragment {
-        track_id: u32,
-        decode_time: u64,
-        data: Vec<u8>, // moof+mdat bytes
-    }
-
-    let mut all_fragments: Vec<TaggedFragment> = Vec::new();
-
-    for (&tid, fmp4_data) in &per_track_fmp4 {
-        let mut pos = 0;
+        let trak = moov.trak.iter().find(|t| t.tkhd.track_id == tid)
+            .ok_or_else(|| crate::Error::InvalidMp4(format!("track {tid} not found")))?;
+        let samples = extract_flat_track_info(trak)?;
         let mut decode_time: u64 = 0;
-        while pos + 8 <= fmp4_data.len() {
-            let size = u32::from_be_bytes([
-                fmp4_data[pos], fmp4_data[pos+1], fmp4_data[pos+2], fmp4_data[pos+3]
-            ]) as usize;
-            let box_type = &fmp4_data[pos+4..pos+8];
-            if size == 0 || pos + size > fmp4_data.len() { break; }
 
-            if box_type == b"moof" {
-                let moof_end = pos + size;
-                // Get duration from this moof for sorting
-                let (dur, _) = parse_moof_duration(&fmp4_data[pos..moof_end]);
-
-                // Expect mdat after moof
-                if moof_end + 8 <= fmp4_data.len() && &fmp4_data[moof_end+4..moof_end+8] == b"mdat" {
-                    let mdat_size = u32::from_be_bytes([
-                        fmp4_data[moof_end], fmp4_data[moof_end+1],
-                        fmp4_data[moof_end+2], fmp4_data[moof_end+3]
-                    ]) as usize;
-                    let frag_end = moof_end + mdat_size;
-                    all_fragments.push(TaggedFragment {
-                        track_id: tid,
-                        decode_time,
-                        data: fmp4_data[pos..frag_end].to_vec(),
-                    });
-                    decode_time += dur;
-                    pos = frag_end;
-                    continue;
-                }
+        for sample in &samples {
+            // Count GOPs by sync samples
+            if sample.frame.is_sync {
+                total_gops += 1;
             }
-            pos += size;
+
+            // Read sample data from flat MP4 via seeking
+            input.seek(SeekFrom::Start(sample.file_offset))?;
+            let mut data = vec![0u8; sample.frame.size as usize];
+            input.read_exact(&mut data)?;
+
+            write_frame_fragment(
+                output,
+                sequence_number,
+                tid,
+                decode_time,
+                &sample.frame,
+                &data,
+            )?;
+            sequence_number += 1;
+            decode_time += sample.frame.duration as u64;
         }
     }
 
-    // Sort by decode_time, then by track_id for stability
-    all_fragments.sort_by_key(|f| (f.decode_time, f.track_id));
-
-    // Feed interleaved fragments through the segmenter
-    let mut segmenter_input = Vec::new();
-    segmenter_input.extend_from_slice(&init);
-    for frag in &all_fragments {
-        segmenter_input.extend_from_slice(&frag.data);
-    }
-
-    let mut gops = Vec::new();
-    crate::segment_fmp4(&mut C::new(&segmenter_input), |gop| {
-        gops.push(gop);
-        Ok(())
-    })?;
-
-    // Build archive: init + [track1 segments] + [track2 segments]
-    let mut archive = Vec::new();
-    archive.extend_from_slice(&init);
-    for &tid in &track_ids {
-        for gop in &gops {
-            if let Some(seg_data) = gop.tracks.get(&tid) {
-                archive.extend_from_slice(seg_data);
-            }
-        }
-    }
-
-    eprintln!("converted flat MP4 → MUXL archive ({} bytes, {} GOPs)", archive.len(), gops.len());
-    Ok(archive)
+    eprintln!("converted flat MP4 → MUXL archive ({total_gops} GOPs)");
+    Ok(())
 }
 
 /// Analyze an archive file and return per-track HLS metadata.
 /// Accepts both fMP4 archives and flat MP4 files (auto-detected).
 fn analyze_archive(path: &str, blobs_dir: Option<&Path>) -> crate::Result<Vec<HlsTrack>> {
-    let raw_data = fs::read(path)?;
-
-    // Detect flat MP4: no moof boxes before end of file
-    let first_moof = find_first_moof_offset(&raw_data);
-    let is_flat = first_moof >= raw_data.len();
-
-    let data;
-    if is_flat {
-        eprintln!("detected flat MP4, converting...");
-        data = flat_mp4_to_archive(&raw_data)?;
-    } else {
-        data = raw_data;
+    // Detect flat vs fMP4 by scanning top-level boxes (no full read needed).
+    let is_flat = {
+        let mut f = fs::File::open(path)?;
+        find_first_moof_offset_seekable(&mut f)?.is_none()
     };
 
-    let blob_cid = bdasl_cid(&data);
-    let blob_size = data.len() as u64;
+    // For flat MP4: convert to archive on disk first, then analyze that.
+    // This avoids buffering the entire flat MP4 + archive in memory.
+    let (archive_path, _temp_file);
+    if is_flat {
+        eprintln!("detected flat MP4, converting...");
+        let tmp = tempfile::NamedTempFile::new()?;
+        {
+            let mut input = fs::File::open(path)?;
+            let mut output = BufWriter::new(tmp.as_file());
+            flat_mp4_to_archive_file(&mut input, &mut output)?;
+            output.flush()?;
+        }
+        archive_path = tmp.path().to_path_buf();
+        _temp_file = Some(tmp); // keep alive until we're done
+    } else {
+        archive_path = Path::new(path).to_path_buf();
+        _temp_file = None;
+    };
+
+    // Compute CID by streaming the archive through BLAKE3 (no full buffer).
+    let blob_cid = bdasl_cid_file(&archive_path)?;
+    let blob_size = fs::metadata(&archive_path)?.len();
 
     // Store blob
     if let Some(bd) = blobs_dir {
         let blob_path = bd.join(format!("{blob_cid}.mp4"));
         if !blob_path.exists() {
             if is_flat {
-                // Converted archive — write directly
-                fs::write(&blob_path, &data)?;
+                // Converted archive in temp file — move or copy it
+                fs::copy(&archive_path, &blob_path)?;
             } else if fs::hard_link(path, &blob_path).is_err() {
                 fs::copy(path, &blob_path)?;
             }
         }
     }
+
+    // Read the archive for segment analysis. For fMP4 inputs this is the
+    // original file; for flat inputs it's the (smaller) converted archive.
+    let data = fs::read(&archive_path)?;
 
     let catalog = crate::catalog_from_mp4(Cursor::new(&data))?;
     let track_inits = crate::init::build_track_init_segments(&catalog)?;
@@ -495,20 +471,90 @@ fn analyze_archive(path: &str, blobs_dir: Option<&Path>) -> crate::Result<Vec<Hl
             .collect();
         track_ids.sort();
 
-        let mut offset = init_size;
-        for &tid in &track_ids {
-            let mut segments = Vec::new();
-            for gop in &gops {
-                if let Some(seg_data) = gop.tracks.get(&tid) {
-                    segments.push(HlsSegment {
-                        offset,
-                        size: seg_data.len() as u64,
-                        duration_ticks: gop.durations.get(&tid).copied().unwrap_or(0),
-                        sample_count: gop.sample_counts.get(&tid).copied().unwrap_or(0),
-                    });
-                    offset += seg_data.len() as u64;
+        // First pass: compute the byte offset where each track's data begins
+        // in the archive (tracks are stored sequentially).
+        let mut track_start_offsets: BTreeMap<u32, u64> = BTreeMap::new();
+        {
+            let mut offset = init_size;
+            for &tid in &track_ids {
+                track_start_offsets.insert(tid, offset);
+                for gop in &gops {
+                    if let Some(seg_data) = gop.tracks.get(&tid) {
+                        offset += seg_data.len() as u64;
+                    }
                 }
             }
+        }
+
+        let audio_track_ids: std::collections::HashSet<u32> =
+            catalog.audio.values().map(|a| a.track_id).collect();
+
+        for &tid in &track_ids {
+            let is_audio = audio_track_ids.contains(&tid);
+            let track_offset = track_start_offsets[&tid];
+
+            let segments = if is_audio {
+                // Audio tracks in a MUXL archive are stored as a contiguous
+                // block of moof+mdat pairs after all video data. The GOP
+                // segmenter lumps them into one huge segment. Re-parse the
+                // raw fragments and merge into ~2s HLS segments.
+                let ts = catalog.audio.values().find(|a| a.track_id == tid)
+                    .map(|a| a.timescale).unwrap_or(1);
+                let target_ticks = ts as u64 * 2;
+
+                let fragments = parse_moof_mdat_fragments(&data, track_offset);
+                let mut segments = Vec::new();
+                let mut cur_offset = 0u64;
+                let mut cur_size = 0u64;
+                let mut cur_dur = 0u64;
+                let mut cur_samples = 0u32;
+
+                for frag in &fragments {
+                    if cur_size == 0 {
+                        cur_offset = frag.offset;
+                    }
+                    cur_size += frag.size;
+                    cur_dur += frag.duration_ticks;
+                    cur_samples += frag.sample_count;
+
+                    if cur_dur >= target_ticks {
+                        segments.push(HlsSegment {
+                            offset: cur_offset,
+                            size: cur_size,
+                            duration_ticks: cur_dur,
+                            sample_count: cur_samples,
+                        });
+                        cur_size = 0;
+                        cur_dur = 0;
+                        cur_samples = 0;
+                    }
+                }
+                if cur_size > 0 {
+                    segments.push(HlsSegment {
+                        offset: cur_offset,
+                        size: cur_size,
+                        duration_ticks: cur_dur,
+                        sample_count: cur_samples,
+                    });
+                }
+                segments
+            } else {
+                // Video tracks: use GOP-based segments with sequential offsets.
+                let mut offset = track_offset;
+                let mut segments = Vec::new();
+                for gop in &gops {
+                    if let Some(seg_data) = gop.tracks.get(&tid) {
+                        segments.push(HlsSegment {
+                            offset,
+                            size: seg_data.len() as u64,
+                            duration_ticks: gop.durations.get(&tid).copied().unwrap_or(0),
+                            sample_count: gop.sample_counts.get(&tid).copied().unwrap_or(0),
+                        });
+                        offset += seg_data.len() as u64;
+                    }
+                }
+                segments
+            };
 
             let init_data = track_inits.get(&tid).cloned().unwrap_or_default();
             let init_cid = bdasl_cid(&init_data);
@@ -581,6 +627,7 @@ fn cmd_hls(args: &[String]) -> crate::Result<()> {
         eprintln!("  <output_dir>/init-N.mp4        Per-track init segments");
         eprintln!("  <output_dir>/metadata.json     Track metadata for programmatic use");
         eprintln!("  <blobs_dir>/CID.mp4            Content-addressed archive + init blobs");
+        eprintln!("  <blobs_dir>/CID.json           Blob-keyed playback metadata");
         process::exit(if args.first().is_some_and(|a| a == "--help" || a == "-h") { 0 } else { 1 });
     }
     let archive_path = &args[0];
@@ -794,10 +841,14 @@ fn cmd_hls(args: &[String]) -> crate::Result<()> {
         "blobSize": primary_blob_size,
         "tracks": meta_tracks,
     });
-    fs::write(
-        output_dir.join("metadata.json"),
-        serde_json::to_string_pretty(&metadata).unwrap_or_default(),
-    )?;
+    let metadata_str = serde_json::to_string_pretty(&metadata).unwrap_or_default();
+    fs::write(output_dir.join("metadata.json"), &metadata_str)?;
+
+    // When --blobs is used, also write blob-keyed metadata so the playback
+    // worker can look it up by CID without knowing the record path.
+    if let Some(bd) = blobs_dir {
+        fs::write(bd.join(format!("{primary_blob_cid}.json")), &metadata_str)?;
+    }
 
     let total_tracks = entries.len();
     let total_blobs: std::collections::HashSet<_> = entries.iter().map(|e| &e.track.blob_cid).collect();
@@ -811,6 +862,23 @@ fn cmd_hls(args: &[String]) -> crate::Result<()> {
 /// Compute a BDASL CID: CIDv1, raw codec (0x55), BLAKE3 (0x1e), base32lower.
 fn bdasl_cid(data: &[u8]) -> String {
     let digest = blake3::hash(data);
+    bdasl_cid_from_digest(&digest)
+}
+
+/// Compute a BDASL CID by streaming a file through BLAKE3 (no full-file buffer).
+fn bdasl_cid_file(path: &Path) -> crate::Result<String> {
+    let mut hasher = blake3::Hasher::new();
+    let mut file = fs::File::open(path)?;
+    let mut buf = [0u8; 256 * 1024];
+    loop {
+        let n = file.read(&mut buf)?;
+        if n == 0 { break; }
+        hasher.update(&buf[..n]);
+    }
+    Ok(bdasl_cid_from_digest(&hasher.finalize()))
+}
+
+fn bdasl_cid_from_digest(digest: &blake3::Hash) -> String {
     // CID binary: version(1) + codec(0x55=raw) + hash_fn(0x1e=blake3) + hash_len(0x20) + digest
     let mut cid_bytes = vec![0x01, 0x55, 0x1e, 0x20];
     cid_bytes.extend_from_slice(digest.as_bytes());
@@ -1004,6 +1072,39 @@ fn find_first_moof_offset(data: &[u8]) -> usize {
         pos += size;
     }
     pos
+}
+
+/// Seekable version: scan top-level boxes to find the first moof.
+/// Returns `Ok(Some(offset))` if found, `Ok(None)` if flat (no moof).
+fn find_first_moof_offset_seekable<RS: Read + Seek>(reader: &mut RS) -> io::Result<Option<u64>> {
+    let file_size = reader.seek(SeekFrom::End(0))?;
+    reader.seek(SeekFrom::Start(0))?;
+
+    let mut hdr = [0u8; 16];
+    let mut pos: u64 = 0;
+
+    while pos + 8 <= file_size {
+        reader.seek(SeekFrom::Start(pos))?;
+        let n = reader.read(&mut hdr)?;
+        if n < 8 { break; }
+
+        let size32 = u32::from_be_bytes([hdr[0], hdr[1], hdr[2], hdr[3]]);
+        let box_type = &hdr[4..8];
+        let size: u64 = if size32 == 1 && n >= 16 {
+            u64::from_be_bytes([hdr[8], hdr[9], hdr[10], hdr[11], hdr[12], hdr[13], hdr[14], hdr[15]])
+        } else {
+            size32 as u64
+        };
+
+        if box_type == b"moof" {
+            return Ok(Some(pos));
+        }
+        if size == 0 || pos + size > file_size {
+            break;
+        }
+        pos += size;
+    }
+    Ok(None)
 }
 
 fn cmd_segment_archive(input: &mut impl Read, output_path: &str) -> crate::Result<()> {

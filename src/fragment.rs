@@ -26,17 +26,17 @@ use crate::init::{catalog_from_moov, read_moov};
 // ---------------------------------------------------------------------------
 
 /// Per-sample metadata used by both flat and streaming paths.
-struct FrameInfo {
-    duration: u32,
-    size: u32,
-    is_sync: bool,
-    cts_offset: i32,
+pub(crate) struct FrameInfo {
+    pub duration: u32,
+    pub size: u32,
+    pub is_sync: bool,
+    pub cts_offset: i32,
 }
 
 /// Write a single-sample moof+mdat fragment.
 ///
 /// Returns the total bytes written (moof + mdat).
-fn write_frame_fragment<W: Write>(
+pub(crate) fn write_frame_fragment<W: Write>(
     writer: &mut W,
     sequence_number: u32,
     track_id: u32,
@@ -439,14 +439,14 @@ pub(crate) fn process_moof_mdat(
 // ---------------------------------------------------------------------------
 
 /// Per-sample metadata with file offset, for flat MP4 fragmentation.
-struct FlatSampleInfo {
-    frame: FrameInfo,
+pub(crate) struct FlatSampleInfo {
+    pub frame: FrameInfo,
     /// File offset where this sample's data starts.
-    file_offset: u64,
+    pub file_offset: u64,
 }
 
 /// Extract per-sample metadata from a flat MP4 track's sample tables.
-fn extract_flat_track_info(trak: &mp4_atom::Trak) -> Result<Vec<FlatSampleInfo>> {
+pub(crate) fn extract_flat_track_info(trak: &mp4_atom::Trak) -> Result<Vec<FlatSampleInfo>> {
     let stbl = &trak.mdia.minf.stbl;
 
     // Sample sizes

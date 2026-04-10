@@ -31,6 +31,7 @@ use js_sys::{Array, Object, Reflect, Uint8Array};
 use wasm_bindgen::prelude::*;
 
 use crate::push::{Segmenter, SegmenterEvent};
+use crate::wasm_io::{WasmReadAt, WasmWriteAt};
 
 /// MUXL streaming segmenter for WebAssembly.
 ///
@@ -73,6 +74,44 @@ impl WasmSegmenter {
     }
 }
 
+/// Convert a flat MP4 to a MUXL archive, streaming I/O through WASM linear memory.
+///
+/// Before calling, JS must:
+/// 1. Write the file size (u64 LE) at `read_buf_offset() + 16`
+/// 2. Be ready to serve read requests on the read buffer
+/// 3. Be ready to drain write chunks from the write buffer
+///
+/// Returns a JSON string containing the track metadata (codecs, segments,
+/// init CIDs, byte offsets). Init segment data is written through the write
+/// buffer after the archive data, prefixed by a 4-byte LE length per track.
+#[wasm_bindgen]
+pub fn convert_flat_mp4() -> Result<String, JsValue> {
+    let reader = WasmReadAt::new()
+        .map_err(|e| JsValue::from_str(&e.to_string()))?;
+    let mut writer = WasmWriteAt::new()
+        .map_err(|e| JsValue::from_str(&e.to_string()))?;
+
+    let tracks = crate::flat_mp4_to_archive(&reader, &mut writer)
+        .map_err(|e| JsValue::from_str(&e.to_string()))?;
+
+    // Write init segments to the output stream so the main thread can upload them.
+    // Format: [4-byte LE length][init data] for each track, in order.
+    use std::io::Write;
+    for track in &tracks {
+        let len = (track.init_data.len() as u32).to_le_bytes();
+        writer.write_all(&len).map_err(|e| JsValue::from_str(&e.to_string()))?;
+        writer.write_all(&track.init_data).map_err(|e| JsValue::from_str(&e.to_string()))?;
+    }
+
+    // Signal end of stream
+    writer.finish();
+
+    // Return track metadata as JSON (small — just offsets, codecs, CIDs)
+    let json = serde_json::to_string(&tracks)
+        .map_err(|e| JsValue::from_str(&e.to_string()))?;
+    Ok(json)
+}
+
 fn events_to_js(events: Vec<SegmenterEvent>) -> Array {
     let arr = Array::new();
     for event in events {
@@ -86,7 +125,12 @@ fn events_to_js(events: Vec<SegmenterEvent>) -> Array {
             SegmenterEvent::Segment(seg) => {
                 Reflect::set(&obj, &"type".into(), &"segment".into()).unwrap();
                 Reflect::set(&obj, &"number".into(), &JsValue::from(seg.number)).unwrap();
-                let buf = Uint8Array::from(seg.data.as_slice());
+                // Concatenate all track data for this GOP
+                let mut all_data = Vec::new();
+                for data in seg.tracks.values() {
+                    all_data.extend_from_slice(data);
+                }
+                let buf = Uint8Array::from(all_data.as_slice());
                 Reflect::set(&obj, &"data".into(), &buf).unwrap();
             }
         }

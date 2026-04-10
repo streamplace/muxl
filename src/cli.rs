@@ -942,6 +942,21 @@ fn cmd_hls(args: &[String]) -> crate::Result<()> {
         total_blobs.len(),
         if write_playlists { " + static playlists" } else { "" },
     );
+
+    // Print generated CIDs for easy consumption
+    let mut printed_cids: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for entry in &entries {
+        let t = &entry.track;
+        if printed_cids.insert(t.init_cid.clone()) {
+            println!("{}.mp4  init({})", t.init_cid, t.track_type);
+        }
+    }
+    for entry in &entries {
+        let t = &entry.track;
+        if printed_cids.insert(t.blob_cid.clone()) {
+            println!("{}.mp4  blob({} bytes)", t.blob_cid, t.blob_size);
+        }
+    }
     Ok(())
 }
 

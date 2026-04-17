@@ -63,7 +63,7 @@ Valid fMP4 file. Each track's segments form a contiguous byte range, enabling HL
 
 ## MUXL Flat MP4
 
-A hybrid layout that reads as a flat MP4 at the top level *and* contains inline CMAF fragments addressable by byte range. One file serves both downloads (LosslessCut, desktop players, editors) and HLS byte-range playlists.
+A hybrid layout that reads as a flat MP4 at the top level *and* contains inline [Hang CMAF](https://doc.moq.dev/concept/layer/hang) fragments addressable by byte range. One file serves both downloads (LosslessCut, desktop players, editors) and HLS byte-range playlists. This design is adapted from the [OBS Studio hybrid MP4](https://obsproject.com/blog/obs-studio-hybrid-mp4) approach.
 
 ```
 ftyp

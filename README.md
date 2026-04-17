@@ -53,8 +53,8 @@ muxl init input.mp4 init.mp4
 # Segment an fMP4 into a directory of .m4s files
 muxl segment input.fmp4 --dir output/
 
-# Build a single archive file (init + all segments)
-muxl segment input.fmp4 --archive output.mp4
+# Build a single MUXL fMP4 file (init + all segments)
+muxl segment input.fmp4 --fmp4 output.mp4
 
 # Stream CBOR events to stdout (for piping to other programs)
 muxl segment input.fmp4 --stdout

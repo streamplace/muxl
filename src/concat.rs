@@ -1,18 +1,18 @@
-//! Concatenator: merge multiple MUXL archives into a single event stream.
+//! Concatenator: merge multiple MUXL fMP4 files into a single event stream.
 //!
-//! Accepts concatenated MUXL fMP4 archives via `feed()`. Each archive has an
+//! Accepts concatenated MUXL fMP4s via `feed()`. Each fMP4 has an
 //! init section (ftyp + uuid + moov) followed by moof+mdat fragment pairs.
 //! The UUID atom in the init section is extracted and prepended to each output
 //! segment.
 //!
 //! Performs keyframe-based segmentation (like [`crate::push::Segmenter`]) but
-//! additionally handles multiple archives: when a new moov arrives, track state
+//! additionally handles multiple fMP4 files: when a new moov arrives, track state
 //! resets and a new init event is emitted only if the catalog actually changed.
 //!
 //! # Example
 //! ```ignore
 //! let mut concat = Concatenator::new();
-//! for chunk in archive_stream {
+//! for chunk in fmp4_stream {
 //!     for event in concat.feed(&chunk)? {
 //!         match event {
 //!             SegmenterEvent::InitSegment { catalog, data } => { /* init changed */ }
@@ -37,16 +37,16 @@ use crate::init::{build_init_segment, catalog_from_moov};
 use crate::push::SegmenterEvent;
 use crate::segment::GopSegment;
 
-/// Push-based concatenator for merging multiple MUXL archives.
+/// Push-based concatenator for merging multiple MUXL fMP4 files.
 ///
-/// Feed concatenated MUXL archive bytes via `feed()`. The concatenator extracts
-/// UUID atoms from each archive's init section and prepends them to output
+/// Feed concatenated MUXL fMP4 bytes via `feed()`. The concatenator extracts
+/// UUID atoms from each fMP4's init section and prepends them to output
 /// segments. Init events are emitted only when the catalog changes between
-/// archives.
+/// fMP4 files.
 pub struct Concatenator {
     buffer: Vec<u8>,
     current_catalog: Option<Catalog>,
-    /// UUID atom from the current archive's init section, prepended to each segment.
+    /// UUID atom from the current fMP4's init section, prepended to each segment.
     current_uuid: Option<Vec<u8>>,
     /// UUID atom seen during init phase, before moov has arrived.
     pending_uuid: Option<Vec<u8>>,
@@ -81,7 +81,7 @@ struct PendingMoof {
 }
 
 impl Concatenator {
-    /// Create a new concatenator ready to receive MUXL archive data.
+    /// Create a new concatenator ready to receive MUXL fMP4 data.
     pub fn new() -> Self {
         Concatenator {
             buffer: Vec::new(),
@@ -96,7 +96,7 @@ impl Concatenator {
         }
     }
 
-    /// Feed a chunk of concatenated MUXL archive data. Returns any events produced.
+    /// Feed a chunk of concatenated MUXL fMP4 data. Returns any events produced.
     pub fn feed(&mut self, data: &[u8]) -> Result<Vec<SegmenterEvent>> {
         self.buffer.extend_from_slice(data);
         let mut events = Vec::new();
@@ -115,7 +115,7 @@ impl Concatenator {
 
             match &box_type {
                 b"ftyp" => {
-                    // New archive starting — flush any pending segment, reset to init phase
+                    // New fMP4 starting — flush any pending segment, reset to init phase
                     self.flush_segment_into(&mut events);
                     self.pending_uuid = None;
                     self.state = ConcatState::WaitingForInit;
@@ -127,7 +127,7 @@ impl Concatenator {
                             self.pending_uuid = Some(box_data);
                         }
                         ConcatState::Streaming(_) => {
-                            // UUID during streaming — treat as new archive's init
+                            // UUID during streaming — treat as new fMP4's init
                             self.flush_segment_into(&mut events);
                             self.pending_uuid = Some(box_data);
                             self.state = ConcatState::WaitingForInit;
@@ -135,7 +135,7 @@ impl Concatenator {
                     }
                 }
                 b"moov" => {
-                    // Flush any pending segment from previous archive
+                    // Flush any pending segment from previous fMP4
                     self.flush_segment_into(&mut events);
 
                     // Parse moov
@@ -357,11 +357,11 @@ mod tests {
         atom
     }
 
-    /// Build a test archive in the Streamplace layout: ftyp + uuid + moov + moof+mdat...
+    /// Build a test fMP4 in the Streamplace layout: ftyp + uuid + moov + moof+mdat...
     /// Uses the existing Segmenter to get canonical init + segment data from the fixture,
     /// then reassembles with the UUID atom inserted between ftyp and moov.
-    /// Returns (archive bytes, original GopSegments).
-    fn build_streamplace_archive(
+    /// Returns (fMP4 bytes, original GopSegments).
+    fn build_streamplace_fmp4(
         fixture: &[u8],
         uuid_atom: &[u8],
     ) -> (Vec<u8>, Vec<GopSegment>) {
@@ -369,7 +369,7 @@ mod tests {
         let mut seg_events = segmenter.feed(fixture).unwrap();
         seg_events.extend(segmenter.flush().unwrap());
 
-        let mut archive = Vec::new();
+        let mut fmp4 = Vec::new();
         let mut original_gops = Vec::new();
 
         for event in seg_events {
@@ -378,39 +378,39 @@ mod tests {
                     let (ftyp_size, _) = peek_atom_header(&data).unwrap();
                     let ftyp = &data[..ftyp_size];
                     let moov = &data[ftyp_size..];
-                    archive.extend_from_slice(ftyp);
-                    archive.extend_from_slice(uuid_atom);
-                    archive.extend_from_slice(moov);
+                    fmp4.extend_from_slice(ftyp);
+                    fmp4.extend_from_slice(uuid_atom);
+                    fmp4.extend_from_slice(moov);
                 }
                 SegmenterEvent::Segment(gop) => {
-                    // Write interleaved for the archive input
+                    // Write interleaved for the fMP4 input
                     for data in gop.tracks.values() {
-                        archive.extend_from_slice(data);
+                        fmp4.extend_from_slice(data);
                     }
                     original_gops.push(gop);
                 }
             }
         }
 
-        (archive, original_gops)
+        (fmp4, original_gops)
     }
 
     #[test]
-    fn test_concat_single_archive_no_uuid() {
+    fn test_concat_single_fmp4_no_uuid() {
         let data = read_fixture("h264-opus-frag.mp4");
 
         let mut segmenter = crate::push::Segmenter::new();
         let mut seg_events = segmenter.feed(&data).unwrap();
         seg_events.extend(segmenter.flush().unwrap());
 
-        let mut archive = Vec::new();
+        let mut fmp4 = Vec::new();
         let mut original_gops = Vec::new();
         for event in seg_events {
             match event {
-                SegmenterEvent::InitSegment { data, .. } => archive.extend_from_slice(&data),
+                SegmenterEvent::InitSegment { data, .. } => fmp4.extend_from_slice(&data),
                 SegmenterEvent::Segment(gop) => {
                     for data in gop.tracks.values() {
-                        archive.extend_from_slice(data);
+                        fmp4.extend_from_slice(data);
                     }
                     original_gops.push(gop);
                 }
@@ -418,7 +418,7 @@ mod tests {
         }
 
         let mut concat = Concatenator::new();
-        let mut events = concat.feed(&archive).unwrap();
+        let mut events = concat.feed(&fmp4).unwrap();
         events.extend(concat.flush().unwrap());
 
         let init_count = events
@@ -447,10 +447,10 @@ mod tests {
         let test_uuid: [u8; 16] = [0xDE, 0xAD, 0xBE, 0xEF, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1];
         let uuid_atom = make_uuid_atom(&test_uuid, b"s2pa-payload");
 
-        let (archive, original_gops) = build_streamplace_archive(&data, &uuid_atom);
+        let (fmp4, original_gops) = build_streamplace_fmp4(&data, &uuid_atom);
 
         let mut concat = Concatenator::new();
-        let mut events = concat.feed(&archive).unwrap();
+        let mut events = concat.feed(&fmp4).unwrap();
         events.extend(concat.flush().unwrap());
 
         let gops: Vec<&GopSegment> = events
@@ -482,15 +482,15 @@ mod tests {
     }
 
     #[test]
-    fn test_concat_duplicate_archive_single_init() {
+    fn test_concat_duplicate_fmp4_single_init() {
         let data = read_fixture("h264-opus-frag.mp4");
         let test_uuid: [u8; 16] = [0x01; 16];
         let uuid_atom = make_uuid_atom(&test_uuid, &[]);
 
-        let (archive, _) = build_streamplace_archive(&data, &uuid_atom);
+        let (fmp4, _) = build_streamplace_fmp4(&data, &uuid_atom);
 
-        let mut doubled = archive.clone();
-        doubled.extend_from_slice(&archive);
+        let mut doubled = fmp4.clone();
+        doubled.extend_from_slice(&fmp4);
 
         let mut concat = Concatenator::new();
         let mut events = concat.feed(&doubled).unwrap();
@@ -500,7 +500,7 @@ mod tests {
             .iter()
             .filter(|e| matches!(e, SegmenterEvent::InitSegment { .. }))
             .count();
-        assert_eq!(init_count, 1, "identical archives should emit init only once");
+        assert_eq!(init_count, 1, "identical fMP4s should emit init only once");
 
         // All tracks in all GOPs should have the UUID prefix
         let gops: Vec<&GopSegment> = events
@@ -527,15 +527,15 @@ mod tests {
         let test_uuid: [u8; 16] = [0xAB; 16];
         let uuid_atom = make_uuid_atom(&test_uuid, b"test");
 
-        let (archive, _) = build_streamplace_archive(&data, &uuid_atom);
+        let (fmp4, _) = build_streamplace_fmp4(&data, &uuid_atom);
 
         let mut concat_whole = Concatenator::new();
-        let mut whole_events = concat_whole.feed(&archive).unwrap();
+        let mut whole_events = concat_whole.feed(&fmp4).unwrap();
         whole_events.extend(concat_whole.flush().unwrap());
 
         let mut concat_byte = Concatenator::new();
         let mut byte_events = Vec::new();
-        for b in &archive {
+        for b in &fmp4 {
             byte_events.extend(concat_byte.feed(std::slice::from_ref(b)).unwrap());
         }
         byte_events.extend(concat_byte.flush().unwrap());
@@ -567,10 +567,10 @@ mod tests {
         let test_uuid: [u8; 16] = [0x42; 16];
         let uuid_atom = make_uuid_atom(&test_uuid, &[]);
 
-        let (archive, original_gops) = build_streamplace_archive(&data, &uuid_atom);
+        let (fmp4, original_gops) = build_streamplace_fmp4(&data, &uuid_atom);
 
         let mut concat = Concatenator::new();
-        let mut events = concat.feed(&archive).unwrap();
+        let mut events = concat.feed(&fmp4).unwrap();
         events.extend(concat.flush().unwrap());
 
         let concat_gops: Vec<&GopSegment> = events

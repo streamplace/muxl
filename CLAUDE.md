@@ -30,9 +30,9 @@ cargo check          # type-check without building
 
 Library (`src/lib.rs`) + CLI (`src/main.rs`). Uses a vendored fork of `mp4-rust` at `crates/mp4` (git subtree). Targets Rust/WASM.
 
-**MUXL segment** (canonical byte sequence): one track's moof+mdat pairs for one GoP. Per-track, independently hashable, blindly concatenatable. Track init metadata is out-of-band (archive file header or external source).
+**MUXL segment** (canonical byte sequence): one track's moof+mdat pairs for one GoP. Per-track, independently hashable, blindly concatenatable. Track init metadata is out-of-band (MUXL fMP4 file header or external source).
 
-**MUXL archive fMP4** (storage): `ftyp + moov (init) + [track 1 segments] + [track 2 segments] + ...` — valid fMP4 file, per-track byte-range addressable for HLS.
+**MUXL fMP4** (storage): `ftyp + moov (init) + [track 1 segments] + [track 2 segments] + ...` — valid fMP4 file, per-track byte-range addressable for HLS.
 
 Public functions:
 - **`catalog_from_mp4()`**: extract track configuration metadata from MP4/fMP4

@@ -12,7 +12,7 @@ Deterministic canonicalization decouples transport, storage, and signing. The sa
 source frames
   ├─ Hang CMAF (per-frame moof+mdat)            → MoQ transport, minimal latency
   ├─ MUXL segment (per-GoP moof+mdat pairs)     → canonical byte sequence, signing unit
-  └─ MUXL archive fMP4 (ftyp+moov+segments)     → appendable storage, playback
+  └─ MUXL fMP4 (ftyp+moov+segments)     → appendable storage, playback
 ```
 
 ### Hang CMAF — Transport Format
@@ -36,16 +36,16 @@ GoP 1:
 Key properties:
 
 - **Per-track segments**: each track is independently hashable, addressable, and concatenatable
-- **Byte-range addressable**: in the archive, all segments for a track are contiguous, enabling HLS byte-range playlists over a single file
+- **Byte-range addressable**: in the MUXL fMP4, all segments for a track are contiguous, enabling HLS byte-range playlists over a single file
 - **Blindly concatenatable**: segments for the same track can be appended by simple byte concatenation
-- **Init data is out-of-band**: track initialization metadata (codec config, timescales) is not part of the segment; it comes from the archive file header or an external source (e.g., S2PA manifest)
+- **Init data is out-of-band**: track initialization metadata (codec config, timescales) is not part of the segment; it comes from the MUXL fMP4 file header or an external source (e.g., S2PA manifest)
 - **Deterministic**: given the same source frames, any MUXL implementation produces identical segment bytes
 
 Segmentation rule: segment boundaries are driven by video sync samples (keyframes). Audio samples are grouped with the video GoP they temporally overlap. This rule is deterministic — given the same samples with the same timestamps, the segment boundaries are always identical.
 
-### MUXL Archive fMP4 — Storage Format
+### MUXL fMP4 — Storage Format
 
-For storage, the archive prepends an init segment (ftyp + moov with empty sample tables) to per-track segments grouped by track:
+For storage, the MUXL fMP4 prepends an init segment (ftyp + moov with empty sample tables) to per-track segments grouped by track:
 
 ```
 ftyp + moov (init, empty sample tables)
@@ -62,12 +62,12 @@ The init segment is deterministic: given the same track configuration, any MUXL 
 ## Round-Trip Properties
 
 ```
-Hang CMAF ──canonicalize──► MUXL segments ──prepend init──► archive fMP4
+Hang CMAF ──canonicalize──► MUXL segments ──prepend init──► MUXL fMP4
 ```
 
 - **Hang CMAF → MUXL segments**: Accumulate per-frame fragments into GoP-sized segments. Apply canonical ordering and metadata normalization.
 
-- **MUXL segments → archive fMP4**: Derive init segment from track metadata. Prepend to concatenated segments.
+- **MUXL segments → MUXL fMP4**: Derive init segment from track metadata. Prepend to concatenated segments.
 
 ## Signing Pipeline
 
@@ -88,7 +88,7 @@ encoder → frames → MoQ transport (Hang CMAF, per-frame)
                         │
                    S2PA sign (per-track hashes → signature)
                         │
-                   append segment to archive fMP4
+                   append segment to MUXL fMP4
                         │
                    publish updated S2PA manifest
                         │
@@ -100,7 +100,7 @@ Key properties:
 - **Signing is not on the hot path**: frames transmit immediately; the signer runs ~1 GoP behind
 - **Zero additional latency** for viewers who don't need real-time verification
 - **~1 GoP latency** (typically 1-2 seconds) for inline verification
-- **Retroactive verification** is always possible from the archive + manifest
+- **Retroactive verification** is always possible from the MUXL fMP4 + manifest
 
 ### Per-Track Signing Model
 

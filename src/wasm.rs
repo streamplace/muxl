@@ -74,7 +74,7 @@ impl WasmSegmenter {
     }
 }
 
-/// Convert a flat MP4 to a MUXL archive, streaming I/O through WASM linear memory.
+/// Convert a flat MP4 to a MUXL fMP4, streaming I/O through WASM linear memory.
 ///
 /// Before calling, JS must:
 /// 1. Write the file size (u64 LE) at `read_buf_offset() + 16`
@@ -83,7 +83,7 @@ impl WasmSegmenter {
 ///
 /// Returns a JSON string containing the track metadata (codecs, segments,
 /// init CIDs, byte offsets). Init segment data is written through the write
-/// buffer after the archive data, prefixed by a 4-byte LE length per track.
+/// buffer after the MUXL fMP4 / flat MP4 data, prefixed by a 4-byte LE length per track.
 #[wasm_bindgen]
 pub fn convert_flat_mp4() -> Result<String, JsValue> {
     let reader = WasmReadAt::new()
@@ -91,7 +91,7 @@ pub fn convert_flat_mp4() -> Result<String, JsValue> {
     let mut writer = WasmWriteAt::new()
         .map_err(|e| JsValue::from_str(&e.to_string()))?;
 
-    let tracks = crate::flat_mp4_to_archive(&reader, &mut writer)
+    let tracks = crate::flat_mp4_to_fmp4(&reader, &mut writer)
         .map_err(|e| JsValue::from_str(&e.to_string()))?;
 
     // Write init segments to the output stream so the main thread can upload them.

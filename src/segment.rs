@@ -3,7 +3,7 @@
 //! Each MUXL segment contains one track's moof+mdat pairs for one video GOP.
 //! Segments are emitted per-track at each keyframe boundary, ordered by
 //! track_id ascending. This enables per-track byte-range addressing in
-//! MUXL archive files (for HLS playlists) and per-track content hashing.
+//! MUXL fMP4 files (for HLS playlists) and per-track content hashing.
 //!
 //! Spec: architecture.md § MUXL Segment
 
@@ -199,7 +199,7 @@ mod tests {
     }
 
     #[test]
-    fn test_per_track_archive_is_parseable() {
+    fn test_per_track_fmp4_is_parseable() {
         let data = read_fixture("h264-opus-frag.mp4");
 
         let mut gops = Vec::new();
@@ -211,7 +211,7 @@ mod tests {
 
         let init = build_init_segment(&catalog).unwrap();
 
-        // Build per-track archive
+        // Build per-track fMP4
         let mut track_ids: Vec<u32> = gops
             .iter()
             .flat_map(|g| g.tracks.keys().copied())
@@ -220,18 +220,18 @@ mod tests {
             .collect();
         track_ids.sort();
 
-        let mut archive = init;
+        let mut fmp4 = init;
         for &tid in &track_ids {
             for gop in &gops {
                 if let Some(data) = gop.tracks.get(&tid) {
-                    archive.extend_from_slice(data);
+                    fmp4.extend_from_slice(data);
                 }
             }
         }
 
-        let archive_catalog = crate::catalog_from_mp4(Cursor::new(&archive)).unwrap();
-        assert_eq!(catalog.video.len(), archive_catalog.video.len());
-        assert_eq!(catalog.audio.len(), archive_catalog.audio.len());
+        let fmp4_catalog = crate::catalog_from_mp4(Cursor::new(&fmp4)).unwrap();
+        assert_eq!(catalog.video.len(), fmp4_catalog.video.len());
+        assert_eq!(catalog.audio.len(), fmp4_catalog.audio.len());
     }
 
     #[test]

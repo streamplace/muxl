@@ -6,7 +6,7 @@
  * then looks up blob-level metadata from S3.
  *
  * S3 bucket layout:
- *   blobs/{cid}.mp4          — archive / sidecar data
+ *   blobs/{cid}.mp4          — MUXL flat MP4 / sidecar data
  *   blobs/{cid}.json         — per-blob playback metadata (tracks, segments)
  */
 

@@ -124,14 +124,14 @@ fn mp4_err(e: mp4_atom::Error) -> Error {
 // ---------------------------------------------------------------------------
 
 /// Per-track defaults resolved from trex (moov/mvex) and tfhd (per-fragment).
-struct TrackDefaults {
-    default_sample_duration: u32,
-    default_sample_size: u32,
-    default_sample_flags: u32,
+pub(crate) struct TrackDefaults {
+    pub default_sample_duration: u32,
+    pub default_sample_size: u32,
+    pub default_sample_flags: u32,
 }
 
 /// Look up trex defaults for a given track_id.
-fn trex_defaults(moov: &Moov, track_id: u32) -> TrackDefaults {
+pub(crate) fn trex_defaults(moov: &Moov, track_id: u32) -> TrackDefaults {
     if let Some(ref mvex) = moov.mvex {
         for trex in &mvex.trex {
             if trex.track_id == track_id {
@@ -152,7 +152,7 @@ fn trex_defaults(moov: &Moov, track_id: u32) -> TrackDefaults {
 
 /// Resolve a TrunEntry's effective values using the ISOBMFF default cascade:
 /// trun entry > tfhd defaults > trex defaults.
-fn resolve_sample(
+pub(crate) fn resolve_sample(
     entry: &TrunEntry,
     tfhd: &Tfhd,
     trex: &TrackDefaults,

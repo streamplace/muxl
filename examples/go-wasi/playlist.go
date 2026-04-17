@@ -58,7 +58,7 @@ func (p *PlaylistGenerator) HandleEvent(ev MuxlEvent) error {
 		p.catalog = ev.Catalog
 		p.initData = ev.Data
 
-		// Build sorted track ID list (matches archive byte order).
+		// Build sorted track ID list (matches fMP4 byte order).
 		ids := []string{}
 		for _, v := range p.catalog.Video {
 			ids = append(ids, fmt.Sprintf("%d", v.TrackID))

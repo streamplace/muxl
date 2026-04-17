@@ -18,7 +18,7 @@ use crate::catalog::{AudioTrackConfig, Catalog, VideoTrackConfig};
 use crate::error::{Error, Result};
 
 // Canonical timescale for mvhd (movie-level, not media-level)
-const MOVIE_TIMESCALE: u32 = 1000;
+pub(crate) const MOVIE_TIMESCALE: u32 = 1000;
 
 /// Extract a Catalog from an MP4 file's moov box.
 ///
@@ -68,9 +68,9 @@ pub fn build_init_segment(catalog: &Catalog) -> Result<Vec<u8>> {
 
     // ftyp — canonical-form.md § ftyp
     let ftyp = Ftyp {
-        major_brand: b"isom".into(),
+        major_brand: b"muxl".into(),
         minor_version: 0,
-        compatible_brands: vec![b"isom".into(), b"iso2".into()],
+        compatible_brands: vec![b"muxl".into(), b"isom".into(), b"iso2".into()],
     };
     ftyp.write_to(&mut buf).map_err(mp4_err)?;
 
@@ -343,7 +343,7 @@ fn empty_stbl(stsd: Stsd) -> Stbl {
 }
 
 /// Build a canonical video trak box from config.
-fn build_video_trak(config: &VideoTrackConfig) -> Result<Trak> {
+pub(crate) fn build_video_trak(config: &VideoTrackConfig) -> Result<Trak> {
     let codec = if config.codec.starts_with("avc1") {
         let avcc: Avcc = decode_atom(&config.description)?;
         Codec::Avc1(Avc1 {
@@ -432,7 +432,7 @@ fn build_video_trak(config: &VideoTrackConfig) -> Result<Trak> {
 }
 
 /// Build a canonical audio trak box from config.
-fn build_audio_trak(config: &AudioTrackConfig) -> Result<Trak> {
+pub(crate) fn build_audio_trak(config: &AudioTrackConfig) -> Result<Trak> {
     let audio = mp4_atom::Audio {
         data_reference_index: 1,
         channel_count: config.number_of_channels as u16,

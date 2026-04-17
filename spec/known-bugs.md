@@ -3,7 +3,7 @@
 ## tkhd flags missing track_in_movie bit
 
 **Status**: open
-**Affects**: init segment output (both archive fMP4 and flat MP4)
+**Affects**: init segment output (both MUXL fMP4 and flat MP4)
 
 The tkhd flags should be `0x03` (`track_enabled | track_in_movie`), but mp4-atom's `Tkhd` struct only exposes an `enabled` field (maps to `track_enabled`, bit 0). Setting `enabled: true` produces flags `0x01`. The `track_in_movie` bit (bit 1) is not settable through the public API — `encode_body_ext` returns `..Default::default()` which leaves it false.
 

@@ -685,7 +685,7 @@ fn cmd_hls(args: HlsArgs) -> crate::Result<()> {
             let default = if is_default { "YES" } else { "NO" };
             master.push_str(&format!(
                 "#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"audio\",NAME=\"{}\",\
-                 DEFAULT={default},AUTOSELECT=YES,CHANNELS=\"{}\",URI=\"audio-{}.m3u8\"\n",
+                 DEFAULT={default},AUTOSELECT=YES,CHANNELS=\"{}\",URI=\"{primary_blob_cid}.audio-{}.m3u8\"\n",
                 entry.track.codec,
                 entry.track.channels,
                 entry.key,
@@ -720,10 +720,10 @@ fn cmd_hls(args: HlsArgs) -> crate::Result<()> {
                  CODECS=\"{},{audio_codec}\",RESOLUTION={}x{},FRAME-RATE={frame_rate:.3}\n",
                 t.codec, t.width, t.height,
             ));
-            master.push_str(&format!("video-{}.m3u8\n", entry.key));
+            master.push_str(&format!("{primary_blob_cid}.video-{}.m3u8\n", entry.key));
         }
 
-        fs::write(output_dir.join("master.m3u8"), &master)?;
+        fs::write(output_dir.join(format!("{primary_blob_cid}.m3u8")), &master)?;
 
         // Generate per-track media playlists
         for entry in &entries {
@@ -756,7 +756,7 @@ fn cmd_hls(args: HlsArgs) -> crate::Result<()> {
             playlist.push_str("#EXT-X-ENDLIST\n");
             let prefix = if t.track_type == "video" { "video" } else { "audio" };
             fs::write(
-                output_dir.join(format!("{prefix}-{}.m3u8", entry.key)),
+                output_dir.join(format!("{primary_blob_cid}.{prefix}-{}.m3u8", entry.key)),
                 &playlist,
             )?;
         }

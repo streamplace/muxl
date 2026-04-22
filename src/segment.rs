@@ -55,7 +55,7 @@ pub fn segment_fmp4<R: Read>(
     let catalog = fmp4.catalog().clone();
 
     // Determine which track IDs are video (for keyframe detection)
-    let video_track_ids: HashSet<u32> = catalog.video.values().map(|v| v.track_id).collect();
+    let video_track_ids: HashSet<u32> = catalog.video_configs().map(|v| v.track_id()).collect();
 
     // Per-track buffers, ordered by track_id
     let mut track_bufs: BTreeMap<u32, Vec<u8>> = BTreeMap::new();
@@ -152,7 +152,7 @@ mod tests {
         })
         .unwrap();
 
-        let num_tracks = catalog.video.len() + catalog.audio.len();
+        let num_tracks = catalog.video_configs().count() + catalog.audio_configs().count();
         assert!(num_tracks > 1, "fixture should have multiple tracks");
         assert!(!gops.is_empty(), "should produce GOP segments");
 
@@ -229,9 +229,9 @@ mod tests {
             }
         }
 
-        let fmp4_catalog = crate::catalog_from_mp4(Cursor::new(&fmp4)).unwrap();
-        assert_eq!(catalog.video.len(), fmp4_catalog.video.len());
-        assert_eq!(catalog.audio.len(), fmp4_catalog.audio.len());
+        let fmp4_catalog = crate::init::catalog_from_mp4(Cursor::new(&fmp4)).unwrap();
+        assert_eq!(catalog.video_configs().count(), fmp4_catalog.video_configs().count());
+        assert_eq!(catalog.audio_configs().count(), fmp4_catalog.audio_configs().count());
     }
 
     #[test]
@@ -245,7 +245,7 @@ mod tests {
         })
         .unwrap();
 
-        let video_track_ids: HashSet<u32> = catalog.video.values().map(|v| v.track_id).collect();
+        let video_track_ids: HashSet<u32> = catalog.video_configs().map(|v| v.track_id()).collect();
 
         for gop in &gops {
             for (&track_id, track_data) in &gop.tracks {

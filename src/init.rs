@@ -14,7 +14,7 @@ use mp4_atom::{
     Stsz, StszSamples, Stts, Tkhd, Trak, Trex, Url, Visual, Vmhd, WriteTo,
 };
 
-use crate::catalog::{AudioTrackConfig, Catalog, VideoTrackConfig};
+use crate::catalog::{AudioConfig, Catalog, Container, VideoConfig};
 use crate::error::{Error, Result};
 
 // Canonical timescale for mvhd (movie-level, not media-level)
@@ -31,8 +31,7 @@ pub fn catalog_from_mp4<RS: Read + Seek>(mut input: RS) -> Result<Catalog> {
 
 /// Extract a Catalog from an already-parsed Moov box.
 pub fn catalog_from_moov(moov: &Moov) -> Result<Catalog> {
-    let mut video = std::collections::BTreeMap::new();
-    let mut audio = std::collections::BTreeMap::new();
+    let mut catalog = Catalog::default();
 
     let mut traks: Vec<&Trak> = moov.trak.iter().collect();
     traks.sort_by_key(|t| t.tkhd.track_id);
@@ -44,19 +43,19 @@ pub fn catalog_from_moov(moov: &Moov) -> Result<Catalog> {
         match handler.as_ref() {
             b"vide" => {
                 if let Some(config) = extract_video_config(trak)? {
-                    video.insert(format!("video{}", track_id), config);
+                    catalog.insert_video(format!("video{}", track_id), config);
                 }
             }
             b"soun" => {
                 if let Some(config) = extract_audio_config(trak)? {
-                    audio.insert(format!("audio{}", track_id), config);
+                    catalog.insert_audio(format!("audio{}", track_id), config);
                 }
             }
             _ => {} // skip subtitle/other tracks for now
         }
     }
 
-    Ok(Catalog { video, audio })
+    Ok(catalog)
 }
 
 /// Build a canonical ftyp+moov init segment from a Catalog.
@@ -76,10 +75,10 @@ pub fn build_init_segment(catalog: &Catalog) -> Result<Vec<u8>> {
 
     // Collect all tracks sorted by track_id
     let mut track_defs: Vec<TrackDef> = Vec::new();
-    for config in catalog.video.values() {
+    for config in catalog.video_configs() {
         track_defs.push(TrackDef::Video(config));
     }
-    for config in catalog.audio.values() {
+    for config in catalog.audio_configs() {
         track_defs.push(TrackDef::Audio(config));
     }
     track_defs.sort_by_key(|t| t.track_id());
@@ -139,26 +138,16 @@ pub fn build_init_segment(catalog: &Catalog) -> Result<Vec<u8>> {
 pub fn build_track_init_segments(catalog: &Catalog) -> Result<std::collections::BTreeMap<u32, Vec<u8>>> {
     let mut result = std::collections::BTreeMap::new();
 
-    for config in catalog.video.values() {
-        let single = Catalog {
-            video: std::collections::BTreeMap::from([(
-                format!("video{}", config.track_id),
-                config.clone(),
-            )]),
-            audio: std::collections::BTreeMap::new(),
-        };
-        result.insert(config.track_id, build_init_segment(&single)?);
+    for config in catalog.video_configs() {
+        let mut single = Catalog::default();
+        single.insert_video(format!("video{}", config.track_id()), config.clone());
+        result.insert(config.track_id(), build_init_segment(&single)?);
     }
 
-    for config in catalog.audio.values() {
-        let single = Catalog {
-            video: std::collections::BTreeMap::new(),
-            audio: std::collections::BTreeMap::from([(
-                format!("audio{}", config.track_id),
-                config.clone(),
-            )]),
-        };
-        result.insert(config.track_id, build_init_segment(&single)?);
+    for config in catalog.audio_configs() {
+        let mut single = Catalog::default();
+        single.insert_audio(format!("audio{}", config.track_id()), config.clone());
+        result.insert(config.track_id(), build_init_segment(&single)?);
     }
 
     Ok(result)
@@ -167,15 +156,15 @@ pub fn build_track_init_segments(catalog: &Catalog) -> Result<std::collections::
 // --- Internal helpers ---
 
 enum TrackDef<'a> {
-    Video(&'a VideoTrackConfig),
-    Audio(&'a AudioTrackConfig),
+    Video(&'a VideoConfig),
+    Audio(&'a AudioConfig),
 }
 
 impl TrackDef<'_> {
     fn track_id(&self) -> u32 {
         match self {
-            TrackDef::Video(c) => c.track_id,
-            TrackDef::Audio(c) => c.track_id,
+            TrackDef::Video(c) => c.track_id(),
+            TrackDef::Audio(c) => c.track_id(),
         }
     }
 }
@@ -264,9 +253,10 @@ fn is_empty_edit(media_time_u64: u64) -> bool {
 }
 
 /// Extract video track config from a trak.
-fn extract_video_config(trak: &Trak) -> Result<Option<VideoTrackConfig>> {
+fn extract_video_config(trak: &Trak) -> Result<Option<VideoConfig>> {
     let track_id = trak.tkhd.track_id;
     let timescale = trak.mdia.mdhd.timescale;
+    let container = Container::cmaf(timescale, track_id);
 
     for codec in &trak.mdia.minf.stbl.stsd.codecs {
         match codec {
@@ -278,13 +268,18 @@ fn extract_video_config(trak: &Trak) -> Result<Option<VideoTrackConfig>> {
                     avc1.avcc.profile_compatibility,
                     avc1.avcc.avc_level_indication,
                 );
-                return Ok(Some(VideoTrackConfig {
+                return Ok(Some(VideoConfig {
                     codec: codec_str,
+                    container,
                     description,
                     coded_width: avc1.visual.width as u32,
                     coded_height: avc1.visual.height as u32,
-                    track_id,
-                    timescale,
+                    display_aspect_width: None,
+                    display_aspect_height: None,
+                    framerate: None,
+                    bitrate: None,
+                    optimize_for_latency: None,
+                    jitter: None,
                 }));
             }
             Codec::Av01(av01) => {
@@ -301,13 +296,18 @@ fn extract_video_config(trak: &Trak) -> Result<Option<VideoTrackConfig>> {
                     8
                 };
                 let codec_str = format!("av01.{profile}.{level:02}{tier}.{bit_depth:02}");
-                return Ok(Some(VideoTrackConfig {
+                return Ok(Some(VideoConfig {
                     codec: codec_str,
+                    container,
                     description,
                     coded_width: av01.visual.width as u32,
                     coded_height: av01.visual.height as u32,
-                    track_id,
-                    timescale,
+                    display_aspect_width: None,
+                    display_aspect_height: None,
+                    framerate: None,
+                    bitrate: None,
+                    optimize_for_latency: None,
+                    jitter: None,
                 }));
             }
             _ => continue,
@@ -317,34 +317,37 @@ fn extract_video_config(trak: &Trak) -> Result<Option<VideoTrackConfig>> {
 }
 
 /// Extract audio track config from a trak.
-fn extract_audio_config(trak: &Trak) -> Result<Option<AudioTrackConfig>> {
+fn extract_audio_config(trak: &Trak) -> Result<Option<AudioConfig>> {
     let track_id = trak.tkhd.track_id;
     let timescale = trak.mdia.mdhd.timescale;
+    let container = Container::cmaf(timescale, track_id);
 
     for codec in &trak.mdia.minf.stbl.stsd.codecs {
         match codec {
             Codec::Opus(opus) => {
                 let description = encode_atom(&opus.dops)?;
-                return Ok(Some(AudioTrackConfig {
+                return Ok(Some(AudioConfig {
                     codec: "opus".into(),
+                    container,
                     description,
                     sample_rate: opus.audio.sample_rate.integer() as u32,
                     number_of_channels: opus.audio.channel_count as u32,
-                    track_id,
-                    timescale,
+                    bitrate: None,
+                    jitter: None,
                 }));
             }
             Codec::Mp4a(mp4a) => {
                 let description = encode_atom(&mp4a.esds)?;
                 let profile = mp4a.esds.es_desc.dec_config.dec_specific.profile;
                 let codec_str = format!("mp4a.40.{}", profile);
-                return Ok(Some(AudioTrackConfig {
+                return Ok(Some(AudioConfig {
                     codec: codec_str,
+                    container,
                     description,
                     sample_rate: mp4a.audio.sample_rate.integer() as u32,
                     number_of_channels: mp4a.audio.channel_count as u32,
-                    track_id,
-                    timescale,
+                    bitrate: None,
+                    jitter: None,
                 }));
             }
             _ => continue,
@@ -399,7 +402,7 @@ fn empty_stbl(stsd: Stsd) -> Stbl {
 }
 
 /// Build a canonical video trak box from config.
-pub(crate) fn build_video_trak(config: &VideoTrackConfig) -> Result<Trak> {
+pub(crate) fn build_video_trak(config: &VideoConfig) -> Result<Trak> {
     let codec = if config.codec.starts_with("avc1") {
         let avcc: Avcc = decode_atom(&config.description)?;
         Codec::Avc1(Avc1 {
@@ -443,7 +446,7 @@ pub(crate) fn build_video_trak(config: &VideoTrackConfig) -> Result<Trak> {
         tkhd: Tkhd {
             creation_time: 0,
             modification_time: 0,
-            track_id: config.track_id,
+            track_id: config.track_id(),
             duration: 0,
             layer: 0,
             alternate_group: 0,
@@ -461,7 +464,7 @@ pub(crate) fn build_video_trak(config: &VideoTrackConfig) -> Result<Trak> {
             mdhd: Mdhd {
                 creation_time: 0,
                 modification_time: 0,
-                timescale: config.timescale,
+                timescale: config.timescale(),
                 duration: 0,
                 language: "und".into(),
             },
@@ -488,7 +491,7 @@ pub(crate) fn build_video_trak(config: &VideoTrackConfig) -> Result<Trak> {
 }
 
 /// Build a canonical audio trak box from config.
-pub(crate) fn build_audio_trak(config: &AudioTrackConfig) -> Result<Trak> {
+pub(crate) fn build_audio_trak(config: &AudioConfig) -> Result<Trak> {
     let audio = mp4_atom::Audio {
         data_reference_index: 1,
         channel_count: config.number_of_channels as u16,
@@ -522,7 +525,7 @@ pub(crate) fn build_audio_trak(config: &AudioTrackConfig) -> Result<Trak> {
         tkhd: Tkhd {
             creation_time: 0,
             modification_time: 0,
-            track_id: config.track_id,
+            track_id: config.track_id(),
             duration: 0,
             layer: 0,
             alternate_group: 0,
@@ -540,7 +543,7 @@ pub(crate) fn build_audio_trak(config: &AudioTrackConfig) -> Result<Trak> {
             mdhd: Mdhd {
                 creation_time: 0,
                 modification_time: 0,
-                timescale: config.timescale,
+                timescale: config.timescale(),
                 duration: 0,
                 language: "und".into(),
             },
@@ -582,16 +585,16 @@ mod tests {
         let data = read_fixture("h264-aac.mp4");
         let catalog = catalog_from_mp4(Cursor::new(data)).unwrap();
 
-        assert_eq!(catalog.video.len(), 1);
-        assert_eq!(catalog.audio.len(), 1);
+        assert_eq!(catalog.video_configs().count(), 1);
+        assert_eq!(catalog.audio_configs().count(), 1);
 
-        let video = catalog.video.values().next().unwrap();
+        let video = catalog.video_configs().next().unwrap();
         assert!(video.codec.starts_with("avc1."), "got {}", video.codec);
         assert!(video.coded_width > 0);
         assert!(video.coded_height > 0);
         assert!(!video.description.is_empty());
 
-        let audio = catalog.audio.values().next().unwrap();
+        let audio = catalog.audio_configs().next().unwrap();
         assert!(audio.codec.starts_with("mp4a."), "got {}", audio.codec);
         assert!(audio.sample_rate > 0);
         assert!(audio.number_of_channels > 0);
@@ -603,10 +606,10 @@ mod tests {
         let data = read_fixture("h264-opus.mp4");
         let catalog = catalog_from_mp4(Cursor::new(data)).unwrap();
 
-        assert_eq!(catalog.video.len(), 1);
-        assert_eq!(catalog.audio.len(), 1);
+        assert_eq!(catalog.video_configs().count(), 1);
+        assert_eq!(catalog.audio_configs().count(), 1);
 
-        let audio = catalog.audio.values().next().unwrap();
+        let audio = catalog.audio_configs().next().unwrap();
         assert_eq!(audio.codec, "opus");
         assert_eq!(audio.sample_rate, 48000);
         assert!(!audio.description.is_empty());
@@ -617,8 +620,8 @@ mod tests {
         let data = read_fixture("h264-video-only.mp4");
         let catalog = catalog_from_mp4(Cursor::new(data)).unwrap();
 
-        assert_eq!(catalog.video.len(), 1);
-        assert_eq!(catalog.audio.len(), 0);
+        assert_eq!(catalog.video_configs().count(), 1);
+        assert_eq!(catalog.audio_configs().count(), 0);
     }
 
     #[test]
@@ -626,8 +629,8 @@ mod tests {
         let data = read_fixture("opus-audio-only.mp4");
         let catalog = catalog_from_mp4(Cursor::new(data)).unwrap();
 
-        assert_eq!(catalog.video.len(), 0);
-        assert_eq!(catalog.audio.len(), 1);
+        assert_eq!(catalog.video_configs().count(), 0);
+        assert_eq!(catalog.audio_configs().count(), 1);
     }
 
     #[test]
@@ -656,23 +659,29 @@ mod tests {
         let init = build_init_segment(&catalog).unwrap();
         let catalog2 = catalog_from_mp4(Cursor::new(init)).unwrap();
 
-        assert_eq!(catalog.video.len(), catalog2.video.len());
-        assert_eq!(catalog.audio.len(), catalog2.audio.len());
+        assert_eq!(catalog.video_configs().count(), catalog2.video_configs().count());
+        assert_eq!(catalog.audio_configs().count(), catalog2.audio_configs().count());
 
-        for (name, v1) in &catalog.video {
-            let v2 = catalog2.video.get(name).expect("video track missing");
+        let vr1 = &catalog.video.as_ref().unwrap().renditions;
+        let vr2 = &catalog2.video.as_ref().unwrap().renditions;
+        for (name, v1) in vr1 {
+            let v2 = vr2.get(name).expect("video rendition missing");
             assert_eq!(v1.codec, v2.codec);
             assert_eq!(v1.description, v2.description);
             assert_eq!(v1.coded_width, v2.coded_width);
             assert_eq!(v1.coded_height, v2.coded_height);
+            assert_eq!(v1.container, v2.container);
         }
 
-        for (name, a1) in &catalog.audio {
-            let a2 = catalog2.audio.get(name).expect("audio track missing");
+        let ar1 = &catalog.audio.as_ref().unwrap().renditions;
+        let ar2 = &catalog2.audio.as_ref().unwrap().renditions;
+        for (name, a1) in ar1 {
+            let a2 = ar2.get(name).expect("audio rendition missing");
             assert_eq!(a1.codec, a2.codec);
             assert_eq!(a1.description, a2.description);
             assert_eq!(a1.sample_rate, a2.sample_rate);
             assert_eq!(a1.number_of_channels, a2.number_of_channels);
+            assert_eq!(a1.container, a2.container);
         }
     }
 
@@ -684,13 +693,13 @@ mod tests {
         let init = build_init_segment(&catalog).unwrap();
         let catalog2 = catalog_from_mp4(Cursor::new(init)).unwrap();
 
-        let v1 = catalog.video.values().next().unwrap();
-        let v2 = catalog2.video.values().next().unwrap();
+        let v1 = catalog.video_configs().next().unwrap();
+        let v2 = catalog2.video_configs().next().unwrap();
         assert_eq!(v1.codec, v2.codec);
         assert_eq!(v1.description, v2.description);
 
-        let a1 = catalog.audio.values().next().unwrap();
-        let a2 = catalog2.audio.values().next().unwrap();
+        let a1 = catalog.audio_configs().next().unwrap();
+        let a2 = catalog2.audio_configs().next().unwrap();
         assert_eq!(a1.codec, a2.codec);
         assert_eq!(a1.description, a2.description);
     }
@@ -703,8 +712,8 @@ mod tests {
         let init = build_init_segment(&catalog).unwrap();
         let catalog2 = catalog_from_mp4(Cursor::new(init)).unwrap();
 
-        let a1 = catalog.audio.values().next().unwrap();
-        let a2 = catalog2.audio.values().next().unwrap();
+        let a1 = catalog.audio_configs().next().unwrap();
+        let a2 = catalog2.audio_configs().next().unwrap();
         assert_eq!(a1.codec, a2.codec);
         assert_eq!(a1.description, a2.description);
         assert_eq!(a1.sample_rate, a2.sample_rate);
@@ -810,7 +819,10 @@ mod tests {
         let init = build_init_segment(&catalog).unwrap();
         let moov = read_moov(&mut Cursor::new(&init)).unwrap();
 
-        assert_eq!(moov.trak.len(), catalog.video.len() + catalog.audio.len());
+        assert_eq!(
+            moov.trak.len(),
+            catalog.video_configs().count() + catalog.audio_configs().count()
+        );
     }
 
     #[test]
@@ -826,7 +838,7 @@ mod tests {
             let data = read_fixture(name);
             let catalog = catalog_from_mp4(Cursor::new(data))
                 .unwrap_or_else(|e| panic!("{name}: catalog extraction failed: {e}"));
-            assert!(!catalog.video.is_empty(), "{name}: no video tracks");
+            assert!(catalog.video_configs().next().is_some(), "{name}: no video tracks");
         }
     }
 
@@ -837,8 +849,10 @@ mod tests {
             let result = catalog_from_mp4(Cursor::new(data));
             match result {
                 Ok(catalog) => {
-                    assert!(!catalog.video.is_empty(), "{name}: no video tracks");
-                    let video = catalog.video.values().next().unwrap();
+                    let video = catalog
+                        .video_configs()
+                        .next()
+                        .unwrap_or_else(|| panic!("{name}: no video tracks"));
                     assert!(
                         video.codec.starts_with("av01."),
                         "{name}: got {}",

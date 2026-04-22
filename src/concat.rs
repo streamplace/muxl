@@ -164,9 +164,8 @@ impl Concatenator {
                         .current_catalog
                         .as_ref()
                         .unwrap()
-                        .video
-                        .values()
-                        .map(|v| v.track_id)
+                        .video_configs()
+                        .map(|v| v.track_id())
                         .collect();
 
                     self.state = ConcatState::Streaming(StreamingState {

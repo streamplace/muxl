@@ -91,7 +91,8 @@ pub fn convert_flat_mp4() -> Result<String, JsValue> {
     let mut writer = WasmWriteAt::new()
         .map_err(|e| JsValue::from_str(&e.to_string()))?;
 
-    let tracks = crate::flat_mp4_to_fmp4(&reader, &mut writer)
+    let source = crate::read(&reader).map_err(|e| JsValue::from_str(&e.to_string()))?;
+    let tracks = crate::fmp4::write(&source, &reader, &mut writer)
         .map_err(|e| JsValue::from_str(&e.to_string()))?;
 
     // Write init segments to the output stream so the main thread can upload them.

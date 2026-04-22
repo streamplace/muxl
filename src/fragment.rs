@@ -834,7 +834,7 @@ mod tests {
         })
         .unwrap();
 
-        assert!(!catalog.video.is_empty(), "should have video tracks");
+        assert!(catalog.video_configs().next().is_some(), "should have video tracks");
         assert!(!frames.is_empty(), "should have produced frames");
 
         // Every frame should be a valid moof+mdat pair

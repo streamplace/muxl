@@ -129,7 +129,7 @@ impl Segmenter {
                         let init_data = build_init_segment(&catalog)?;
 
                         let video_track_ids: HashSet<u32> =
-                            catalog.video.values().map(|v| v.track_id).collect();
+                            catalog.video_configs().map(|v| v.track_id()).collect();
 
                         events.push(SegmenterEvent::InitSegment {
                             catalog,

@@ -51,32 +51,34 @@ use crate::init::{
 };
 use crate::io::{ReadAt, ReadAtCursor};
 
-/// Per-sample metadata for flat MP4 assembly.
-pub struct FlatSample {
-    pub duration: u32,
-    pub size: u32,
-    pub is_sync: bool,
-    pub cts_offset: i32,
-    /// Byte offset in the input where this sample's encoded data lives.
-    pub input_offset: u64,
+pub use crate::source::{Sample, TrackPlan};
+
+use crate::source::{Plan, Source};
+
+/// Read a flat MP4 into a [`Source`]. Auto-detects fMP4-bodied inputs and
+/// delegates to [`crate::fmp4::read`] for those.
+pub fn read<R: ReadAt + ?Sized>(input: &R) -> Result<Source> {
+    let (catalog, tracks) = if detect_is_fmp4(input)? {
+        plan_from_fmp4(input)?
+    } else {
+        plan_from_flat_mp4(input)?
+    };
+    Ok(Source {
+        catalog,
+        plan: Plan::new(tracks),
+    })
 }
 
-/// Per-track sample plan for flat MP4 assembly.
-pub struct FlatTrackPlan {
-    pub track_id: u32,
-    pub is_video: bool,
-    pub samples: Vec<FlatSample>,
-    /// Presentation start offset in the track's media timescale.
-    ///
-    /// Baked into the track's first-fragment `tfdt` (so CMAF/Hang consumers
-    /// inherit the offset from the fragment bytes themselves) and into a
-    /// synthesized canonical `elst` in the flat MP4 moov (so non-fragmented
-    /// players honor the same offset).
-    ///
-    /// Typical source: a LosslessCut-style leading empty edit on one track
-    /// but not others. Pure codec-priming `media_time > 0` is left at 0
-    /// here and is tracked separately — see `open-questions.md`.
-    pub start_offset_ticks: u64,
+/// Write a [`Source`] as a canonical MUXL flat MP4.
+///
+/// `input` is the original ReadAt the source was built from — sample bytes
+/// are streamed from it on demand (offsets live in the plan).
+pub fn write<R: ReadAt + ?Sized, W: Write>(
+    source: &Source,
+    input: &R,
+    output: &mut W,
+) -> Result<FlatMp4Info> {
+    write_flat_mp4(&source.catalog, &source.plan.tracks, input, output)
 }
 
 /// Metadata returned from a flat MP4 write — file sizes, per-track fragment
@@ -172,7 +174,7 @@ fn detect_is_fmp4<R: ReadAt + ?Sized>(input: &R) -> Result<bool> {
 /// inner mdats.
 pub fn plan_from_fmp4<R: ReadAt + ?Sized>(
     input: &R,
-) -> Result<(Catalog, Vec<FlatTrackPlan>)> {
+) -> Result<(Catalog, Vec<TrackPlan>)> {
     use mp4_atom::{Atom, FourCC, Header, Moof, ReadAtom, ReadFrom};
     use std::io::{Seek, SeekFrom};
 
@@ -183,7 +185,7 @@ pub fn plan_from_fmp4<R: ReadAt + ?Sized>(
     let moov = read_moov(&mut cursor)?;
     let catalog = crate::init::catalog_from_moov(&moov)?;
     let video_ids: std::collections::HashSet<u32> =
-        catalog.video.values().map(|v| v.track_id).collect();
+        catalog.video_configs().map(|v| v.track_id()).collect();
 
     // Initialize per-track plans.
     //
@@ -191,14 +193,16 @@ pub fn plan_from_fmp4<R: ReadAt + ?Sized>(
     // leading presentation offsets are expected to live in the first
     // fragment's tfdt. We recover that below by reading tfdt on each
     // track's first traf.
-    let mut track_plans: std::collections::BTreeMap<u32, FlatTrackPlan> =
+    let mut track_plans: std::collections::BTreeMap<u32, TrackPlan> =
         std::collections::BTreeMap::new();
-    for tid in moov.trak.iter().map(|t| t.tkhd.track_id) {
+    for trak in &moov.trak {
+        let tid = trak.tkhd.track_id;
         track_plans.insert(
             tid,
-            FlatTrackPlan {
+            TrackPlan {
                 track_id: tid,
                 is_video: video_ids.contains(&tid),
+                timescale: trak.mdia.mdhd.timescale,
                 samples: Vec::new(),
                 start_offset_ticks: 0,
             },
@@ -276,7 +280,7 @@ pub fn plan_from_fmp4<R: ReadAt + ?Sized>(
                                     track_id
                                 ))
                             })?;
-                        plan.samples.push(FlatSample {
+                        plan.samples.push(Sample {
                             duration: frame.duration,
                             size: frame.size,
                             is_sync: frame.is_sync,
@@ -321,20 +325,20 @@ pub fn plan_from_fmp4<R: ReadAt + ?Sized>(
         }
     }
 
-    let plans: Vec<FlatTrackPlan> = track_plans.into_values().collect();
+    let plans: Vec<TrackPlan> = track_plans.into_values().collect();
     Ok((catalog, plans))
 }
 
 /// Build a per-track sample plan from a flat (non-fragmented) MP4.
 pub fn plan_from_flat_mp4<R: ReadAt + ?Sized>(
     input: &R,
-) -> Result<(Catalog, Vec<FlatTrackPlan>)> {
+) -> Result<(Catalog, Vec<TrackPlan>)> {
     let mut cursor = ReadAtCursor::new(input).map_err(Error::Io)?;
     let moov = read_moov(&mut cursor)?;
     let catalog = crate::init::catalog_from_moov(&moov)?;
 
     let video_ids: std::collections::HashSet<u32> =
-        catalog.video.values().map(|v| v.track_id).collect();
+        catalog.video_configs().map(|v| v.track_id()).collect();
 
     let movie_ts = moov.mvhd.timescale;
     let mut plans = Vec::new();
@@ -343,7 +347,7 @@ pub fn plan_from_flat_mp4<R: ReadAt + ?Sized>(
         let samples = extract_flat_track_info(trak)?;
         let samples = samples
             .into_iter()
-            .map(|s| FlatSample {
+            .map(|s| Sample {
                 duration: s.frame.duration,
                 size: s.frame.size,
                 is_sync: s.frame.is_sync,
@@ -355,9 +359,10 @@ pub fn plan_from_flat_mp4<R: ReadAt + ?Sized>(
         // becomes the track's first-fragment tfdt (and a canonical
         // synthesized elst in the flat MP4 moov). See start_offset_from_trak.
         let start_offset_ticks = start_offset_from_trak(trak, movie_ts);
-        plans.push(FlatTrackPlan {
+        plans.push(TrackPlan {
             track_id,
             is_video: video_ids.contains(&track_id),
+            timescale: trak.mdia.mdhd.timescale,
             samples,
             start_offset_ticks,
         });
@@ -375,11 +380,11 @@ pub fn plan_from_flat_mp4<R: ReadAt + ?Sized>(
 /// peer into the mdat envelope.
 pub fn write_flat_mp4<R: ReadAt + ?Sized, W: Write>(
     catalog: &Catalog,
-    plans: &[FlatTrackPlan],
+    plans: &[TrackPlan],
     input: &R,
     output: &mut W,
 ) -> Result<FlatMp4Info> {
-    let mut ordered: Vec<&FlatTrackPlan> = plans.iter().collect();
+    let mut ordered: Vec<&TrackPlan> = plans.iter().collect();
     ordered.sort_by_key(|p| p.track_id);
 
     // ftyp — canonical-form.md § ftyp
@@ -593,7 +598,7 @@ fn build_frame_moof(
     sequence_number: u32,
     track_id: u32,
     base_decode_time: u64,
-    sample: &FlatSample,
+    sample: &Sample,
     data_offset: i32,
 ) -> Moof {
     let sample_flags: u32 = if sample.is_sync {
@@ -638,7 +643,7 @@ fn measure_frame_moof(
     sequence_number: u32,
     track_id: u32,
     base_decode_time: u64,
-    sample: &FlatSample,
+    sample: &Sample,
 ) -> Result<u32> {
     // data_offset is a fixed-size i32, so its value doesn't affect size.
     let moof = build_frame_moof(sequence_number, track_id, base_decode_time, sample, 0);
@@ -654,7 +659,7 @@ fn write_frame_pair<W: Write>(
     sequence_number: u32,
     track_id: u32,
     base_decode_time: u64,
-    sample: &FlatSample,
+    sample: &Sample,
     sample_data: &[u8],
     expected_moof_size: u32,
 ) -> Result<()> {
@@ -686,11 +691,11 @@ fn write_frame_pair<W: Write>(
 
 /// Build a base trak (tkhd + mdia + empty stbl) for a track_id from the catalog.
 fn build_base_trak(catalog: &Catalog, track_id: u32) -> Result<(Trak, u32)> {
-    if let Some(v) = catalog.video.values().find(|v| v.track_id == track_id) {
-        return Ok((build_video_trak(v)?, v.timescale));
+    if let Some(v) = catalog.video_configs().find(|v| v.track_id() == track_id) {
+        return Ok((build_video_trak(v)?, v.timescale()));
     }
-    if let Some(a) = catalog.audio.values().find(|a| a.track_id == track_id) {
-        return Ok((build_audio_trak(a)?, a.timescale));
+    if let Some(a) = catalog.audio_configs().find(|a| a.track_id() == track_id) {
+        return Ok((build_audio_trak(a)?, a.timescale()));
     }
     Err(Error::InvalidMp4(format!(
         "no track config for track_id {}",
@@ -703,7 +708,7 @@ fn build_base_trak(catalog: &Catalog, track_id: u32) -> Result<(Trak, u32)> {
 /// `sample_offsets` has one entry per sample (absolute file offsets). Length
 /// must match `plan.samples.len()`. Using placeholder zeros during sizing is
 /// fine: moov size depends on entry count, not entry values.
-fn populate_stbl(stbl: &mut Stbl, plan: &FlatTrackPlan, sample_offsets: &[u64]) {
+fn populate_stbl(stbl: &mut Stbl, plan: &TrackPlan, sample_offsets: &[u64]) {
     let n = plan.samples.len() as u32;
     assert_eq!(sample_offsets.len(), plan.samples.len());
 
@@ -925,9 +930,9 @@ mod tests {
     #[test]
     fn flat_is_parseable_as_mp4() {
         let out = convert("h264-aac.mp4");
-        let catalog = crate::catalog_from_mp4(Cursor::new(&out)).unwrap();
-        assert_eq!(catalog.video.len(), 1);
-        assert_eq!(catalog.audio.len(), 1);
+        let catalog = crate::init::catalog_from_mp4(Cursor::new(&out)).unwrap();
+        assert_eq!(catalog.video_configs().count(), 1);
+        assert_eq!(catalog.audio_configs().count(), 1);
     }
 
     #[test]
@@ -1067,22 +1072,21 @@ mod tests {
     fn hybrid_from_fmp4_matches_hybrid_from_flat() {
         // flat MP4 → hybrid A. flat MP4 → fMP4 → hybrid B. A should equal B
         // because both paths produce the same MUXL hybrid for the same samples.
-        use crate::cli::flat_mp4_to_fmp4;
-
         let name = "h264-aac.mp4";
         let flat_input = FileReadAt::open(&fixture_path(name)).unwrap();
 
         // Path A: flat → hybrid
+        let source_a = read(&flat_input).unwrap();
         let mut hybrid_a = Vec::new();
-        flat_mp4_to_flat(&flat_input, &mut hybrid_a).unwrap();
+        write(&source_a, &flat_input, &mut hybrid_a).unwrap();
 
-        // Path B: flat → fMP4 → hybrid (via plan_from_fmp4)
+        // Path B: flat → fMP4 → hybrid
         let mut fmp4 = Vec::new();
-        flat_mp4_to_fmp4(&flat_input, &mut fmp4).unwrap();
+        crate::fmp4::write(&source_a, &flat_input, &mut fmp4).unwrap();
         let fmp4_ra: &[u8] = &fmp4;
-        let (catalog, plans) = plan_from_fmp4(fmp4_ra).unwrap();
+        let source_b = read(&fmp4_ra.to_vec()).unwrap();
         let mut hybrid_b = Vec::new();
-        write_flat_mp4(&catalog, &plans, fmp4_ra, &mut hybrid_b).unwrap();
+        write(&source_b, &fmp4_ra.to_vec(), &mut hybrid_b).unwrap();
 
         assert_eq!(
             hybrid_a, hybrid_b,
@@ -1096,20 +1100,21 @@ mod tests {
         let flat_input = FileReadAt::open(&fixture_path(name)).unwrap();
 
         // Baseline: flat → hybrid
+        let source = read(&flat_input).unwrap();
         let mut expected = Vec::new();
-        flat_mp4_to_flat(&flat_input, &mut expected).unwrap();
+        write(&source, &flat_input, &mut expected).unwrap();
 
-        // Via to_flat on a flat input
+        // Via auto-detect (read) on a flat input
         let mut via_autodetect_flat = Vec::new();
-        to_flat(&flat_input, &mut via_autodetect_flat).unwrap();
+        write(&read(&flat_input).unwrap(), &flat_input, &mut via_autodetect_flat).unwrap();
         assert_eq!(expected, via_autodetect_flat);
 
-        // Via to_flat on an fMP4 input
+        // Via auto-detect on an fMP4 input
         let mut fmp4 = Vec::new();
-        crate::cli::flat_mp4_to_fmp4(&flat_input, &mut fmp4).unwrap();
-        let fmp4_ra: &[u8] = &fmp4;
+        crate::fmp4::write(&source, &flat_input, &mut fmp4).unwrap();
+        let fmp4_ra: Vec<u8> = fmp4;
         let mut via_autodetect_fmp4 = Vec::new();
-        to_flat(fmp4_ra, &mut via_autodetect_fmp4).unwrap();
+        write(&read(&fmp4_ra).unwrap(), &fmp4_ra, &mut via_autodetect_fmp4).unwrap();
         assert_eq!(expected, via_autodetect_fmp4);
     }
 
@@ -1127,8 +1132,8 @@ mod tests {
         let flat_input = FileReadAt::open(&fixture_path("h264-aac.mp4")).unwrap();
         let (catalog, mut plans) = plan_from_flat_mp4(&flat_input).unwrap();
         // Pick the video plan (matches the catalog video track_id).
-        let video_track_id = catalog.video.values().next().unwrap().track_id;
-        let video_ts = catalog.video.values().next().unwrap().timescale;
+        let video_track_id = catalog.video_configs().next().unwrap().track_id();
+        let video_ts = catalog.video_configs().next().unwrap().timescale();
         for plan in &mut plans {
             if plan.track_id == video_track_id {
                 // 9 ms in movie timescale (1000) → 138 ticks in video timescale (15360).

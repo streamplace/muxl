@@ -6,19 +6,19 @@ default:
 
 # Build the project
 build:
-    cargo build
+    cargo build --workspace
 
 # Build in release mode
 build-release:
-    cargo build --release
+    cargo build --release --workspace
 
 # Type-check without building
 check:
-    cargo check
+    cargo check --workspace
 
 # Run cargo tests
 test: build
-    cargo test
+    cargo test --workspace
 
 # Generate synthetic test fixtures (requires ffmpeg)
 fixtures:

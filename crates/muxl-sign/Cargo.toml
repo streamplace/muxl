@@ -1,0 +1,9 @@
+[package]
+name = "muxl-sign"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+
+[dependencies]
+muxl = { path = "../.." }
+c2pa = { git = "https://github.com/streamplace/c2pa-rs.git", rev = "544825abfaf9e588813e18dba70c8d5afd039d46", features = ["openssl", "file_io"] }

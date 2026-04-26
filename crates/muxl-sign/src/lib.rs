@@ -11,9 +11,11 @@
 //! - [`sign_per_track`] — split a multi-track [`muxl::Source`] into per-track
 //!   flat MP4s, sign each, and combine into a wrapper signed flat MP4.
 
+mod cli;
 mod error;
 mod sign;
 
 pub use c2pa::SigningAlg;
+pub use cli::cli_main;
 pub use error::{Error, Result};
 pub use sign::{SignerKey, sign_per_track};

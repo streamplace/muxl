@@ -31,6 +31,22 @@ pub struct Source {
     pub plan: Plan,
 }
 
+impl Source {
+    /// Return a new `Source` whose catalog and plan contain only the
+    /// requested track. Useful for emitting per-track flat MP4s from a
+    /// multi-track input — the resulting source can be passed to
+    /// [`crate::flat::write`] verbatim.
+    ///
+    /// Returns `None` if no track has the given id.
+    pub fn filter_to_track(&self, track_id: u32) -> Option<Source> {
+        let track = self.plan.track(track_id)?.clone();
+        Some(Source {
+            catalog: self.catalog.filter_to_track(track_id),
+            plan: Plan { tracks: vec![track] },
+        })
+    }
+}
+
 /// Per-track sample plans in track-id order.
 #[derive(Debug, Clone, Default)]
 pub struct Plan {

@@ -239,6 +239,46 @@ impl Catalog {
         });
         audio.renditions.insert(name.into(), config);
     }
+
+    /// Return a new catalog containing only the rendition whose `track_id`
+    /// matches. The matching rendition's wrapping `Video` or `Audio` is
+    /// retained (with its other-rendition entries stripped); the opposite
+    /// track-type wrapper is dropped entirely. If no rendition matches,
+    /// both wrappers are `None`.
+    pub fn filter_to_track(&self, track_id: u32) -> Catalog {
+        let video = self.video.as_ref().and_then(|v| {
+            let renditions: BTreeMap<String, VideoConfig> = v
+                .renditions
+                .iter()
+                .filter(|(_, c)| c.track_id() == track_id)
+                .map(|(k, c)| (k.clone(), c.clone()))
+                .collect();
+            if renditions.is_empty() {
+                None
+            } else {
+                Some(Video {
+                    renditions,
+                    display: v.display,
+                    rotation: v.rotation,
+                    flip: v.flip,
+                })
+            }
+        });
+        let audio = self.audio.as_ref().and_then(|a| {
+            let renditions: BTreeMap<String, AudioConfig> = a
+                .renditions
+                .iter()
+                .filter(|(_, c)| c.track_id() == track_id)
+                .map(|(k, c)| (k.clone(), c.clone()))
+                .collect();
+            if renditions.is_empty() {
+                None
+            } else {
+                Some(Audio { renditions })
+            }
+        });
+        Catalog { video, audio }
+    }
 }
 
 // ---------------------------------------------------------------------------

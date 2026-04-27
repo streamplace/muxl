@@ -10,6 +10,7 @@
 
 use std::io::{Cursor, Read, Write};
 use std::path::Path;
+use std::sync::Once;
 
 use c2pa::{Builder, CallbackSigner, Signer as C2paSigner, SigningAlg};
 use muxl::{Segmenter, SegmenterEvent, Source};
@@ -17,6 +18,42 @@ use muxl::io::ReadAt;
 
 use crate::cbor::SignedEvent;
 use crate::error::{Error, Result};
+
+/// Process-global c2pa-rs settings applied once before any sign call.
+///
+/// muxl-sign doesn't yet have a use case for X.509 trust verification —
+/// our certs are issued via DID-based identity flows (Streamplace's
+/// ES256K + did:key path), not chained to public CAs. So we disable
+/// trust/OCSP/timestamp checks unconditionally. Callers that want
+/// stricter settings can call `c2pa::settings::Settings::from_toml`
+/// themselves before invoking any muxl-sign API — Once::call_once
+/// ensures we won't stomp them.
+const MUXL_SIGN_DEFAULTS_TOML: &str = r#"
+version_major = 1
+version_minor = 0
+
+[verify]
+verify_after_sign = false
+verify_trust = false
+verify_timestamp_trust = false
+ocsp_fetch = false
+remote_manifest_fetch = false
+check_ingredient_trust = false
+skip_ingredient_conflict_resolution = false
+strict_v1_validation = false
+
+[builder.thumbnail]
+enabled = false
+"#;
+
+static SETTINGS_INIT: Once = Once::new();
+
+fn init_default_settings() {
+    SETTINGS_INIT.call_once(|| {
+        c2pa::settings::Settings::from_toml(MUXL_SIGN_DEFAULTS_TOML)
+            .expect("muxl-sign default settings TOML should always parse");
+    });
+}
 
 /// PEM-format cert chain + private key bundle, used to drive c2pa-rs.
 ///
@@ -140,6 +177,7 @@ where
     R: ReadAt + ?Sized,
     W: Write,
 {
+    init_default_settings();
     let c2pa_signer = signer.build()?;
 
     // 1. Per-track sign — emit + sign one flat MP4 per track.
@@ -186,34 +224,6 @@ where
     Ok(())
 }
 
-/// Apply a c2pa-rs settings TOML to the current process.
-///
-/// Settings in c2pa-rs are process-global, so this only needs to be
-/// called once before any signing or reading. Useful overrides for
-/// muxl-sign callers running with self-signed test certs:
-///
-/// ```toml
-/// [verify]
-/// verify_after_sign = false
-/// verify_trust = false
-/// verify_timestamp_trust = false
-/// ocsp_fetch = false
-/// remote_manifest_fetch = false
-/// check_ingredient_trust = false
-/// ```
-///
-/// Production deployments with proper trust roots can skip this entirely.
-pub fn apply_settings_from_toml(toml: &str) -> Result<()> {
-    c2pa::settings::Settings::from_toml(toml)?;
-    Ok(())
-}
-
-/// Read a TOML file from `path` and apply it via [`apply_settings_from_toml`].
-pub fn apply_settings_from_file(path: impl AsRef<Path>) -> Result<()> {
-    let toml = std::fs::read_to_string(path)?;
-    apply_settings_from_toml(&toml)
-}
-
 /// Stream-sign an fMP4 source: consume `input` (an fMP4 byte stream from
 /// e.g. `muxl segment`'s emitter) and emit one CBOR-framed
 /// `signed-segment` event per GoP on `output`.
@@ -230,6 +240,7 @@ pub fn sign_segment_stream<R: Read, W: Write>(
     track_manifest: &str,
     wrapper_manifest: &str,
 ) -> Result<()> {
+    init_default_settings();
     let mut segmenter = Segmenter::new();
     let mut init_bytes: Option<Vec<u8>> = None;
     let mut buf = [0u8; 64 * 1024];

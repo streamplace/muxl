@@ -4,31 +4,9 @@
 
 use std::io::Cursor;
 use std::path::PathBuf;
-use std::sync::Once;
 
 use muxl::io::FileReadAt;
 use muxl_sign::{SignerKey, SigningAlg, sign_per_track};
-
-/// c2pa-rs's defaults run a full verify pass on a freshly-signed asset.
-/// Our test cert isn't in any trust store, so disable trust verification
-/// and external fetches — the signature itself still has to verify
-/// (`verify_after_sign` stays on).
-const TEST_SETTINGS: &str = r#"
-[verify]
-verify_trust = false
-verify_timestamp_trust = false
-ocsp_fetch = false
-remote_manifest_fetch = false
-check_ingredient_trust = false
-"#;
-
-static SETTINGS_INIT: Once = Once::new();
-
-fn init_settings() {
-    SETTINGS_INIT.call_once(|| {
-        c2pa::settings::Settings::from_toml(TEST_SETTINGS).expect("c2pa settings");
-    });
-}
 
 fn repo_path(rel: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -58,8 +36,6 @@ const WRAPPER_MANIFEST: &str = r#"{
 
 #[test]
 fn sign_per_track_roundtrip_h264_aac() {
-    init_settings();
-
     let input_path = repo_path("samples/fixtures/h264-aac.mp4");
     let input = FileReadAt::open(&input_path).expect("open fixture");
     let source = muxl::read(&input).expect("read source");

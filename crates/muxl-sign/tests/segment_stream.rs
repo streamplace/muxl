@@ -4,27 +4,9 @@
 
 use std::io::{BufReader, Cursor};
 use std::path::PathBuf;
-use std::sync::Once;
 
 use dasl::drisl::de::iter_from_reader;
 use muxl_sign::{SignedEvent, SignerKey, SigningAlg, sign_segment_stream};
-
-const TEST_SETTINGS: &str = r#"
-[verify]
-verify_trust = false
-verify_timestamp_trust = false
-ocsp_fetch = false
-remote_manifest_fetch = false
-check_ingredient_trust = false
-"#;
-
-static SETTINGS_INIT: Once = Once::new();
-
-fn init_settings() {
-    SETTINGS_INIT.call_once(|| {
-        c2pa::settings::Settings::from_toml(TEST_SETTINGS).expect("c2pa settings");
-    });
-}
 
 fn repo_path(rel: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -50,8 +32,6 @@ const WRAPPER_MANIFEST: &str = r#"{
 
 #[test]
 fn segment_stream_signs_each_gop() {
-    init_settings();
-
     let fmp4 = std::fs::read(repo_path("samples/fixtures/h264-opus-frag.mp4"))
         .expect("read fmp4 fixture");
 

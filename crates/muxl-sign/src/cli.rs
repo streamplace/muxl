@@ -7,9 +7,7 @@ use std::process;
 
 use clap::{Parser, Subcommand, ValueEnum};
 
-use crate::{
-    Result, SignerKey, SigningAlg, apply_settings_from_file, sign_per_track, sign_segment_stream,
-};
+use crate::{Result, SignerKey, SigningAlg, sign_per_track, sign_segment_stream};
 
 #[derive(Parser)]
 #[command(
@@ -54,10 +52,6 @@ struct SigningArgs {
     /// Optional RFC 3161 timestamp authority URL.
     #[arg(long, value_name = "URL")]
     tsa_url: Option<String>,
-    /// Optional path to a c2pa-rs settings TOML — applied before signing.
-    /// Useful with self-signed test certs to disable trust/OCSP checks.
-    #[arg(long, value_name = "PATH")]
-    settings: Option<PathBuf>,
 }
 
 impl SigningArgs {
@@ -69,11 +63,7 @@ impl SigningArgs {
             track_manifest,
             wrapper_manifest,
             tsa_url,
-            settings,
         } = self;
-        if let Some(path) = settings {
-            apply_settings_from_file(path)?;
-        }
         let mut signer = SignerKey::from_pem_files(&cert, &key, alg.into())?;
         if let Some(url) = tsa_url {
             signer = signer.with_tsa_url(url);

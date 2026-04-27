@@ -1,5 +1,10 @@
 # muxl — deterministic MP4 canonicalization
 
+# Container CLI to use for Dockerfile-based builds. Defaults to `docker`,
+# which works with podman via the podman-docker shim. Override with e.g.
+# `DOCKER=podman just build-wasi-sign`.
+docker := env("DOCKER", "docker")
+
 # Default: list available recipes
 default:
     @just --list
@@ -140,6 +145,27 @@ show-changes file: build
 # Build WASI binary (for Go/wazero embedding)
 build-wasi:
     cargo build --target wasm32-wasip1 --release
+
+# Build the muxl-sign WASI binary inside a container.
+# c2pa-rs pulls in `ring` which needs clang at compile time; running the
+# build in a container lets you ship the .wasm without installing clang
+# on the host. Output: target/wasm32-wasip1/release/muxl-sign.wasm
+#
+# Mounts the sibling ../c2pa-rs because of the temporary [patch] override
+# in the workspace Cargo.toml (drop that mount once the patch goes away).
+#
+# Container runs as its default user (root on docker; mapped to the host
+# user under rootless podman via the user namespace). On rootful docker
+# the resulting target/ files end up root-owned — sudo chown if needed.
+build-wasi-sign:
+    {{docker}} build -q -t muxl-wasi-build -f Dockerfile.wasm .
+    {{docker}} run --rm \
+        -v "$(pwd)":/work \
+        -v "$(pwd)/../c2pa-rs":/c2pa-rs \
+        -e CARGO_HOME=/work/target/.docker-cargo \
+        muxl-wasi-build \
+        cargo build --release --target wasm32-wasip1 -p muxl-sign
+    @echo "Built target/wasm32-wasip1/release/muxl-sign.wasm"
 
 # Build browser WASM library (with wasm-bindgen)
 build-wasm:

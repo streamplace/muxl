@@ -1790,8 +1790,11 @@ version = "0.1.0"
 dependencies = [
  "c2pa",
  "clap",
+ "dasl",
  "k256",
  "muxl",
+ "serde",
+ "serde_bytes",
 ]
 
 [[package]]

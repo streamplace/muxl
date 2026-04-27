@@ -8,13 +8,14 @@
 //! isolation — losing a track only invalidates that ingredient, not the
 //! wrapper signature or the surviving tracks.
 
-use std::io::{Cursor, Write};
+use std::io::{Cursor, Read, Write};
 use std::path::Path;
 
 use c2pa::{Builder, CallbackSigner, Signer as C2paSigner, SigningAlg};
-use muxl::Source;
+use muxl::{Segmenter, SegmenterEvent, Source};
 use muxl::io::ReadAt;
 
+use crate::cbor::SignedEvent;
 use crate::error::{Error, Result};
 
 /// PEM-format cert chain + private key bundle, used to drive c2pa-rs.
@@ -183,6 +184,123 @@ where
 
     output.write_all(&output_buf)?;
     Ok(())
+}
+
+/// Stream-sign an fMP4 source: consume `input` (an fMP4 byte stream from
+/// e.g. `muxl segment`'s emitter) and emit one CBOR-framed
+/// `signed-segment` event per GoP on `output`.
+///
+/// Each event's `data` field is a complete signed flat MP4 (wrapper +
+/// per-track ingredients) — the artifact Streamplace stores per GoP.
+///
+/// Output framing is one DRISL/CBOR value per event, written
+/// back-to-back. Decoders read one value at a time until EOF.
+pub fn sign_segment_stream<R: Read, W: Write>(
+    input: &mut R,
+    output: &mut W,
+    signer: &SignerKey,
+    track_manifest: &str,
+    wrapper_manifest: &str,
+) -> Result<()> {
+    let mut segmenter = Segmenter::new();
+    let mut init_bytes: Option<Vec<u8>> = None;
+    let mut buf = [0u8; 64 * 1024];
+
+    loop {
+        let n = input.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        for event in segmenter.feed(&buf[..n])? {
+            handle_event(
+                event,
+                &mut init_bytes,
+                signer,
+                track_manifest,
+                wrapper_manifest,
+                output,
+            )?;
+        }
+    }
+    for event in segmenter.flush()? {
+        handle_event(
+            event,
+            &mut init_bytes,
+            signer,
+            track_manifest,
+            wrapper_manifest,
+            output,
+        )?;
+    }
+    Ok(())
+}
+
+fn handle_event<W: Write>(
+    event: SegmenterEvent,
+    init_bytes: &mut Option<Vec<u8>>,
+    signer: &SignerKey,
+    track_manifest: &str,
+    wrapper_manifest: &str,
+    output: &mut W,
+) -> Result<()> {
+    match event {
+        SegmenterEvent::InitSegment { data, .. } => {
+            *init_bytes = Some(data);
+        }
+        SegmenterEvent::Segment(gop) => {
+            let init = init_bytes.as_deref().ok_or_else(|| {
+                Error::Muxl(muxl::Error::InvalidMp4(
+                    "segment received before init segment".into(),
+                ))
+            })?;
+            let signed = sign_one_gop_fmp4(init, &gop, signer, track_manifest, wrapper_manifest)?;
+            let signed_len = signed.len();
+            let number = gop.number;
+            let event = SignedEvent::SignedSegment {
+                number,
+                data: signed,
+            };
+            dasl::drisl::to_writer(&mut *output, &event).map_err(|e| {
+                Error::Io(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    e.to_string(),
+                ))
+            })?;
+            output.flush()?;
+            eprintln!("signed segment {}: {} bytes", number, signed_len);
+        }
+    }
+    Ok(())
+}
+
+/// Reassemble one GoP's per-track moof+mdat segments back into a self-
+/// contained fMP4 (init + interleaved track data), then drive the
+/// existing `sign_per_track` over it.
+fn sign_one_gop_fmp4(
+    init_bytes: &[u8],
+    gop: &muxl::GopSegment,
+    signer: &SignerKey,
+    track_manifest: &str,
+    wrapper_manifest: &str,
+) -> Result<Vec<u8>> {
+    let body_len: usize = gop.tracks.values().map(|v| v.len()).sum();
+    let mut fmp4 = Vec::with_capacity(init_bytes.len() + body_len);
+    fmp4.extend_from_slice(init_bytes);
+    for data in gop.tracks.values() {
+        fmp4.extend_from_slice(data);
+    }
+
+    let source = muxl::read(&fmp4)?;
+    let mut signed = Vec::new();
+    sign_per_track(
+        &source,
+        &fmp4,
+        signer,
+        track_manifest,
+        wrapper_manifest,
+        &mut signed,
+    )?;
+    Ok(signed)
 }
 
 /// Sign a single in-memory MP4 buffer with a given manifest.

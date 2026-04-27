@@ -1,13 +1,13 @@
 //! CLI entry point for the `muxl-sign` binary.
 
 use std::fs;
-use std::io::{BufWriter, Write};
+use std::io::{self, BufWriter, Write};
 use std::path::PathBuf;
 use std::process;
 
 use clap::{Parser, Subcommand, ValueEnum};
 
-use crate::{Result, SignerKey, SigningAlg, sign_per_track};
+use crate::{Result, SignerKey, SigningAlg, sign_per_track, sign_segment_stream};
 
 #[derive(Parser)]
 #[command(
@@ -26,16 +26,14 @@ enum Command {
     /// into a wrapper signed flat MP4 whose manifest carries each
     /// per-track signed asset as a c2pa Ingredient.
     SignPerTrack(SignPerTrackArgs),
+    /// Stream-sign an fMP4 input on stdin: for each GoP emitted by the
+    /// MUXL segmenter, produce one signed flat MP4 (per-track + wrapper)
+    /// as a CBOR `signed-segment` event on stdout.
+    Segment(SegmentArgs),
 }
 
 #[derive(clap::Args)]
-struct SignPerTrackArgs {
-    /// Input MP4 (flat or fragmented; auto-detected).
-    #[arg(long, value_name = "PATH")]
-    input: PathBuf,
-    /// Output path for the signed wrapper flat MP4.
-    #[arg(long, value_name = "PATH")]
-    output: PathBuf,
+struct SigningArgs {
     /// PEM-encoded signing cert chain (leaf first).
     #[arg(long, value_name = "PATH")]
     cert: PathBuf,
@@ -54,6 +52,46 @@ struct SignPerTrackArgs {
     /// Optional RFC 3161 timestamp authority URL.
     #[arg(long, value_name = "URL")]
     tsa_url: Option<String>,
+}
+
+impl SigningArgs {
+    fn into_signer_and_manifests(self) -> Result<(SignerKey, String, String)> {
+        let SigningArgs {
+            cert,
+            key,
+            alg,
+            track_manifest,
+            wrapper_manifest,
+            tsa_url,
+        } = self;
+        let mut signer = SignerKey::from_pem_files(&cert, &key, alg.into())?;
+        if let Some(url) = tsa_url {
+            signer = signer.with_tsa_url(url);
+        }
+        Ok((
+            signer,
+            fs::read_to_string(&track_manifest)?,
+            fs::read_to_string(&wrapper_manifest)?,
+        ))
+    }
+}
+
+#[derive(clap::Args)]
+struct SignPerTrackArgs {
+    /// Input MP4 (flat or fragmented; auto-detected).
+    #[arg(long, value_name = "PATH")]
+    input: PathBuf,
+    /// Output path for the signed wrapper flat MP4.
+    #[arg(long, value_name = "PATH")]
+    output: PathBuf,
+    #[command(flatten)]
+    signing: SigningArgs,
+}
+
+#[derive(clap::Args)]
+struct SegmentArgs {
+    #[command(flatten)]
+    signing: SigningArgs,
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -88,6 +126,7 @@ pub fn cli_main() {
     let cli = Cli::parse();
     let result = match cli.command {
         Command::SignPerTrack(args) => cmd_sign_per_track(args),
+        Command::Segment(args) => cmd_segment(args),
     };
     if let Err(e) = result {
         eprintln!("Error: {e}");
@@ -99,24 +138,12 @@ fn cmd_sign_per_track(args: SignPerTrackArgs) -> Result<()> {
     let SignPerTrackArgs {
         input,
         output,
-        cert,
-        key,
-        alg,
-        track_manifest,
-        wrapper_manifest,
-        tsa_url,
+        signing,
     } = args;
+    let (signer, track_manifest, wrapper_manifest) = signing.into_signer_and_manifests()?;
 
     let input_reader = muxl::io::FileReadAt::open(&input)?;
     let source = muxl::read(&input_reader)?;
-
-    let track_manifest = fs::read_to_string(&track_manifest)?;
-    let wrapper_manifest = fs::read_to_string(&wrapper_manifest)?;
-
-    let mut signer = SignerKey::from_pem_files(&cert, &key, alg.into())?;
-    if let Some(url) = tsa_url {
-        signer = signer.with_tsa_url(url);
-    }
 
     let out_file = fs::File::create(&output)?;
     let mut out = BufWriter::new(out_file);
@@ -137,4 +164,17 @@ fn cmd_sign_per_track(args: SignPerTrackArgs) -> Result<()> {
         output.display()
     );
     Ok(())
+}
+
+fn cmd_segment(args: SegmentArgs) -> Result<()> {
+    let (signer, track_manifest, wrapper_manifest) = args.signing.into_signer_and_manifests()?;
+    let mut stdin = io::stdin().lock();
+    let mut stdout = io::stdout().lock();
+    sign_segment_stream(
+        &mut stdin,
+        &mut stdout,
+        &signer,
+        &track_manifest,
+        &wrapper_manifest,
+    )
 }

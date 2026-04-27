@@ -142,14 +142,17 @@ fn cmd_sign_per_track(args: SignPerTrackArgs) -> Result<()> {
     } = args;
     let (signer, track_manifest, wrapper_manifest) = signing.into_signer_and_manifests()?;
 
-    let input_reader = muxl::io::FileReadAt::open(&input)?;
-    let source = muxl::read(&input_reader)?;
+    // FileReadAt uses pread(2) which isn't implemented for wasip1; read the
+    // input into a Vec<u8> first so we can lean on the in-memory ReadAt impl
+    // and stay portable across native + WASM builds.
+    let input_bytes: Vec<u8> = fs::read(&input)?;
+    let source = muxl::read(&input_bytes)?;
 
     let out_file = fs::File::create(&output)?;
     let mut out = BufWriter::new(out_file);
     sign_per_track(
         &source,
-        &input_reader,
+        &input_bytes,
         &signer,
         &track_manifest,
         &wrapper_manifest,

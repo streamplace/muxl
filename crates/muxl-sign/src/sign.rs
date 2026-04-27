@@ -11,7 +11,7 @@
 use std::io::{Cursor, Write};
 use std::path::Path;
 
-use c2pa::{Builder, Signer as C2paSigner, SigningAlg};
+use c2pa::{Builder, CallbackSigner, Signer as C2paSigner, SigningAlg};
 use muxl::Source;
 use muxl::io::ReadAt;
 
@@ -68,12 +68,49 @@ impl SignerKey {
     }
 
     fn build(&self) -> Result<Box<dyn C2paSigner>> {
-        Ok(c2pa::create_signer::from_keys(
-            &self.cert_chain,
-            &self.private_key,
-            self.alg,
-            self.tsa_url.clone(),
-        )?)
+        match self.alg {
+            // The streamplace c2pa-rs fork validates ES256K but doesn't sign
+            // it via the rust_native_crypto path — wire the signer through
+            // CallbackSigner using `k256` so signing works in WASM too.
+            SigningAlg::Es256K => self.build_es256k_callback(),
+            _ => Ok(c2pa::create_signer::from_keys(
+                &self.cert_chain,
+                &self.private_key,
+                self.alg,
+                self.tsa_url.clone(),
+            )?),
+        }
+    }
+
+    fn build_es256k_callback(&self) -> Result<Box<dyn C2paSigner>> {
+        use k256::ecdsa::SigningKey;
+        use k256::ecdsa::signature::Signer;
+        use k256::pkcs8::DecodePrivateKey;
+
+        let pem_str = std::str::from_utf8(&self.private_key).map_err(|_| {
+            Error::C2pa(c2pa::Error::BadParam(
+                "private key is not UTF-8 PEM".into(),
+            ))
+        })?;
+        let secret_key = k256::SecretKey::from_pkcs8_pem(pem_str)
+            .map_err(|e| Error::C2pa(c2pa::Error::BadParam(format!("bad ES256K key PEM: {e}"))))?;
+        let signing_key = SigningKey::from(&secret_key);
+
+        let mut signer = CallbackSigner::new(
+            move |_ctx, data: &[u8]| -> std::result::Result<Vec<u8>, c2pa::Error> {
+                // k256's deterministic ECDSA hashes with SHA-256 internally
+                // and returns a fixed-length 64-byte (R || S) signature —
+                // exactly the P1363 format c2pa expects for ES256K.
+                let sig: k256::ecdsa::Signature = signing_key.sign(data);
+                Ok(sig.to_bytes().to_vec())
+            },
+            SigningAlg::Es256K,
+            self.cert_chain.clone(),
+        );
+        if let Some(url) = &self.tsa_url {
+            signer = signer.set_tsa_url(url.clone());
+        }
+        Ok(Box::new(signer))
     }
 }
 

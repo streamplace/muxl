@@ -20,4 +20,7 @@ pub use c2pa::SigningAlg;
 pub use cbor::SignedEvent;
 pub use cli::cli_main;
 pub use error::{Error, Result};
-pub use sign::{SignerKey, sign_per_track, sign_segment_stream};
+pub use sign::{
+    SignerKey, apply_settings_from_file, apply_settings_from_toml, sign_per_track,
+    sign_segment_stream,
+};

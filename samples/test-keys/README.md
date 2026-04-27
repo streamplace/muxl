@@ -12,6 +12,7 @@ the repo.
 | --- | --- |
 | `es256k-cert.pem` | PEM cert chain — leaf first, then root CA |
 | `es256k-key.pem`  | PEM PKCS#8 leaf private key |
+| `test-settings.toml` | c2pa-rs settings — pass via `muxl-sign --settings` to disable trust/OCSP for the self-signed chain |
 
 The c2pa-rs cert profile check (`check_certificate_profile`) requires:
 - a v3 cert

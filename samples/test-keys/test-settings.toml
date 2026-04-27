@@ -1,0 +1,22 @@
+# c2pa-rs settings for muxl-sign tests + integrations using the
+# self-signed cert chain in this directory. Pass to `muxl-sign` via
+# `--settings samples/test-keys/test-settings.toml`. Mirrors the TOML
+# the streamplace iroh-streamplace/src/c2pa.rs flow installs for the
+# same reason — the test cert isn't in any trust store, so trust/OCSP
+# verification has to be off for either signing or reading to succeed.
+
+version_major = 1
+version_minor = 0
+
+[verify]
+verify_after_sign = false
+verify_trust = false
+verify_timestamp_trust = false
+ocsp_fetch = false
+remote_manifest_fetch = false
+check_ingredient_trust = false
+skip_ingredient_conflict_resolution = false
+strict_v1_validation = false
+
+[builder.thumbnail]
+enabled = false

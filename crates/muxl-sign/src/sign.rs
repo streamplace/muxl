@@ -186,6 +186,34 @@ where
     Ok(())
 }
 
+/// Apply a c2pa-rs settings TOML to the current process.
+///
+/// Settings in c2pa-rs are process-global, so this only needs to be
+/// called once before any signing or reading. Useful overrides for
+/// muxl-sign callers running with self-signed test certs:
+///
+/// ```toml
+/// [verify]
+/// verify_after_sign = false
+/// verify_trust = false
+/// verify_timestamp_trust = false
+/// ocsp_fetch = false
+/// remote_manifest_fetch = false
+/// check_ingredient_trust = false
+/// ```
+///
+/// Production deployments with proper trust roots can skip this entirely.
+pub fn apply_settings_from_toml(toml: &str) -> Result<()> {
+    c2pa::settings::Settings::from_toml(toml)?;
+    Ok(())
+}
+
+/// Read a TOML file from `path` and apply it via [`apply_settings_from_toml`].
+pub fn apply_settings_from_file(path: impl AsRef<Path>) -> Result<()> {
+    let toml = std::fs::read_to_string(path)?;
+    apply_settings_from_toml(&toml)
+}
+
 /// Stream-sign an fMP4 source: consume `input` (an fMP4 byte stream from
 /// e.g. `muxl segment`'s emitter) and emit one CBOR-framed
 /// `signed-segment` event per GoP on `output`.

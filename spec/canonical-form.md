@@ -211,11 +211,15 @@ Edit lists are a pre-CMAF mechanism for expressing presentation-start offsets (e
 Round-trip:
 
 1. **Source → MUXL.** Any leading empty-edit entries (`media_time == -1`) at the head of a source track's `elst` are summed, rescaled from the movie timescale into the track's media timescale, and baked into the first MUXL fragment's `tfdt`. Any non-empty entries are discarded; a canonical MUXL track's media timeline begins at `media_time == 0`.
-2. **MUXL → flat MP4.** If a track carries a non-zero first-fragment `tfdt`, `write_flat_mp4` synthesizes a canonical two-entry `elst` in that track's `trak`:
+2. **MUXL → flat MP4.** Per-track leading offsets are first **normalized**: the smallest leading offset across all tracks (computed in the movie timescale) is subtracted from every track's offset, leaving only the inter-track relative delta. Then, for any track whose normalized offset is non-zero, `write_flat_mp4` synthesizes a canonical two-entry `elst` in that track's `trak`:
    - Entry 1: `segment_duration = tfdt_movie_ts, media_time = -1` (empty edit)
    - Entry 2: `segment_duration = media_duration_movie_ts, media_time = 0` (normal play)
-   A zero offset produces no `edts` box at all.
-3. **MUXL → fragments.** First fragment's `tfdt` carries the offset; later fragments' tfdts follow from per-sample durations as usual. No `elst` is ever in play.
+   A zero normalized offset produces no `edts` box at all.
+
+   Normalization preserves A/V sync (the inter-track delta is the only thing that affects playback alignment) while dropping the absolute capture-clock offset. Two consequences:
+   - **Robust across muxers.** Different upstream muxers emit different leading edits for logically identical content (mp4mux bakes running-time tfdts, ffmpeg sometimes strips them entirely, OBS hybrid varies). Normalization makes MUXL output stable regardless of upstream convention.
+   - **No capture-clock leak.** Sources whose first sample lands at a non-zero wall-clock-aligned position don't propagate that offset through the canonical bytes. Wall-clock provenance, when needed, lives in c2pa/S2PA assertions, not in the container.
+3. **MUXL → fragments.** First fragment's `tfdt` carries the normalized offset; later fragments' tfdts follow from per-sample durations as usual. No `elst` is ever in play.
 
 Source `elst` patterns outside the leading-empty-edit shape — media-time offsets used for encoder priming, rate changes, trims — are not converged by MUXL and are tracked in `open-questions.md`. A source file with a priming `elst` (e.g. `media_time = 1024` for AAC) currently loses the priming metadata in the MUXL form; playback is offset by the priming duration until a separate sample-dropping normalization lands.
 

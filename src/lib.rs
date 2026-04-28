@@ -34,7 +34,7 @@ pub use fragment::{FragmentStats, Frame, TrackStats, fragment_to_directory, frag
 // playlists. The reader/writer entry points live in `muxl::flat::{read, write}`.
 pub use flat::{FlatFragment, FlatMp4Info, FlatTrackInfo};
 
-mod cli;
+pub mod cli;
 pub use cli::cli_main;
 
 // ---------------------------------------------------------------------------

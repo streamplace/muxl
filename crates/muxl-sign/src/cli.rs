@@ -1,4 +1,10 @@
 //! CLI entry point for the `muxl-sign` binary.
+//!
+//! Consolidated CLI: every `muxl` subcommand is reachable here under the
+//! same name (catalog, fmp4, mp4, segment, concat, hls), plus the
+//! sign-specific subcommands `sign-per-track` and `sign-segment`. This
+//! lets Streamplace ship a single `muxl-sign.wasm` that covers both the
+//! unsigned-muxing path and the per-track signing path.
 
 use std::fs;
 use std::io::{self, BufWriter, Write};
@@ -6,13 +12,14 @@ use std::path::PathBuf;
 use std::process;
 
 use clap::{Parser, Subcommand, ValueEnum};
+use muxl::cli as muxl_cli;
 
 use crate::{Result, SignerKey, SigningAlg, sign_per_track, sign_segment_stream};
 
 #[derive(Parser)]
 #[command(
     name = "muxl-sign",
-    about = "Per-track C2PA signing for MUXL flat MP4s",
+    about = "MUXL canonicalization + per-track C2PA signing",
     version
 )]
 struct Cli {
@@ -22,6 +29,7 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    // Sign-specific subcommands. ----------------------------------------------
     /// Split a multi-track flat MP4 per-track, sign each, and combine
     /// into a wrapper signed flat MP4 whose manifest carries each
     /// per-track signed asset as a c2pa Ingredient.
@@ -29,7 +37,21 @@ enum Command {
     /// Stream-sign an fMP4 input on stdin: for each GoP emitted by the
     /// MUXL segmenter, produce one signed flat MP4 (per-track + wrapper)
     /// as a CBOR `signed-segment` event on stdout.
-    Segment(SegmentArgs),
+    SignSegment(SignSegmentArgs),
+
+    // muxl subcommands, lifted verbatim. --------------------------------------
+    /// Extract catalog (track config) from an MP4.
+    Catalog(muxl_cli::CatalogArgs),
+    /// Write a canonical MUXL fMP4 (or just its init segment with --init-only).
+    Fmp4(muxl_cli::Fmp4Args),
+    /// Write a canonical MUXL flat MP4 (faststart) from an input MP4.
+    Mp4(muxl_cli::Mp4Args),
+    /// Segment an fMP4 into per-GoP MUXL segments.
+    Segment(muxl_cli::SegmentArgs),
+    /// Concatenate MUXL fMP4 files from stdin, emit CBOR events to stdout.
+    Concat,
+    /// Generate HLS playback artifacts (CID-addressed blobs + optional playlists).
+    Hls(muxl_cli::HlsArgs),
 }
 
 #[derive(clap::Args)]
@@ -89,7 +111,7 @@ struct SignPerTrackArgs {
 }
 
 #[derive(clap::Args)]
-struct SegmentArgs {
+struct SignSegmentArgs {
     #[command(flatten)]
     signing: SigningArgs,
 }
@@ -126,7 +148,16 @@ pub fn cli_main() {
     let cli = Cli::parse();
     let result = match cli.command {
         Command::SignPerTrack(args) => cmd_sign_per_track(args),
-        Command::Segment(args) => cmd_segment(args),
+        Command::SignSegment(args) => cmd_sign_segment(args),
+        // muxl subcommands delegate to muxl::cli::dispatch via its
+        // matching enum variant — we just rebuild the muxl Command from
+        // our payload and hand it off.
+        Command::Catalog(args) => muxl_cli::cmd_catalog(args).map_err(Into::into),
+        Command::Fmp4(args) => muxl_cli::cmd_fmp4(args).map_err(Into::into),
+        Command::Mp4(args) => muxl_cli::cmd_mp4(args).map_err(Into::into),
+        Command::Segment(args) => muxl_cli::cmd_segment(args).map_err(Into::into),
+        Command::Concat => muxl_cli::cmd_concat().map_err(Into::into),
+        Command::Hls(args) => muxl_cli::cmd_hls(args).map_err(Into::into),
     };
     if let Err(e) = result {
         eprintln!("Error: {e}");
@@ -169,7 +200,7 @@ fn cmd_sign_per_track(args: SignPerTrackArgs) -> Result<()> {
     Ok(())
 }
 
-fn cmd_segment(args: SegmentArgs) -> Result<()> {
+fn cmd_sign_segment(args: SignSegmentArgs) -> Result<()> {
     let (signer, track_manifest, wrapper_manifest) = args.signing.into_signer_and_manifests()?;
     let mut stdin = io::stdin().lock();
     let mut stdout = io::stdout().lock();

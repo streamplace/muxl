@@ -7,7 +7,7 @@
 //! unsigned-muxing path and the per-track signing path.
 
 use std::fs;
-use std::io::{self, BufWriter, Write};
+use std::io::{self, BufWriter, Read, Write};
 use std::path::PathBuf;
 use std::process;
 
@@ -173,14 +173,29 @@ fn cmd_sign_per_track(args: SignPerTrackArgs) -> Result<()> {
     } = args;
     let (signer, track_manifest, wrapper_manifest) = signing.into_signer_and_manifests()?;
 
-    // FileReadAt uses pread(2) which isn't implemented for wasip1; read the
-    // input into a Vec<u8> first so we can lean on the in-memory ReadAt impl
-    // and stay portable across native + WASM builds.
-    let input_bytes: Vec<u8> = fs::read(&input)?;
+    // "-" reads stdin / writes stdout. Lets a host runtime skip the
+    // filesystem entirely for the hot input/output bytes — useful on
+    // platforms where temp-file I/O is expensive (Windows %TEMP% on NTFS,
+    // antivirus scanning, etc.). Cert/key/manifests stay path-based and
+    // can come from a read-only FS mount.
+    //
+    // FileReadAt uses pread(2) which isn't implemented for wasip1; we
+    // also slurp file inputs into a Vec<u8> so the same in-memory
+    // ReadAt code path covers both file and stdin sources.
+    let input_bytes: Vec<u8> = if input.as_os_str() == "-" {
+        let mut buf = Vec::new();
+        io::stdin().lock().read_to_end(&mut buf)?;
+        buf
+    } else {
+        fs::read(&input)?
+    };
     let source = muxl::read(&input_bytes)?;
 
-    let out_file = fs::File::create(&output)?;
-    let mut out = BufWriter::new(out_file);
+    let mut out: Box<dyn Write> = if output.as_os_str() == "-" {
+        Box::new(BufWriter::new(io::stdout().lock()))
+    } else {
+        Box::new(BufWriter::new(fs::File::create(&output)?))
+    };
     sign_per_track(
         &source,
         &input_bytes,
@@ -191,12 +206,14 @@ fn cmd_sign_per_track(args: SignPerTrackArgs) -> Result<()> {
     )?;
     out.flush()?;
 
-    eprintln!(
-        "signed {} ({} tracks) → {}",
-        input.display(),
-        source.plan.tracks.len(),
-        output.display()
-    );
+    if input.as_os_str() != "-" && output.as_os_str() != "-" {
+        eprintln!(
+            "signed {} ({} tracks) → {}",
+            input.display(),
+            source.plan.tracks.len(),
+            output.display()
+        );
+    }
     Ok(())
 }
 

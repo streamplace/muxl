@@ -2,12 +2,7 @@
 resolver = "3"
 members = ["crates/muxl-sign"]
 
-# Temporary local override for the streamplace c2pa-rs fork while a fix
-# for the wasip1 `tempfile_builder` bug is upstreamed. Drop this section
-# and bump the rev in crates/muxl-sign/Cargo.toml once the fix lands on
-# the `streamplace` branch.
-[patch."https://github.com/streamplace/c2pa-rs.git"]
-c2pa = { path = "../c2pa-rs/sdk" }
+c2pa = { git = "https://github.com/streamplace/c2pa-rs.git", rev = "f23cfd398aac79f06cc7114baa633096189d5a37" }
 
 [package]
 name = "muxl"

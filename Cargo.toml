@@ -2,7 +2,6 @@
 resolver = "3"
 members = ["crates/muxl-sign"]
 
-c2pa = { git = "https://github.com/streamplace/c2pa-rs.git", rev = "f23cfd398aac79f06cc7114baa633096189d5a37" }
 
 [package]
 name = "muxl"

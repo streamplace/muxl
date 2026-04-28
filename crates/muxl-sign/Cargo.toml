@@ -1,0 +1,21 @@
+[package]
+name = "muxl-sign"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+
+[[bin]]
+name = "muxl-sign"
+path = "src/main.rs"
+
+[dependencies]
+muxl = { path = "../.." }
+c2pa = { git = "https://github.com/streamplace/c2pa-rs.git", rev = "f23cfd398aac79f06cc7114baa633096189d5a37", default-features = false, features = ["rust_native_crypto", "file_io"] }
+clap = { version = "4", features = ["derive"] }
+# ES256K signing is wired through CallbackSigner — c2pa-rs's
+# rust_native_crypto path validates ES256K but doesn't sign with it.
+k256 = { version = "0.13", features = ["ecdsa", "pkcs8", "pem"] }
+# Streaming CBOR/DRISL output for the `segment` subcommand.
+dasl = "0.2"
+serde = { version = "1", features = ["derive"] }
+serde_bytes = "0.11"

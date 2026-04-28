@@ -282,3 +282,41 @@ fn source_plan_covers_every_track() {
         assert!(track.timescale > 0, "track {} has zero timescale", track.track_id);
     }
 }
+
+// ---------------------------------------------------------------------------
+// 8. Source::filter_to_track produces a single-track Source
+// ---------------------------------------------------------------------------
+
+/// Filtering a multi-track `Source` to a single track yields a `Source`
+/// whose catalog and plan each describe exactly that one track. The
+/// filtered source can drive `flat::write` to produce a per-track flat MP4
+/// that itself round-trips back to a single-track `Source`.
+#[test]
+fn filter_to_track_produces_single_track_source() {
+    let input = open_fixture("h264-aac.mp4");
+    let source = muxl::read(&input).unwrap();
+
+    let track_ids: Vec<u32> = source.plan.tracks.iter().map(|t| t.track_id).collect();
+    assert!(track_ids.len() >= 2, "fixture must be multi-track");
+
+    for &tid in &track_ids {
+        let filtered = source
+            .filter_to_track(tid)
+            .unwrap_or_else(|| panic!("track {tid} should exist"));
+        assert_eq!(filtered.plan.tracks.len(), 1);
+        assert_eq!(filtered.plan.tracks[0].track_id, tid);
+        let renditions =
+            filtered.catalog.video_configs().count() + filtered.catalog.audio_configs().count();
+        assert_eq!(renditions, 1, "filtered catalog should have exactly one rendition");
+
+        let mut buf = Vec::new();
+        muxl::flat::write(&filtered, &input, &mut buf)
+            .expect("flat::write should succeed for a single-track source");
+
+        let round_tripped = muxl::read(&buf).unwrap();
+        assert_eq!(round_tripped.plan.tracks.len(), 1);
+        assert_eq!(round_tripped.plan.tracks[0].track_id, tid);
+    }
+
+    assert!(source.filter_to_track(99_999).is_none());
+}

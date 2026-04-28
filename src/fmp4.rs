@@ -86,12 +86,11 @@ pub fn write<R: ReadAt + ?Sized, W: Write>(
     use crate::hls::{BlobSegment, BlobTrack};
     use crate::io::ReadAtCursor;
 
-    // Re-parse the moov from `input` so we can reuse the existing flat
-    // sample-table extractor. The `source` argument is carried for
-    // symmetry with `flat::write` and for callers that want to stabilize
-    // the catalog before writing; the per-sample layout still comes from
-    // `input`'s moov because that's where co64 / chunk offsets live.
-    let _ = source;
+    // Re-parse the moov from `input` for the per-sample layout (co64 /
+    // chunk offsets live there). Per-track leading offsets come from the
+    // already-normalized `source.plan` instead — that's how this path
+    // picks up the same canonical normalization that `flat::write`
+    // produces. See `canonical-form.md § edts/elst`.
     let mut cursor = ReadAtCursor::new(input).map_err(Error::Io)?;
     let catalog = crate::init::catalog_from_mp4(&mut cursor)?;
     let init = crate::init::build_init_segment(&catalog)?;
@@ -114,9 +113,14 @@ pub fn write<R: ReadAt + ?Sized, W: Write>(
             .find(|t| t.tkhd.track_id == tid)
             .ok_or_else(|| Error::InvalidMp4(format!("track {tid} not found")))?;
         let samples = extract_flat_track_info(trak)?;
-        // Bake leading-empty-edit into first fragment's tfdt — canonical
-        // form has no elst in the init segment.
-        let mut decode_time: u64 = crate::init::start_offset_from_trak(trak, moov.mvhd.timescale);
+        // Pull the canonical (normalized) leading offset from the plan, so
+        // fragmented and flat outputs of the same source agree on
+        // first-fragment tfdts.
+        let mut decode_time: u64 = source
+            .plan
+            .track(tid)
+            .map(|p| p.start_offset_ticks)
+            .unwrap_or(0);
         let mut segments: Vec<BlobSegment> = Vec::new();
         let mut cur_seg_offset = write_offset;
         let mut cur_seg_size: u64 = 0;

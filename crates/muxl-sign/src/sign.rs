@@ -1,0 +1,459 @@
+//! Per-track signing + ingredient combine.
+//!
+//! Splits a multi-track [`muxl::Source`] into per-track flat MP4s, signs
+//! each one independently with c2pa-rs, and combines the signed per-track
+//! assets as `Ingredient`s in a wrapper signed flat MP4. The result is a
+//! multi-track flat MP4 whose top-level manifest covers cross-track
+//! claims and whose per-track ingredient manifests verify each track in
+//! isolation — losing a track only invalidates that ingredient, not the
+//! wrapper signature or the surviving tracks.
+
+use std::io::{Cursor, Read, Write};
+use std::path::Path;
+use std::sync::Once;
+
+use c2pa::{Builder, CallbackSigner, Signer as C2paSigner, SigningAlg};
+use muxl::{Segmenter, SegmenterEvent, Source};
+use muxl::io::ReadAt;
+
+use crate::cbor::SignedEvent;
+use crate::error::{Error, Result};
+
+/// Process-global c2pa-rs settings applied once before any sign call.
+///
+/// muxl-sign doesn't yet have a use case for X.509 trust verification —
+/// our certs are issued via DID-based identity flows (Streamplace's
+/// ES256K + did:key path), not chained to public CAs. So we disable
+/// trust/OCSP/timestamp checks unconditionally. Callers that want
+/// stricter settings can call `c2pa::settings::Settings::from_toml`
+/// themselves before invoking any muxl-sign API — Once::call_once
+/// ensures we won't stomp them.
+const MUXL_SIGN_DEFAULTS_TOML: &str = r#"
+version_major = 1
+version_minor = 0
+
+[verify]
+verify_after_sign = false
+verify_trust = false
+verify_timestamp_trust = false
+ocsp_fetch = false
+remote_manifest_fetch = false
+check_ingredient_trust = false
+skip_ingredient_conflict_resolution = false
+strict_v1_validation = false
+
+[builder.thumbnail]
+enabled = false
+"#;
+
+static SETTINGS_INIT: Once = Once::new();
+
+fn init_default_settings() {
+    SETTINGS_INIT.call_once(|| {
+        c2pa::settings::Settings::from_toml(MUXL_SIGN_DEFAULTS_TOML)
+            .expect("muxl-sign default settings TOML should always parse");
+    });
+}
+
+/// Cert chain + signing backend used to drive c2pa-rs.
+///
+/// Two backends:
+/// - [`SignBackend::Pem`] — sign in-process with a PEM-encoded private key.
+///   Works in any target. Used by file-based CLI invocations and as the
+///   default in WASM hosts that pass the streamer's key into the sandbox.
+/// - [`SignBackend::Host`] — delegate signing to the embedding host via
+///   the `streamplace.host_sign` wasm import. The private key never enters
+///   the wasm sandbox; the host does the ECDSA work and returns raw r||s.
+///   Required for hardware-backed signers (PKCS#11, TPM, EIP-712 wallets,
+///   etc.) where the key is not extractable as PEM. Only usable when
+///   compiled for `target_family = "wasm"`; native builds can construct
+///   the variant but `build()` will error out.
+///
+/// An optional RFC 3161 TSA URL applies to either backend.
+pub struct SignerKey {
+    cert_chain: Vec<u8>,
+    alg: SigningAlg,
+    tsa_url: Option<String>,
+    backend: SignBackend,
+}
+
+enum SignBackend {
+    Pem(Vec<u8>),
+    Host,
+}
+
+impl SignerKey {
+    /// Build from in-memory PEM byte slices. The cert chain may be a
+    /// concatenation of multiple PEM-encoded certs (leaf first).
+    pub fn from_pem_bytes(
+        cert_chain: impl Into<Vec<u8>>,
+        private_key: impl Into<Vec<u8>>,
+        alg: SigningAlg,
+    ) -> Self {
+        SignerKey {
+            cert_chain: cert_chain.into(),
+            alg,
+            tsa_url: None,
+            backend: SignBackend::Pem(private_key.into()),
+        }
+    }
+
+    /// Read PEM cert chain and PEM private key from filesystem paths.
+    pub fn from_pem_files(
+        cert_path: impl AsRef<Path>,
+        key_path: impl AsRef<Path>,
+        alg: SigningAlg,
+    ) -> Result<Self> {
+        Ok(SignerKey {
+            cert_chain: std::fs::read(cert_path)?,
+            alg,
+            tsa_url: None,
+            backend: SignBackend::Pem(std::fs::read(key_path)?),
+        })
+    }
+
+    /// Build a host-callback signer from in-memory cert chain bytes.
+    ///
+    /// The wasm runtime must supply a `streamplace.host_sign` import; see
+    /// [`host_sign`]'s contract.
+    pub fn host_from_pem_bytes(cert_chain: impl Into<Vec<u8>>, alg: SigningAlg) -> Self {
+        SignerKey {
+            cert_chain: cert_chain.into(),
+            alg,
+            tsa_url: None,
+            backend: SignBackend::Host,
+        }
+    }
+
+    /// Build a host-callback signer, reading the cert chain from a file.
+    pub fn host_from_pem_file(cert_path: impl AsRef<Path>, alg: SigningAlg) -> Result<Self> {
+        Ok(SignerKey {
+            cert_chain: std::fs::read(cert_path)?,
+            alg,
+            tsa_url: None,
+            backend: SignBackend::Host,
+        })
+    }
+
+    /// Set the RFC 3161 timestamp authority URL. Defaults to `None`.
+    pub fn with_tsa_url(mut self, tsa_url: impl Into<String>) -> Self {
+        self.tsa_url = Some(tsa_url.into());
+        self
+    }
+
+    fn build(&self) -> Result<Box<dyn C2paSigner>> {
+        match (&self.backend, self.alg) {
+            (SignBackend::Host, _) => self.build_host_callback(),
+            // The streamplace c2pa-rs fork validates ES256K but doesn't sign
+            // it via the rust_native_crypto path — wire the signer through
+            // CallbackSigner using `k256` so signing works in WASM too.
+            (SignBackend::Pem(_), SigningAlg::Es256K) => self.build_es256k_callback(),
+            (SignBackend::Pem(key), _) => Ok(c2pa::create_signer::from_keys(
+                &self.cert_chain,
+                key,
+                self.alg,
+                self.tsa_url.clone(),
+            )?),
+        }
+    }
+
+    fn build_es256k_callback(&self) -> Result<Box<dyn C2paSigner>> {
+        use k256::ecdsa::SigningKey;
+        use k256::ecdsa::signature::Signer;
+        use k256::pkcs8::DecodePrivateKey;
+
+        let private_key = match &self.backend {
+            SignBackend::Pem(k) => k,
+            SignBackend::Host => unreachable!("build_es256k_callback called for host backend"),
+        };
+        let pem_str = std::str::from_utf8(private_key).map_err(|_| {
+            Error::C2pa(c2pa::Error::BadParam(
+                "private key is not UTF-8 PEM".into(),
+            ))
+        })?;
+        let secret_key = k256::SecretKey::from_pkcs8_pem(pem_str)
+            .map_err(|e| Error::C2pa(c2pa::Error::BadParam(format!("bad ES256K key PEM: {e}"))))?;
+        let signing_key = SigningKey::from(&secret_key);
+
+        let mut signer = CallbackSigner::new(
+            move |_ctx, data: &[u8]| -> std::result::Result<Vec<u8>, c2pa::Error> {
+                // k256's deterministic ECDSA hashes with SHA-256 internally
+                // and returns a fixed-length 64-byte (R || S) signature —
+                // exactly the P1363 format c2pa expects for ES256K.
+                let sig: k256::ecdsa::Signature = signing_key.sign(data);
+                Ok(sig.to_bytes().to_vec())
+            },
+            SigningAlg::Es256K,
+            self.cert_chain.clone(),
+        );
+        if let Some(url) = &self.tsa_url {
+            signer = signer.set_tsa_url(url.clone());
+        }
+        Ok(Box::new(signer))
+    }
+
+    fn build_host_callback(&self) -> Result<Box<dyn C2paSigner>> {
+        let alg = self.alg;
+        let mut signer = CallbackSigner::new(
+            move |_ctx, data: &[u8]| -> std::result::Result<Vec<u8>, c2pa::Error> {
+                host_sign_callback(data, alg).map_err(|e| c2pa::Error::BadParam(e.to_string()))
+            },
+            self.alg,
+            self.cert_chain.clone(),
+        );
+        if let Some(url) = &self.tsa_url {
+            signer = signer.set_tsa_url(url.clone());
+        }
+        Ok(Box::new(signer))
+    }
+}
+
+/// Host-supplied signing import. The wasm runtime is expected to provide
+/// this function under module name `streamplace`; signs `data` and writes
+/// the raw r||s (or DER, per `alg`) signature into `[out_sig_ptr,
+/// out_sig_max)`. Returns the signature length, or `u32::MAX` on error.
+///
+/// Only linked in wasm targets — native builds get a stub that always
+/// returns the error sentinel so [`SignBackend::Host`] simply doesn't
+/// work outside of a wasm runtime that wires it up.
+#[cfg(target_family = "wasm")]
+#[link(wasm_import_module = "streamplace")]
+unsafe extern "C" {
+    fn host_sign(data_ptr: u32, data_len: u32, out_sig_ptr: u32, out_sig_max: u32) -> u32;
+}
+
+#[cfg(not(target_family = "wasm"))]
+unsafe fn host_sign(_: u32, _: u32, _: u32, _: u32) -> u32 {
+    u32::MAX
+}
+
+/// Pre-allocated buffer for the host's signature. Sized for the largest
+/// algorithm we expect (PS512 over RSA-4096 ≈ 512 bytes); ECDSA r||s for
+/// ES256/ES256K/ES384/ES512 fits comfortably under this.
+const HOST_SIG_BUF_LEN: usize = 1024;
+
+fn host_sign_callback(data: &[u8], _alg: SigningAlg) -> std::result::Result<Vec<u8>, String> {
+    let mut buf = vec![0u8; HOST_SIG_BUF_LEN];
+    let n = unsafe {
+        host_sign(
+            data.as_ptr() as u32,
+            data.len() as u32,
+            buf.as_mut_ptr() as u32,
+            buf.len() as u32,
+        )
+    };
+    if n == u32::MAX {
+        return Err("host_sign rejected the request".into());
+    }
+    let n = n as usize;
+    if n > buf.len() {
+        return Err(format!("host_sign returned bogus length {n}"));
+    }
+    buf.truncate(n);
+    Ok(buf)
+}
+
+/// Sign a multi-track [`Source`] per-track and combine.
+///
+/// Steps, in order:
+/// 1. For each track in `source.plan.tracks`, write a single-track flat MP4
+///    (via [`Source::filter_to_track`] + [`muxl::flat::write`]) and sign it
+///    with `track_manifest` to produce a per-track signed asset.
+/// 2. Write the multi-track flat MP4 of the original source.
+/// 3. Build a wrapper [`Builder`] from `wrapper_manifest`, attach each
+///    per-track signed asset as a c2pa `Ingredient`, sign, and write the
+///    wrapper bytes to `output`.
+///
+/// The same `track_manifest` JSON is used for every track in v1; per-track
+/// templating can come later if needed.
+pub fn sign_per_track<R, W>(
+    source: &Source,
+    input: &R,
+    signer: &SignerKey,
+    track_manifest: &str,
+    wrapper_manifest: &str,
+    output: &mut W,
+) -> Result<()>
+where
+    R: ReadAt + ?Sized,
+    W: Write,
+{
+    init_default_settings();
+    let c2pa_signer = signer.build()?;
+
+    // 1. Per-track sign — emit + sign one flat MP4 per track.
+    let mut signed_tracks: Vec<(u32, Vec<u8>)> = Vec::with_capacity(source.plan.tracks.len());
+    for track in &source.plan.tracks {
+        let single = source.filter_to_track(track.track_id).ok_or_else(|| {
+            Error::Muxl(muxl::Error::InvalidMp4(format!(
+                "track {} disappeared during filter",
+                track.track_id
+            )))
+        })?;
+        let mut track_buf = Vec::new();
+        muxl::flat::write(&single, input, &mut track_buf)?;
+        let signed = sign_buf(&track_buf, track_manifest, &*c2pa_signer)?;
+        signed_tracks.push((track.track_id, signed));
+    }
+
+    // 2. Wrapper flat MP4 — covers all tracks together.
+    let mut wrapper_buf = Vec::new();
+    muxl::flat::write(source, input, &mut wrapper_buf)?;
+
+    // 3. Wrapper sign with per-track signed assets as ingredients.
+    let mut builder = Builder::from_json(wrapper_manifest)?;
+    for (track_id, signed_bytes) in &signed_tracks {
+        let ingredient_json = format!(
+            r#"{{"title": "track-{}", "relationship": "componentOf"}}"#,
+            track_id
+        );
+        let mut ingredient_cursor = Cursor::new(signed_bytes.as_slice());
+        builder.add_ingredient_from_stream(ingredient_json, "video/mp4", &mut ingredient_cursor)?;
+    }
+
+    let mut source_cursor = Cursor::new(wrapper_buf);
+    let mut output_buf: Vec<u8> = Vec::new();
+    let mut dest_cursor = Cursor::new(&mut output_buf);
+    builder.sign(
+        &*c2pa_signer,
+        "video/mp4",
+        &mut source_cursor,
+        &mut dest_cursor,
+    )?;
+
+    output.write_all(&output_buf)?;
+    Ok(())
+}
+
+/// Stream-sign an fMP4 source: consume `input` (an fMP4 byte stream from
+/// e.g. `muxl segment`'s emitter) and emit one CBOR-framed
+/// `signed-segment` event per GoP on `output`.
+///
+/// Each event's `data` field is a complete signed flat MP4 (wrapper +
+/// per-track ingredients) — the artifact Streamplace stores per GoP.
+///
+/// Output framing is one DRISL/CBOR value per event, written
+/// back-to-back. Decoders read one value at a time until EOF.
+pub fn sign_segment_stream<R: Read, W: Write>(
+    input: &mut R,
+    output: &mut W,
+    signer: &SignerKey,
+    track_manifest: &str,
+    wrapper_manifest: &str,
+) -> Result<()> {
+    init_default_settings();
+    let mut segmenter = Segmenter::new();
+    let mut init_bytes: Option<Vec<u8>> = None;
+    let mut buf = [0u8; 64 * 1024];
+
+    loop {
+        let n = input.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        for event in segmenter.feed(&buf[..n])? {
+            handle_event(
+                event,
+                &mut init_bytes,
+                signer,
+                track_manifest,
+                wrapper_manifest,
+                output,
+            )?;
+        }
+    }
+    for event in segmenter.flush()? {
+        handle_event(
+            event,
+            &mut init_bytes,
+            signer,
+            track_manifest,
+            wrapper_manifest,
+            output,
+        )?;
+    }
+    Ok(())
+}
+
+fn handle_event<W: Write>(
+    event: SegmenterEvent,
+    init_bytes: &mut Option<Vec<u8>>,
+    signer: &SignerKey,
+    track_manifest: &str,
+    wrapper_manifest: &str,
+    output: &mut W,
+) -> Result<()> {
+    match event {
+        SegmenterEvent::InitSegment { data, .. } => {
+            *init_bytes = Some(data);
+        }
+        SegmenterEvent::Segment(gop) => {
+            let init = init_bytes.as_deref().ok_or_else(|| {
+                Error::Muxl(muxl::Error::InvalidMp4(
+                    "segment received before init segment".into(),
+                ))
+            })?;
+            let signed = sign_one_gop_fmp4(init, &gop, signer, track_manifest, wrapper_manifest)?;
+            let signed_len = signed.len();
+            let number = gop.number;
+            let event = SignedEvent::SignedSegment {
+                number,
+                data: signed,
+            };
+            dasl::drisl::to_writer(&mut *output, &event).map_err(|e| {
+                Error::Io(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    e.to_string(),
+                ))
+            })?;
+            output.flush()?;
+            eprintln!("signed segment {}: {} bytes", number, signed_len);
+        }
+    }
+    Ok(())
+}
+
+/// Reassemble one GoP's per-track moof+mdat segments back into a self-
+/// contained fMP4 (init + interleaved track data), then drive the
+/// existing `sign_per_track` over it.
+fn sign_one_gop_fmp4(
+    init_bytes: &[u8],
+    gop: &muxl::GopSegment,
+    signer: &SignerKey,
+    track_manifest: &str,
+    wrapper_manifest: &str,
+) -> Result<Vec<u8>> {
+    let body_len: usize = gop.tracks.values().map(|v| v.len()).sum();
+    let mut fmp4 = Vec::with_capacity(init_bytes.len() + body_len);
+    fmp4.extend_from_slice(init_bytes);
+    for data in gop.tracks.values() {
+        fmp4.extend_from_slice(data);
+    }
+
+    let source = muxl::read(&fmp4)?;
+    let mut signed = Vec::new();
+    sign_per_track(
+        &source,
+        &fmp4,
+        signer,
+        track_manifest,
+        wrapper_manifest,
+        &mut signed,
+    )?;
+    Ok(signed)
+}
+
+/// Sign a single in-memory MP4 buffer with a given manifest.
+///
+/// Helper for the per-track step. Wraps [`Builder::sign`] over
+/// `Cursor`-backed buffers — c2pa-rs needs `Read+Seek` on input and
+/// `Write+Read+Seek` on output, neither of which our caller's `&mut W:
+/// Write` satisfies on its own.
+fn sign_buf(input: &[u8], manifest: &str, signer: &dyn C2paSigner) -> Result<Vec<u8>> {
+    let mut builder = Builder::from_json(manifest)?;
+    let mut source_cursor = Cursor::new(input);
+    let mut output_buf: Vec<u8> = Vec::new();
+    let mut dest_cursor = Cursor::new(&mut output_buf);
+    builder.sign(signer, "video/mp4", &mut source_cursor, &mut dest_cursor)?;
+    Ok(output_buf)
+}

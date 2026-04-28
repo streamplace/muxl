@@ -1,3 +1,16 @@
+//! `muxl` CLI surface.
+//!
+//! Public so that downstream binaries (notably `muxl-sign`) can include
+//! these subcommands in a single consolidated CLI without duplicating
+//! arg-parsing code. The shape:
+//!
+//! - [`Command`] — the top-level subcommand enum.
+//! - One named `*Args` struct per subcommand (e.g. [`CatalogArgs`],
+//!   [`Fmp4Args`]).
+//! - One `cmd_*` handler per subcommand, plus [`dispatch`] which
+//!   pattern-matches a [`Command`] to its handler.
+//! - [`cli_main`] — the binary entry point: `Cli::parse() ; dispatch(...)`.
+
 use std::fs;
 use std::io::{self, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
@@ -7,7 +20,7 @@ use clap::{ArgGroup, Args, Parser, Subcommand, ValueEnum};
 
 /// Output encoding for `muxl catalog --format`.
 #[derive(Clone, Copy, Debug, ValueEnum)]
-enum CatalogFormat {
+pub enum CatalogFormat {
     /// Canonical deterministic CBOR (MUXL's content-addressed wire form).
     /// Written to stdout as raw bytes.
     Drisl,
@@ -22,34 +35,15 @@ struct Cli {
     command: Command,
 }
 
+/// All `muxl` subcommands. Reused as variants in `muxl-sign`'s consolidated CLI.
 #[derive(Subcommand)]
-enum Command {
+pub enum Command {
     /// Extract catalog (track config) from an MP4.
-    Catalog {
-        /// Input MP4 file.
-        input: PathBuf,
-        /// Machine-readable output format. Omit for a human-readable summary.
-        #[arg(long, value_enum)]
-        format: Option<CatalogFormat>,
-    },
+    Catalog(CatalogArgs),
     /// Write a canonical MUXL fMP4 (or just its init segment with --init-only).
-    Fmp4 {
-        /// Input MP4 file (flat or fragmented).
-        input: PathBuf,
-        /// Output fMP4 path.
-        output: PathBuf,
-        /// Write only the canonical ftyp+moov init segment (no fragments).
-        /// The input's fragment data is not touched.
-        #[arg(long)]
-        init_only: bool,
-    },
+    Fmp4(Fmp4Args),
     /// Write a canonical MUXL flat MP4 (faststart) from an input MP4.
-    Mp4 {
-        /// Input MP4 file (flat or fragmented).
-        input: PathBuf,
-        /// Output flat MP4 path.
-        output: PathBuf,
-    },
+    Mp4(Mp4Args),
     /// Segment an fMP4 into per-GoP MUXL segments.
     Segment(SegmentArgs),
     /// Concatenate MUXL fMP4 files from stdin, emit CBOR events to stdout.
@@ -59,62 +53,92 @@ enum Command {
 }
 
 #[derive(Args)]
-#[command(group(ArgGroup::new("mode").required(true).args(["dir", "fmp4", "stdout"])))]
-struct SegmentArgs {
-    /// Input fMP4 file, or "-" for stdin.
-    input: String,
-    /// Write segments into this directory (one file per segment).
-    #[arg(long, value_name = "DIR")]
-    dir: Option<PathBuf>,
-    /// Emit a single MUXL fMP4 file covering the whole input.
-    #[arg(long, value_name = "FILE")]
-    fmp4: Option<PathBuf>,
-    /// Stream segments to stdout as framed CBOR events.
-    #[arg(long)]
-    stdout: bool,
+pub struct CatalogArgs {
+    /// Input MP4 file.
+    pub input: PathBuf,
+    /// Machine-readable output format. Omit for a human-readable summary.
+    #[arg(long, value_enum)]
+    pub format: Option<CatalogFormat>,
 }
 
 #[derive(Args)]
-struct HlsArgs {
+pub struct Fmp4Args {
     /// Input MP4 file (flat or fragmented).
-    input: PathBuf,
-    /// Output directory for content-addressed blobs.
-    output_dir: PathBuf,
-    /// Alternate rendition from another MP4 file (repeatable).
-    #[arg(long = "sidecar", value_name = "FILE")]
-    sidecars: Vec<PathBuf>,
-    /// Also generate static HLS playlists (master.m3u8, per-track media playlists).
+    pub input: PathBuf,
+    /// Output fMP4 path.
+    pub output: PathBuf,
+    /// Write only the canonical ftyp+moov init segment (no fragments).
+    /// The input's fragment data is not touched.
     #[arg(long)]
-    playlists: bool,
+    pub init_only: bool,
 }
 
+#[derive(Args)]
+pub struct Mp4Args {
+    /// Input MP4 file (flat or fragmented).
+    pub input: PathBuf,
+    /// Output flat MP4 path.
+    pub output: PathBuf,
+}
+
+#[derive(Args)]
+#[command(group(ArgGroup::new("mode").required(true).args(["dir", "fmp4", "stdout"])))]
+pub struct SegmentArgs {
+    /// Input fMP4 file, or "-" for stdin.
+    pub input: String,
+    /// Write segments into this directory (one file per segment).
+    #[arg(long, value_name = "DIR")]
+    pub dir: Option<PathBuf>,
+    /// Emit a single MUXL fMP4 file covering the whole input.
+    #[arg(long, value_name = "FILE")]
+    pub fmp4: Option<PathBuf>,
+    /// Stream segments to stdout as framed CBOR events.
+    #[arg(long)]
+    pub stdout: bool,
+}
+
+#[derive(Args)]
+pub struct HlsArgs {
+    /// Input MP4 file (flat or fragmented).
+    pub input: PathBuf,
+    /// Output directory for content-addressed blobs.
+    pub output_dir: PathBuf,
+    /// Alternate rendition from another MP4 file (repeatable).
+    #[arg(long = "sidecar", value_name = "FILE")]
+    pub sidecars: Vec<PathBuf>,
+    /// Also generate static HLS playlists (master.m3u8, per-track media playlists).
+    #[arg(long)]
+    pub playlists: bool,
+}
+
+/// Run the parsed `muxl` CLI: parse argv into a [`Command`] and [`dispatch`] it.
 pub fn cli_main() {
     let cli = Cli::parse();
-
-    let result = match cli.command {
-        Command::Catalog { input, format } => cmd_catalog(&input, format),
-        Command::Fmp4 {
-            input,
-            output,
-            init_only,
-        } => cmd_fmp4(&input, &output, init_only),
-        Command::Mp4 { input, output } => cmd_mp4(&input, &output),
-        Command::Segment(args) => cmd_segment(args),
-        Command::Concat => cmd_concat(),
-        Command::Hls(args) => cmd_hls(args),
-    };
-
-    if let Err(e) = result {
+    if let Err(e) = dispatch(cli.command) {
         eprintln!("Error: {e}");
         process::exit(1);
     }
 }
 
-fn cmd_catalog(input: &Path, format: Option<CatalogFormat>) -> crate::Result<()> {
+/// Run a parsed [`Command`]. Used by both `cli_main` and downstream
+/// binaries that flatten muxl's subcommands into a wider CLI.
+pub fn dispatch(cmd: Command) -> crate::Result<()> {
+    match cmd {
+        Command::Catalog(args) => cmd_catalog(args),
+        Command::Fmp4(args) => cmd_fmp4(args),
+        Command::Mp4(args) => cmd_mp4(args),
+        Command::Segment(args) => cmd_segment(args),
+        Command::Concat => cmd_concat(),
+        Command::Hls(args) => cmd_hls(args),
+    }
+}
+
+pub fn cmd_catalog(args: CatalogArgs) -> crate::Result<()> {
+    let CatalogArgs { input, format } = args;
     // Open with FileReadAt so arbitrarily-long inputs don't load into memory —
     // catalog extraction reads only the moov box.
-    let input = crate::io::FileReadAt::open(input)?;
-    let catalog = crate::catalog::from_input(&input)?;
+    let input_reader = crate::io::FileReadAt::open(&input)?;
+    let catalog = crate::catalog::from_input(&input_reader)?;
 
     match format {
         Some(CatalogFormat::Drisl) => {
@@ -155,17 +179,23 @@ fn cmd_catalog(input: &Path, format: Option<CatalogFormat>) -> crate::Result<()>
         }
     }
 
+    let _ = input;
     Ok(())
 }
 
-fn cmd_fmp4(input: &Path, output: &Path, init_only: bool) -> crate::Result<()> {
-    let input = crate::io::FileReadAt::open(input)?;
-    let out_file = fs::File::create(output)?;
+pub fn cmd_fmp4(args: Fmp4Args) -> crate::Result<()> {
+    let Fmp4Args {
+        input,
+        output,
+        init_only,
+    } = args;
+    let input_reader = crate::io::FileReadAt::open(&input)?;
+    let out_file = fs::File::create(&output)?;
     let mut out = BufWriter::new(out_file);
 
     if init_only {
         // Cheap path — only needs the moov, not a full sample plan.
-        let catalog = crate::catalog::from_input(&input)?;
+        let catalog = crate::catalog::from_input(&input_reader)?;
         let init = crate::fmp4::init_segment(&catalog)?;
         out.write_all(&init)?;
         out.flush()?;
@@ -173,18 +203,19 @@ fn cmd_fmp4(input: &Path, output: &Path, init_only: bool) -> crate::Result<()> {
         return Ok(());
     }
 
-    let source = crate::read(&input)?;
-    crate::fmp4::write(&source, &input, &mut out)?;
+    let source = crate::read(&input_reader)?;
+    crate::fmp4::write(&source, &input_reader, &mut out)?;
     out.flush()?;
     Ok(())
 }
 
-fn cmd_mp4(input: &Path, output: &Path) -> crate::Result<()> {
-    let input = crate::io::FileReadAt::open(input)?;
-    let out_file = fs::File::create(output)?;
+pub fn cmd_mp4(args: Mp4Args) -> crate::Result<()> {
+    let Mp4Args { input, output } = args;
+    let input_reader = crate::io::FileReadAt::open(&input)?;
+    let out_file = fs::File::create(&output)?;
     let mut out = BufWriter::new(out_file);
-    let source = crate::read(&input)?;
-    let info = crate::flat::write(&source, &input, &mut out)?;
+    let source = crate::read(&input_reader)?;
+    let info = crate::flat::write(&source, &input_reader, &mut out)?;
     out.flush()?;
     eprintln!(
         "flat MP4: {} bytes (mdat payload @ {}, {} tracks)",
@@ -195,7 +226,7 @@ fn cmd_mp4(input: &Path, output: &Path) -> crate::Result<()> {
     Ok(())
 }
 
-fn cmd_segment(args: SegmentArgs) -> crate::Result<()> {
+pub fn cmd_segment(args: SegmentArgs) -> crate::Result<()> {
     let mut input: Box<dyn Read> = if args.input == "-" {
         Box::new(io::stdin().lock())
     } else {
@@ -294,7 +325,7 @@ fn write_cbor_event(w: &mut impl io::Write, event: &crate::SegmenterEvent) -> cr
 /// Reads concatenated MUXL fMP4s from stdin. Emits init events only
 /// when the catalog changes between fMP4 files. UUID atoms delimit segments
 /// and are passed through in the segment data.
-fn cmd_concat() -> crate::Result<()> {
+pub fn cmd_concat() -> crate::Result<()> {
     let mut stdin = io::stdin().lock();
     let mut stdout = io::stdout().lock();
     let mut buf = [0u8; 64 * 1024];
@@ -315,7 +346,7 @@ fn cmd_concat() -> crate::Result<()> {
     Ok(())
 }
 
-fn cmd_hls(args: HlsArgs) -> crate::Result<()> {
+pub fn cmd_hls(args: HlsArgs) -> crate::Result<()> {
     let HlsArgs {
         input,
         output_dir,

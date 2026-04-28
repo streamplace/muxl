@@ -20,7 +20,7 @@ mod wasm;
 mod wasm_io;
 
 pub use error::{Error, Result};
-pub use source::{Plan, Sample, Source, TrackPlan};
+pub use source::{Plan, Sample, Source, TrackPlan, normalize_track_offsets};
 pub use concat::Concatenator;
 pub use push::{Segmenter, SegmenterEvent};
 pub use segment::{GopSegment, Segment, segment_fmp4};
@@ -34,7 +34,7 @@ pub use fragment::{FragmentStats, Frame, TrackStats, fragment_to_directory, frag
 // playlists. The reader/writer entry points live in `muxl::flat::{read, write}`.
 pub use flat::{FlatFragment, FlatMp4Info, FlatTrackInfo};
 
-mod cli;
+pub mod cli;
 pub use cli::cli_main;
 
 // ---------------------------------------------------------------------------

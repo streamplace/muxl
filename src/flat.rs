@@ -325,7 +325,9 @@ pub fn plan_from_fmp4<R: ReadAt + ?Sized>(
         }
     }
 
-    let plans: Vec<TrackPlan> = track_plans.into_values().collect();
+    let mut plans: Vec<TrackPlan> = track_plans.into_values().collect();
+    plans.sort_by_key(|p| p.track_id);
+    crate::source::normalize_track_offsets(&mut plans);
     Ok((catalog, plans))
 }
 
@@ -368,6 +370,7 @@ pub fn plan_from_flat_mp4<R: ReadAt + ?Sized>(
         });
     }
     plans.sort_by_key(|p| p.track_id);
+    crate::source::normalize_track_offsets(&mut plans);
 
     Ok((catalog, plans))
 }
@@ -387,32 +390,12 @@ pub fn write_flat_mp4<R: ReadAt + ?Sized, W: Write>(
     let mut ordered: Vec<&TrackPlan> = plans.iter().collect();
     ordered.sort_by_key(|p| p.track_id);
 
-    // Normalize per-track presentation offsets: subtract the smallest leading
-    // empty edit across tracks, leaving only the inter-track A/V delta.
-    //
-    // Source-driven absolute offsets (e.g. mp4mux livestream segments where
-    // both tracks have the running-time tfdt baked into their first fragment)
-    // produce flat MP4s that gst's qtdemux mishandles in push mode: the
-    // synthesized elst pushes stream-time past segment.stop on the very first
-    // sample, so qtdemux drops every keyframe and the appsink never sees a
-    // buffer. Standalone signed segments don't need the absolute offset
-    // anyway — c2pa metadata carries the wall-clock time, and clip stitchers
-    // build their own wrapper-level elst. Keeping just the relative delta
-    // preserves A/V sync while making the file demux cleanly.
-    let movie_offsets: Vec<u64> = ordered
-        .iter()
-        .map(|p| rescale_to_movie(p.start_offset_ticks, p.timescale))
-        .collect();
-    let min_movie_offset = movie_offsets.iter().copied().min().unwrap_or(0);
-    let effective_offsets: Vec<u64> = ordered
-        .iter()
-        .zip(&movie_offsets)
-        .map(|(p, mo)| {
-            let rel_movie = mo.saturating_sub(min_movie_offset);
-            (rel_movie * p.timescale as u64 + MOVIE_TIMESCALE as u64 / 2)
-                / MOVIE_TIMESCALE as u64
-        })
-        .collect();
+    // Per-track leading offsets are expected to be already normalized —
+    // [`Plan::new`] / [`crate::source::normalize_track_offsets`] subtract
+    // the smallest offset across tracks before this point. write_flat_mp4
+    // bakes whatever values it receives into the synthesized elsts and
+    // first-fragment tfdts; canonical callers go through Plan, which
+    // guarantees the contract.
 
     // ftyp — canonical-form.md § ftyp
     let ftyp = Ftyp {
@@ -437,7 +420,7 @@ pub fn write_flat_mp4<R: ReadAt + ?Sized, W: Write>(
     for (ti, plan) in ordered.iter().enumerate() {
         let mut sizes = Vec::with_capacity(plan.samples.len());
         let mut track_bytes: u64 = 0;
-        let mut dt: u64 = effective_offsets[ti];
+        let mut dt: u64 = plan.start_offset_ticks;
 
         for sample in &plan.samples {
             let moof_size = measure_frame_moof(seq, plan.track_id, dt, sample)?;
@@ -472,15 +455,15 @@ pub fn write_flat_mp4<R: ReadAt + ?Sized, W: Write>(
             plan,
             &vec![0u64; n as usize],
         );
-        let media_duration = per_track_final_decode_time[ti] - effective_offsets[ti];
+        let media_duration = per_track_final_decode_time[ti] - plan.start_offset_ticks;
         traks[ti].mdia.mdhd.duration = media_duration;
         // Synthesize a canonical elst for non-zero presentation offsets so
         // flat-MP4 players honor the same start offset baked into the
         // first-fragment tfdt. Spec: canonical-form.md § edts/elst.
         traks[ti].edts =
-            build_canonical_elst(effective_offsets[ti], media_duration, track_ts[ti]);
+            build_canonical_elst(plan.start_offset_ticks, media_duration, track_ts[ti]);
         let tkhd_duration = rescale_to_movie(
-            media_duration + effective_offsets[ti],
+            media_duration + plan.start_offset_ticks,
             track_ts[ti],
         );
         traks[ti].tkhd.duration = tkhd_duration;
@@ -588,7 +571,7 @@ pub fn write_flat_mp4<R: ReadAt + ?Sized, W: Write>(
     let mut io_buf = vec![0u8; 256 * 1024];
     let mut seq: u32 = 1;
     for (ti, plan) in ordered.iter().enumerate() {
-        let mut dt: u64 = effective_offsets[ti];
+        let mut dt: u64 = plan.start_offset_ticks;
         for (si, sample) in plan.samples.iter().enumerate() {
             let size = sample.size as usize;
             if io_buf.len() < size {
@@ -1284,6 +1267,7 @@ mod tests {
                 plan.start_offset_ticks = 10 * audio_ts as u64 / 1000;
             }
         }
+        crate::source::normalize_track_offsets(&mut plans);
 
         let mut out = Vec::new();
         write_flat_mp4(&catalog, &plans, &flat_input, &mut out).unwrap();
@@ -1346,6 +1330,7 @@ mod tests {
                 plan.start_offset_ticks = audio_ts as u64; // 1s
             }
         }
+        crate::source::normalize_track_offsets(&mut plans);
 
         let mut out = Vec::new();
         write_flat_mp4(&catalog, &plans, &flat_input, &mut out).unwrap();

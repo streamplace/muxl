@@ -55,18 +55,31 @@ fn init_default_settings() {
     });
 }
 
-/// PEM-format cert chain + private key bundle, used to drive c2pa-rs.
+/// Cert chain + signing backend used to drive c2pa-rs.
 ///
-/// Holds the bytes of the (possibly multi-cert) PEM signing chain and the
-/// matching private key, plus the chosen [`SigningAlg`] (typically
-/// `Es256K` for Streamplace's ES256K + DID issuance flow). An optional
-/// timestamp authority URL can be set for RFC 3161 timestamps; leave it
-/// unset for tests.
+/// Two backends:
+/// - [`SignBackend::Pem`] — sign in-process with a PEM-encoded private key.
+///   Works in any target. Used by file-based CLI invocations and as the
+///   default in WASM hosts that pass the streamer's key into the sandbox.
+/// - [`SignBackend::Host`] — delegate signing to the embedding host via
+///   the `streamplace.host_sign` wasm import. The private key never enters
+///   the wasm sandbox; the host does the ECDSA work and returns raw r||s.
+///   Required for hardware-backed signers (PKCS#11, TPM, EIP-712 wallets,
+///   etc.) where the key is not extractable as PEM. Only usable when
+///   compiled for `target_family = "wasm"`; native builds can construct
+///   the variant but `build()` will error out.
+///
+/// An optional RFC 3161 TSA URL applies to either backend.
 pub struct SignerKey {
     cert_chain: Vec<u8>,
-    private_key: Vec<u8>,
     alg: SigningAlg,
     tsa_url: Option<String>,
+    backend: SignBackend,
+}
+
+enum SignBackend {
+    Pem(Vec<u8>),
+    Host,
 }
 
 impl SignerKey {
@@ -79,9 +92,9 @@ impl SignerKey {
     ) -> Self {
         SignerKey {
             cert_chain: cert_chain.into(),
-            private_key: private_key.into(),
             alg,
             tsa_url: None,
+            backend: SignBackend::Pem(private_key.into()),
         }
     }
 
@@ -93,9 +106,32 @@ impl SignerKey {
     ) -> Result<Self> {
         Ok(SignerKey {
             cert_chain: std::fs::read(cert_path)?,
-            private_key: std::fs::read(key_path)?,
             alg,
             tsa_url: None,
+            backend: SignBackend::Pem(std::fs::read(key_path)?),
+        })
+    }
+
+    /// Build a host-callback signer from in-memory cert chain bytes.
+    ///
+    /// The wasm runtime must supply a `streamplace.host_sign` import; see
+    /// [`host_sign`]'s contract.
+    pub fn host_from_pem_bytes(cert_chain: impl Into<Vec<u8>>, alg: SigningAlg) -> Self {
+        SignerKey {
+            cert_chain: cert_chain.into(),
+            alg,
+            tsa_url: None,
+            backend: SignBackend::Host,
+        }
+    }
+
+    /// Build a host-callback signer, reading the cert chain from a file.
+    pub fn host_from_pem_file(cert_path: impl AsRef<Path>, alg: SigningAlg) -> Result<Self> {
+        Ok(SignerKey {
+            cert_chain: std::fs::read(cert_path)?,
+            alg,
+            tsa_url: None,
+            backend: SignBackend::Host,
         })
     }
 
@@ -106,14 +142,15 @@ impl SignerKey {
     }
 
     fn build(&self) -> Result<Box<dyn C2paSigner>> {
-        match self.alg {
+        match (&self.backend, self.alg) {
+            (SignBackend::Host, _) => self.build_host_callback(),
             // The streamplace c2pa-rs fork validates ES256K but doesn't sign
             // it via the rust_native_crypto path — wire the signer through
             // CallbackSigner using `k256` so signing works in WASM too.
-            SigningAlg::Es256K => self.build_es256k_callback(),
-            _ => Ok(c2pa::create_signer::from_keys(
+            (SignBackend::Pem(_), SigningAlg::Es256K) => self.build_es256k_callback(),
+            (SignBackend::Pem(key), _) => Ok(c2pa::create_signer::from_keys(
                 &self.cert_chain,
-                &self.private_key,
+                key,
                 self.alg,
                 self.tsa_url.clone(),
             )?),
@@ -125,7 +162,11 @@ impl SignerKey {
         use k256::ecdsa::signature::Signer;
         use k256::pkcs8::DecodePrivateKey;
 
-        let pem_str = std::str::from_utf8(&self.private_key).map_err(|_| {
+        let private_key = match &self.backend {
+            SignBackend::Pem(k) => k,
+            SignBackend::Host => unreachable!("build_es256k_callback called for host backend"),
+        };
+        let pem_str = std::str::from_utf8(private_key).map_err(|_| {
             Error::C2pa(c2pa::Error::BadParam(
                 "private key is not UTF-8 PEM".into(),
             ))
@@ -150,6 +191,66 @@ impl SignerKey {
         }
         Ok(Box::new(signer))
     }
+
+    fn build_host_callback(&self) -> Result<Box<dyn C2paSigner>> {
+        let alg = self.alg;
+        let mut signer = CallbackSigner::new(
+            move |_ctx, data: &[u8]| -> std::result::Result<Vec<u8>, c2pa::Error> {
+                host_sign_callback(data, alg).map_err(|e| c2pa::Error::BadParam(e.to_string()))
+            },
+            self.alg,
+            self.cert_chain.clone(),
+        );
+        if let Some(url) = &self.tsa_url {
+            signer = signer.set_tsa_url(url.clone());
+        }
+        Ok(Box::new(signer))
+    }
+}
+
+/// Host-supplied signing import. The wasm runtime is expected to provide
+/// this function under module name `streamplace`; signs `data` and writes
+/// the raw r||s (or DER, per `alg`) signature into `[out_sig_ptr,
+/// out_sig_max)`. Returns the signature length, or `u32::MAX` on error.
+///
+/// Only linked in wasm targets — native builds get a stub that always
+/// returns the error sentinel so [`SignBackend::Host`] simply doesn't
+/// work outside of a wasm runtime that wires it up.
+#[cfg(target_family = "wasm")]
+#[link(wasm_import_module = "streamplace")]
+unsafe extern "C" {
+    fn host_sign(data_ptr: u32, data_len: u32, out_sig_ptr: u32, out_sig_max: u32) -> u32;
+}
+
+#[cfg(not(target_family = "wasm"))]
+unsafe fn host_sign(_: u32, _: u32, _: u32, _: u32) -> u32 {
+    u32::MAX
+}
+
+/// Pre-allocated buffer for the host's signature. Sized for the largest
+/// algorithm we expect (PS512 over RSA-4096 ≈ 512 bytes); ECDSA r||s for
+/// ES256/ES256K/ES384/ES512 fits comfortably under this.
+const HOST_SIG_BUF_LEN: usize = 1024;
+
+fn host_sign_callback(data: &[u8], _alg: SigningAlg) -> std::result::Result<Vec<u8>, String> {
+    let mut buf = vec![0u8; HOST_SIG_BUF_LEN];
+    let n = unsafe {
+        host_sign(
+            data.as_ptr() as u32,
+            data.len() as u32,
+            buf.as_mut_ptr() as u32,
+            buf.len() as u32,
+        )
+    };
+    if n == u32::MAX {
+        return Err("host_sign rejected the request".into());
+    }
+    let n = n as usize;
+    if n > buf.len() {
+        return Err(format!("host_sign returned bogus length {n}"));
+    }
+    buf.truncate(n);
+    Ok(buf)
 }
 
 /// Sign a multi-track [`Source`] per-track and combine.

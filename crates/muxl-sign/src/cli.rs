@@ -11,7 +11,7 @@ use std::io::{self, BufWriter, Read, Write};
 use std::path::PathBuf;
 use std::process;
 
-use clap::{Parser, Subcommand, ValueEnum};
+use clap::{ArgGroup, Parser, Subcommand, ValueEnum};
 use muxl::cli as muxl_cli;
 
 use crate::{Result, SignerKey, SigningAlg, sign_per_track, sign_segment_stream};
@@ -55,13 +55,26 @@ enum Command {
 }
 
 #[derive(clap::Args)]
+#[command(group(
+    ArgGroup::new("signing-key")
+        .required(true)
+        .args(["key", "host_sign"])
+))]
 struct SigningArgs {
     /// PEM-encoded signing cert chain (leaf first).
     #[arg(long, value_name = "PATH")]
     cert: PathBuf,
-    /// PEM-encoded private key matching `--cert`.
+    /// PEM-encoded private key matching `--cert`. Mutually exclusive with
+    /// `--host-sign`.
     #[arg(long, value_name = "PATH")]
-    key: PathBuf,
+    key: Option<PathBuf>,
+    /// Delegate signing to the wasm host via the `streamplace.host_sign`
+    /// import. The host receives the bytes to sign and returns the
+    /// signature; the private key never enters the wasm sandbox. Mutually
+    /// exclusive with `--key`. Only useful inside a wasm runtime that
+    /// wires up the import.
+    #[arg(long)]
+    host_sign: bool,
     /// Signing algorithm. Defaults to ES256K (Streamplace's default).
     #[arg(long, value_enum, default_value_t = Alg::Es256K)]
     alg: Alg,
@@ -81,12 +94,19 @@ impl SigningArgs {
         let SigningArgs {
             cert,
             key,
+            host_sign,
             alg,
             track_manifest,
             wrapper_manifest,
             tsa_url,
         } = self;
-        let mut signer = SignerKey::from_pem_files(&cert, &key, alg.into())?;
+        let mut signer = if host_sign {
+            SignerKey::host_from_pem_file(&cert, alg.into())?
+        } else {
+            // ArgGroup guarantees one of {key, host_sign} is set.
+            let key = key.expect("clap ArgGroup guarantees --key when --host-sign is absent");
+            SignerKey::from_pem_files(&cert, &key, alg.into())?
+        };
         if let Some(url) = tsa_url {
             signer = signer.with_tsa_url(url);
         }

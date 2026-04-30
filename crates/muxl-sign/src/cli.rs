@@ -10,6 +10,7 @@ use std::fs;
 use std::io::{self, BufWriter, Read, Write};
 use std::path::PathBuf;
 use std::process;
+use std::time::Instant;
 
 use clap::{ArgGroup, Parser, Subcommand, ValueEnum};
 use muxl::cli as muxl_cli;
@@ -38,6 +39,11 @@ enum Command {
     /// MUXL segmenter, produce one signed flat MP4 (per-track + wrapper)
     /// as a CBOR `signed-segment` event on stdout.
     SignSegment(SignSegmentArgs),
+    /// Microbenchmark: hash N×size bytes via either in-wasm sha2 or the
+    /// `streamplace.host_sha256` import. Used to size the upper bound on
+    /// what a host-SHA256 path could save before committing to a
+    /// full-crate sha2 patch in c2pa-rs's hot path.
+    BenchSha256(BenchSha256Args),
 
     // muxl subcommands, lifted verbatim. --------------------------------------
     /// Extract catalog (track config) from an MP4.
@@ -136,6 +142,28 @@ struct SignSegmentArgs {
     signing: SigningArgs,
 }
 
+#[derive(clap::Args)]
+struct BenchSha256Args {
+    /// Bytes of pseudo-random input per iteration.
+    #[arg(long, default_value_t = 1_048_576)]
+    size: usize,
+    /// Number of iterations.
+    #[arg(long, default_value_t = 100)]
+    iterations: usize,
+    /// Hashing backend.
+    #[arg(long, value_enum, default_value_t = Sha256Mode::Wasm)]
+    mode: Sha256Mode,
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum Sha256Mode {
+    /// Hash inside wasm using the bundled `sha2` crate. Same code path
+    /// c2pa-rs follows today.
+    Wasm,
+    /// Hash on the host via the `streamplace.host_sha256` import.
+    Host,
+}
+
 #[derive(Clone, Copy, Debug, ValueEnum)]
 enum Alg {
     Es256,
@@ -169,6 +197,7 @@ pub fn cli_main() {
     let result = match cli.command {
         Command::SignPerTrack(args) => cmd_sign_per_track(args),
         Command::SignSegment(args) => cmd_sign_segment(args),
+        Command::BenchSha256(args) => cmd_bench_sha256(args),
         // muxl subcommands delegate to muxl::cli::dispatch via its
         // matching enum variant — we just rebuild the muxl Command from
         // our payload and hand it off.
@@ -248,4 +277,66 @@ fn cmd_sign_segment(args: SignSegmentArgs) -> Result<()> {
         &track_manifest,
         &wrapper_manifest,
     )
+}
+
+fn cmd_bench_sha256(args: BenchSha256Args) -> Result<()> {
+    let BenchSha256Args { size, iterations, mode } = args;
+
+    // Deterministic-but-non-trivial input so the optimizer can't fold
+    // the hash to a constant. xorshift64 over a known seed.
+    let mut buf = vec![0u8; size];
+    let mut s: u64 = 0xdeadbeef_cafebabe;
+    for chunk in buf.chunks_mut(8) {
+        s ^= s << 13;
+        s ^= s >> 7;
+        s ^= s << 17;
+        let bytes = s.to_le_bytes();
+        chunk.copy_from_slice(&bytes[..chunk.len()]);
+    }
+
+    // One untimed warmup hash so wasm AOT / page-fault costs don't land
+    // in the first iteration of the timed loop.
+    let _ = sha256_once(&buf, mode);
+
+    let start = Instant::now();
+    let mut acc: u8 = 0;
+    for _ in 0..iterations {
+        let digest = sha256_once(&buf, mode);
+        // Touch the digest so the compiler can't elide the call.
+        acc ^= digest[0];
+    }
+    let elapsed = start.elapsed();
+
+    let total_bytes = (size as u64) * (iterations as u64);
+    let throughput_mb_s =
+        (total_bytes as f64) / 1_048_576.0 / elapsed.as_secs_f64();
+    let per_iter_us = elapsed.as_secs_f64() * 1e6 / (iterations as f64);
+
+    println!(
+        "mode={:?} size={} iterations={} elapsed={:?} per_iter={:.1}us throughput={:.1}MB/s sentinel={}",
+        mode, size, iterations, elapsed, per_iter_us, throughput_mb_s, acc
+    );
+    Ok(())
+}
+
+fn sha256_once(data: &[u8], mode: Sha256Mode) -> [u8; 32] {
+    match mode {
+        Sha256Mode::Wasm => {
+            use sha2::{Digest, Sha256};
+            let mut hasher = Sha256::new();
+            hasher.update(data);
+            hasher.finalize().into()
+        }
+        Sha256Mode::Host => {
+            let mut out = [0u8; 32];
+            unsafe {
+                crate::sign::host_sha256(
+                    data.as_ptr() as u32,
+                    data.len() as u32,
+                    out.as_mut_ptr() as u32,
+                );
+            }
+            out
+        }
+    }
 }

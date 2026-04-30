@@ -220,12 +220,21 @@ impl SignerKey {
 #[link(wasm_import_module = "streamplace")]
 unsafe extern "C" {
     fn host_sign(data_ptr: u32, data_len: u32, out_sig_ptr: u32, out_sig_max: u32) -> u32;
+    /// Compute SHA-256 of `data` host-side, write the 32-byte digest at
+    /// `out_ptr`. Used by `bench-sha256` to measure whether moving SHA-256
+    /// out of wasm shrinks p99 sign latency before committing to a
+    /// crate-level sha2 patch. Always available host-side (PEM-mode
+    /// invocations may still call into it).
+    pub(crate) fn host_sha256(data_ptr: u32, data_len: u32, out_ptr: u32);
 }
 
 #[cfg(not(target_family = "wasm"))]
 unsafe fn host_sign(_: u32, _: u32, _: u32, _: u32) -> u32 {
     u32::MAX
 }
+
+#[cfg(not(target_family = "wasm"))]
+pub(crate) unsafe fn host_sha256(_: u32, _: u32, _: u32) {}
 
 /// Pre-allocated buffer for the host's signature. Sized for the largest
 /// algorithm we expect (PS512 over RSA-4096 ≈ 512 bytes); ECDSA r||s for

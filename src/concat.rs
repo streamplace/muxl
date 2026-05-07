@@ -1,7 +1,16 @@
-//! Concatenator: merge multiple MUXL fMP4 files into a single event stream.
+//! Concatenator: merge multiple MUXL fMP4 or flat MP4 files into a single
+//! event stream.
 //!
-//! Accepts concatenated MUXL fMP4s via `feed()`. Each fMP4 has an
-//! init section (ftyp + uuid + moov) followed by moof+mdat fragment pairs.
+//! Accepts concatenated MUXL files via `feed()`. Two input shapes are handled
+//! interchangeably:
+//!
+//! - **fMP4**: `ftyp + uuid? + moov + moof+mdat moof+mdat ...`
+//! - **flat MP4** (incl. signed muxl): `ftyp + uuid? + moov + mdat-envelope { moof+mdat moof+mdat ... }`
+//!
+//! Detection is implicit: an mdat encountered in streaming state with no
+//! pending moof is the outer envelope of a flat MP4 — the concat consumes its
+//! header only and lets the inner moof+mdat pairs flow through.
+//!
 //! The UUID atom in the init section is extracted and prepended to each output
 //! segment.
 //!
@@ -37,12 +46,14 @@ use crate::init::{build_init_segment, catalog_from_moov};
 use crate::push::SegmenterEvent;
 use crate::segment::GopSegment;
 
-/// Push-based concatenator for merging multiple MUXL fMP4 files.
+/// Push-based concatenator for merging multiple MUXL fMP4 or flat MP4 files.
 ///
-/// Feed concatenated MUXL fMP4 bytes via `feed()`. The concatenator extracts
-/// UUID atoms from each fMP4's init section and prepends them to output
+/// Feed concatenated bytes via `feed()`. The concatenator extracts UUID
+/// atoms from each file's init section and prepends them to output
 /// segments. Init events are emitted only when the catalog changes between
-/// fMP4 files.
+/// files. For flat MP4 input, a segment is flushed at the end of each
+/// outer-mdat envelope — so livestream consumers don't lag by one file
+/// waiting for the next ftyp boundary.
 pub struct Concatenator {
     buffer: Vec<u8>,
     current_catalog: Option<Catalog>,
@@ -58,6 +69,11 @@ pub struct Concatenator {
     /// Per-track accumulated sample count.
     track_sample_counts: BTreeMap<u32, u32>,
     segment_number: u32,
+    /// Bytes left until the end of the current flat-MP4 outer-mdat envelope.
+    /// When this reaches 0 we flush the accumulated segment and clear the
+    /// marker. `None` outside an envelope (i.e. fMP4 input or before the
+    /// outer mdat is seen).
+    envelope_remaining: Option<usize>,
 }
 
 enum ConcatState {
@@ -93,10 +109,12 @@ impl Concatenator {
             track_durations: BTreeMap::new(),
             track_sample_counts: BTreeMap::new(),
             segment_number: 0,
+            envelope_remaining: None,
         }
     }
 
-    /// Feed a chunk of concatenated MUXL fMP4 data. Returns any events produced.
+    /// Feed a chunk of concatenated MUXL fMP4 or flat MP4 data. Returns any
+    /// events produced.
     pub fn feed(&mut self, data: &[u8]) -> Result<Vec<SegmenterEvent>> {
         self.buffer.extend_from_slice(data);
         let mut events = Vec::new();
@@ -106,6 +124,26 @@ impl Concatenator {
                 Some(v) => v,
                 None => break,
             };
+
+            // Outer-mdat envelope of a (signed) flat MP4: an mdat in
+            // Streaming state with no pending moof is the wrapper around
+            // inner moof+mdat fragment pairs. Consume only the box header
+            // so the inner pairs surface as top-level boxes for the
+            // existing handlers — and so we don't have to wait for the
+            // full envelope (potentially gigabytes) to arrive. Record the
+            // remaining body size so we can flush when we hit the end of
+            // the envelope (one envelope = one logical segment).
+            if &box_type == b"mdat"
+                && matches!(
+                    &self.state,
+                    ConcatState::Streaming(ss) if ss.pending_moof.is_none()
+                )
+            {
+                let header_size = if self.buffer[0..4] == [0u8, 0, 0, 1] { 16 } else { 8 };
+                self.envelope_remaining = Some(box_total_size.saturating_sub(header_size));
+                self.buffer.drain(..header_size);
+                continue;
+            }
 
             if self.buffer.len() < box_total_size {
                 break;
@@ -118,6 +156,7 @@ impl Concatenator {
                     // New fMP4 starting — flush any pending segment, reset to init phase
                     self.flush_segment_into(&mut events);
                     self.pending_uuid = None;
+                    self.envelope_remaining = None;
                     self.state = ConcatState::WaitingForInit;
                 }
                 b"uuid" => {
@@ -130,6 +169,7 @@ impl Concatenator {
                             // UUID during streaming — treat as new fMP4's init
                             self.flush_segment_into(&mut events);
                             self.pending_uuid = Some(box_data);
+                            self.envelope_remaining = None;
                             self.state = ConcatState::WaitingForInit;
                         }
                     }
@@ -253,6 +293,20 @@ impl Concatenator {
                 }
                 _ => {
                     // Skip other boxes (free, styp, sidx, etc.)
+                }
+            }
+
+            // If we're inside a flat-MP4 outer-mdat envelope, count this
+            // box against the remaining body. ftyp/uuid/moov already
+            // cleared envelope_remaining in their handlers, so this only
+            // fires for the inner moof/mdat pairs that actually live
+            // inside the envelope. When we hit zero, the envelope is done
+            // → flush the accumulated segment.
+            if let Some(rem) = self.envelope_remaining.as_mut() {
+                *rem = rem.saturating_sub(box_total_size);
+                if *rem == 0 {
+                    self.envelope_remaining = None;
+                    self.flush_segment_into(&mut events);
                 }
             }
         }
@@ -593,5 +647,124 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Concat must descend into a flat MP4's outer mdat envelope to surface
+    /// the inner moof+mdat fragments. Streamplace's S3 livestream-to-VOD
+    /// pipeline feeds signed muxl flat MP4s (one per signed segment) — if
+    /// concat treats the outer mdat opaquely, InitCh fires but SegCh never
+    /// does. Regression test for that bug.
+    #[test]
+    fn test_concat_flat_mp4_input() {
+        let data = read_fixture("h264-opus-frag.mp4");
+        let source = crate::read(&data[..]).unwrap();
+        let mut flat_mp4 = Vec::new();
+        crate::flat::write(&source, &data[..], &mut flat_mp4).unwrap();
+
+        let mut concat = Concatenator::new();
+        let mut events = concat.feed(&flat_mp4).unwrap();
+        events.extend(concat.flush().unwrap());
+
+        let init_count = events
+            .iter()
+            .filter(|e| matches!(e, SegmenterEvent::InitSegment { .. }))
+            .count();
+        assert_eq!(init_count, 1, "expected one init segment");
+
+        let gops: Vec<&GopSegment> = events
+            .iter()
+            .filter_map(|e| match e {
+                SegmenterEvent::Segment(s) => Some(s),
+                _ => None,
+            })
+            .collect();
+        assert!(!gops.is_empty(), "concat must emit segments from flat MP4 input");
+
+        // Across all GoPs the union of tracks must include every catalog
+        // track — i.e. fragments from both the video and audio sub-runs of
+        // the outer mdat envelope made it out. (We don't assert per-GoP
+        // track presence: flat MP4 groups fragments by track rather than
+        // interleaving by time, so concat's keyframe-based segmentation
+        // can produce per-track-only intermediate segments. Streamplace's
+        // real flow feeds one-GoP flat MP4s where the ftyp boundary
+        // delimits segments and this concern goes away.)
+        let mut seen_tracks = std::collections::BTreeSet::new();
+        for gop in &gops {
+            for tid in gop.tracks.keys() {
+                seen_tracks.insert(*tid);
+            }
+        }
+        let expected: std::collections::BTreeSet<u32> = source
+            .catalog
+            .video_configs()
+            .map(|v| v.track_id())
+            .chain(source.catalog.audio_configs().map(|a| a.track_id()))
+            .collect();
+        assert_eq!(seen_tracks, expected, "expected all catalog tracks across emitted segments");
+    }
+
+    /// Streaming livestream invariant: each input file's segment must be
+    /// emitted as soon as that file's outer-mdat envelope completes — *not*
+    /// at the next file's ftyp boundary or at flush(). Without this, a
+    /// livestream consumer (Streamplace's S3 upload) lags one file behind
+    /// the producer indefinitely, since the final flush only ever fires at
+    /// stream close.
+    #[test]
+    fn test_concat_flushes_at_envelope_end_without_flush_call() {
+        let data = read_fixture("h264-opus-frag.mp4");
+        let source = crate::read(&data[..]).unwrap();
+        let mut flat_mp4 = Vec::new();
+        crate::flat::write(&source, &data[..], &mut flat_mp4).unwrap();
+
+        // Feed three concatenated flat MP4s; do NOT call flush().
+        let mut concat = Concatenator::new();
+        let mut events = Vec::new();
+        for _ in 0..3 {
+            events.extend(concat.feed(&flat_mp4).unwrap());
+        }
+
+        let segs: Vec<&GopSegment> = events
+            .iter()
+            .filter_map(|e| match e {
+                SegmenterEvent::Segment(s) => Some(s),
+                _ => None,
+            })
+            .collect();
+        // At minimum, we expect three envelope-end flushes — one per file.
+        // (Per-file may also include keyframe-mid flushes if the fixture
+        // has multiple GoPs, hence >= rather than ==.)
+        assert!(
+            segs.len() >= 3,
+            "expected at least 3 segments without flush() (one per envelope), got {}",
+            segs.len(),
+        );
+    }
+
+    /// Same as above but byte-by-byte feeding, to confirm the streaming
+    /// state machine handles the outer mdat header arriving in pieces and
+    /// doesn't block waiting for the (potentially gigabytes-long) envelope
+    /// body.
+    #[test]
+    fn test_concat_flat_mp4_byte_at_a_time() {
+        let data = read_fixture("h264-opus-frag.mp4");
+        let source = crate::read(&data[..]).unwrap();
+        let mut flat_mp4 = Vec::new();
+        crate::flat::write(&source, &data[..], &mut flat_mp4).unwrap();
+
+        let mut concat = Concatenator::new();
+        let mut events = Vec::new();
+        for b in &flat_mp4 {
+            events.extend(concat.feed(std::slice::from_ref(b)).unwrap());
+        }
+        events.extend(concat.flush().unwrap());
+
+        let gops: Vec<&GopSegment> = events
+            .iter()
+            .filter_map(|e| match e {
+                SegmenterEvent::Segment(s) => Some(s),
+                _ => None,
+            })
+            .collect();
+        assert!(!gops.is_empty(), "byte-at-a-time flat MP4 input must produce segments");
     }
 }

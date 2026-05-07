@@ -74,12 +74,6 @@ pub struct Concatenator {
     /// marker. `None` outside an envelope (i.e. fMP4 input or before the
     /// outer mdat is seen).
     envelope_remaining: Option<usize>,
-    /// Per-track running `(base_media_decode_time, per_track_seq)` carried
-    /// across input files so output tfdts are cumulative. Each input file
-    /// has its own tfdts starting at 0 within its own timeline; we strip
-    /// those on the way through and let `process_moof_mdat` continue from
-    /// here. Persists across moov boundaries.
-    track_state: HashMap<u32, (u64, u32)>,
 }
 
 enum ConcatState {
@@ -92,6 +86,7 @@ enum ConcatState {
 struct StreamingState {
     moov: Moov,
     video_track_ids: HashSet<u32>,
+    track_state: HashMap<u32, (u64, u32)>,
     seen_first_keyframe: bool,
     pending_moof: Option<PendingMoof>,
 }
@@ -115,7 +110,6 @@ impl Concatenator {
             track_sample_counts: BTreeMap::new(),
             segment_number: 0,
             envelope_remaining: None,
-            track_state: HashMap::new(),
         }
     }
 
@@ -217,6 +211,7 @@ impl Concatenator {
                     self.state = ConcatState::Streaming(StreamingState {
                         moov,
                         video_track_ids,
+                        track_state: HashMap::new(),
                         seen_first_keyframe: false,
                         pending_moof: None,
                     });
@@ -242,20 +237,10 @@ impl Concatenator {
                     let mut frames: Vec<(Frame, bool)> = Vec::new();
 
                     if let ConcatState::Streaming(ss) = &mut self.state {
-                        if let Some(mut pending) = ss.pending_moof.take() {
+                        if let Some(pending) = ss.pending_moof.take() {
                             let mdat_header_size =
                                 if box_data.len() > u32::MAX as usize { 16 } else { 8 };
                             let mdat_payload = &box_data[mdat_header_size..];
-
-                            // Strip the input file's tfdts so process_moof_mdat
-                            // continues from our cumulative running decode_time
-                            // (in self.track_state) instead of resetting to the
-                            // input file's local timeline. Without this, every
-                            // concatenated file would restart at decode_time=0
-                            // and players would skip / overlap on playback.
-                            for traf in &mut pending.moof.traf {
-                                traf.tfdt = None;
-                            }
 
                             let mut raw_frames: Vec<Frame> = Vec::new();
                             fragment::process_moof_mdat(
@@ -263,7 +248,7 @@ impl Concatenator {
                                 &pending.moof,
                                 pending.box_size,
                                 mdat_payload,
-                                &mut self.track_state,
+                                &mut ss.track_state,
                                 &mut |frame| {
                                     raw_frames.push(frame);
                                     Ok(())
@@ -716,68 +701,6 @@ mod tests {
             .chain(source.catalog.audio_configs().map(|a| a.track_id()))
             .collect();
         assert_eq!(seen_tracks, expected, "expected all catalog tracks across emitted segments");
-    }
-
-    /// Cumulative-tfdt invariant: when concatenating multiple input files
-    /// (each with its own local timeline starting at decode_time=0), the
-    /// output's per-track decode times must be cumulative across files.
-    /// Without this, players see decode time go backwards every input
-    /// boundary and skip / overlap on playback.
-    #[test]
-    fn test_concat_tfdt_is_cumulative_across_files() {
-        use mp4_atom::{Header, Moof, ReadAtom, ReadFrom};
-
-        let data = read_fixture("h264-opus-frag.mp4");
-        let source = crate::read(&data[..]).unwrap();
-        let mut flat_mp4 = Vec::new();
-        crate::flat::write(&source, &data[..], &mut flat_mp4).unwrap();
-
-        // Feed two identical flat MP4s. Each input file's tfdts start at 0
-        // within its own timeline. Output tfdts must continue from where
-        // the first file ended into the second file's frames.
-        let mut concat = Concatenator::new();
-        let mut events = concat.feed(&flat_mp4).unwrap();
-        events.extend(concat.feed(&flat_mp4).unwrap());
-        events.extend(concat.flush().unwrap());
-
-        // Walk every output moof and collect (track_id, tfdt) pairs in order.
-        let mut tfdts: BTreeMap<u32, Vec<u64>> = BTreeMap::new();
-        for event in &events {
-            let SegmenterEvent::Segment(gop) = event else { continue };
-            for (&tid, data) in &gop.tracks {
-                let mut off = 0;
-                while off + 8 <= data.len() {
-                    let size = u32::from_be_bytes([data[off], data[off + 1], data[off + 2], data[off + 3]]) as usize;
-                    let btype = &data[off + 4..off + 8];
-                    if btype == b"moof" {
-                        let blob = &data[off..off + size];
-                        let mut cur = std::io::Cursor::new(blob);
-                        let header = <Option<Header> as ReadFrom>::read_from(&mut cur).unwrap().unwrap();
-                        let moof = Moof::read_atom(&header, &mut cur).unwrap();
-                        for traf in &moof.traf {
-                            if let Some(ref tfdt) = traf.tfdt {
-                                tfdts.entry(tid).or_default().push(tfdt.base_media_decode_time);
-                            }
-                        }
-                    }
-                    if size == 0 { break; }
-                    off += size;
-                }
-            }
-        }
-
-        // Per-track tfdts must be strictly monotonically increasing —
-        // including across the boundary between the two input files.
-        for (tid, ts) in &tfdts {
-            assert!(ts.len() >= 2, "track {tid} should have multiple tfdts, got {}", ts.len());
-            for w in ts.windows(2) {
-                assert!(
-                    w[1] > w[0],
-                    "track {tid} tfdt went backwards across files: {} → {}\n(full sequence: {:?})",
-                    w[0], w[1], ts,
-                );
-            }
-        }
     }
 
     /// Streaming livestream invariant: each input file's segment must be

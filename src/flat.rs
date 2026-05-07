@@ -327,7 +327,6 @@ pub fn plan_from_fmp4<R: ReadAt + ?Sized>(
 
     let mut plans: Vec<TrackPlan> = track_plans.into_values().collect();
     plans.sort_by_key(|p| p.track_id);
-    crate::source::normalize_track_offsets(&mut plans);
     Ok((catalog, plans))
 }
 
@@ -370,7 +369,6 @@ pub fn plan_from_flat_mp4<R: ReadAt + ?Sized>(
         });
     }
     plans.sort_by_key(|p| p.track_id);
-    crate::source::normalize_track_offsets(&mut plans);
 
     Ok((catalog, plans))
 }
@@ -390,12 +388,12 @@ pub fn write_flat_mp4<R: ReadAt + ?Sized, W: Write>(
     let mut ordered: Vec<&TrackPlan> = plans.iter().collect();
     ordered.sort_by_key(|p| p.track_id);
 
-    // Per-track leading offsets are expected to be already normalized —
-    // [`Plan::new`] / [`crate::source::normalize_track_offsets`] subtract
-    // the smallest offset across tracks before this point. write_flat_mp4
-    // bakes whatever values it receives into the synthesized elsts and
-    // first-fragment tfdts; canonical callers go through Plan, which
-    // guarantees the contract.
+    // Per-track leading offsets are taken at face value: each track's
+    // start_offset_ticks is baked into its first-fragment tfdt and (for
+    // non-zero values) into a synthesized canonical elst in the moov.
+    // No inter-track normalization here — A/V sync rides on the per-track
+    // delta, and absolute time anchoring is preserved as-is. Spec:
+    // canonical-form.md § edts/elst.
 
     // ftyp — canonical-form.md § ftyp
     let ftyp = Ftyp {
@@ -1248,26 +1246,28 @@ mod tests {
     }
 
     #[test]
-    fn flat_normalizes_inter_track_offset_delta() {
+    fn flat_preserves_per_track_offsets_verbatim() {
         // Both tracks carry leading offsets: video at 50ms, audio at 10ms.
-        // The smaller offset (audio) anchors at zero; the inter-track delta
-        // (40ms) survives as the video's synthesized elst, preserving A/V
-        // sync while dropping the absolute capture-clock offset.
+        // Canonical form preserves both verbatim — A/V sync rides on the
+        // 40ms inter-track delta naturally; absolute time anchoring is
+        // whatever the caller set. Each track gets its own synthesized
+        // elst and first-fragment tfdt at its own offset.
         let flat_input = FileReadAt::open(&fixture_path("h264-aac.mp4")).unwrap();
         let (catalog, mut plans) = plan_from_flat_mp4(&flat_input).unwrap();
         let video_track_id = catalog.video_configs().next().unwrap().track_id();
         let audio_track_id = catalog.audio_configs().next().unwrap().track_id();
         let video_ts = catalog.video_configs().next().unwrap().timescale();
         let audio_ts = catalog.audio_configs().next().unwrap().timescale();
+        let video_offset_ticks = 50 * video_ts as u64 / 1000;
+        let audio_offset_ticks = 10 * audio_ts as u64 / 1000;
 
         for plan in &mut plans {
             if plan.track_id == video_track_id {
-                plan.start_offset_ticks = 50 * video_ts as u64 / 1000;
+                plan.start_offset_ticks = video_offset_ticks;
             } else if plan.track_id == audio_track_id {
-                plan.start_offset_ticks = 10 * audio_ts as u64 / 1000;
+                plan.start_offset_ticks = audio_offset_ticks;
             }
         }
-        crate::source::normalize_track_offsets(&mut plans);
 
         let mut out = Vec::new();
         write_flat_mp4(&catalog, &plans, &flat_input, &mut out).unwrap();
@@ -1284,69 +1284,81 @@ mod tests {
             .find(|t| t.tkhd.track_id == audio_track_id)
             .unwrap();
 
-        // Audio anchors at zero — no synthesized elst.
-        assert!(
-            audio_trak.edts.is_none(),
-            "track at the minimum offset should have no elst",
-        );
-
-        // Video keeps the 40ms inter-track delta as a synthesized empty edit.
-        let elst = video_trak
+        // Both tracks get a synthesized empty-edit elst sized to their
+        // own offset (in the movie timescale), since neither is zero.
+        let video_elst = video_trak
             .edts
             .as_ref()
             .and_then(|e| e.elst.as_ref())
             .expect("video trak should have a synthesized elst");
-        assert_eq!(elst.entries.len(), 2);
-        assert_eq!(elst.entries[0].segment_duration, 40);
-        assert_eq!(elst.entries[0].media_time, u64::MAX);
-        assert_eq!(elst.entries[1].media_time, 0);
+        assert_eq!(video_elst.entries.len(), 2);
+        assert_eq!(video_elst.entries[0].segment_duration, 50);
+        assert_eq!(video_elst.entries[0].media_time, u64::MAX);
+        assert_eq!(video_elst.entries[1].media_time, 0);
 
-        // First-fragment tfdts: audio at 0, video at the relative delta.
+        let audio_elst = audio_trak
+            .edts
+            .as_ref()
+            .and_then(|e| e.elst.as_ref())
+            .expect("audio trak should have a synthesized elst");
+        assert_eq!(audio_elst.entries.len(), 2);
+        assert_eq!(audio_elst.entries[0].segment_duration, 10);
+        assert_eq!(audio_elst.entries[0].media_time, u64::MAX);
+        assert_eq!(audio_elst.entries[1].media_time, 0);
+
+        // First-fragment tfdts: each carries its own absolute offset.
         let video_tfdt = find_first_tfdt_for_track(&out, video_track_id).unwrap();
         let audio_tfdt = find_first_tfdt_for_track(&out, audio_track_id).unwrap();
-        assert_eq!(audio_tfdt, 0);
-        let expected_video_tfdt = (40 * video_ts as u64 + 500) / 1000;
-        assert_eq!(video_tfdt, expected_video_tfdt);
+        assert_eq!(video_tfdt, video_offset_ticks);
+        assert_eq!(audio_tfdt, audio_offset_ticks);
     }
 
     #[test]
-    fn flat_drops_absolute_offset_when_tracks_synced() {
-        // Both tracks share a leading offset (the case mp4mux produces for
-        // livestream segments where every fragment's tfdt is running-time).
-        // Normalization subtracts the common offset, leaving zero leading
-        // edits anywhere — the canonical bytes are independent of when the
-        // source clock started.
+    fn flat_preserves_shared_absolute_offset() {
+        // Both tracks share a 1-second leading offset (the case mp4mux
+        // produces for livestream segments where every fragment's tfdt is
+        // running-time). Canonical form preserves the offset — the output
+        // file's first-fragment tfdts are at 1s, the moov's elsts encode
+        // the shift. Concatenating segments downstream gets continuous
+        // tfdts without any rebase step.
         let flat_input = FileReadAt::open(&fixture_path("h264-aac.mp4")).unwrap();
         let (catalog, mut plans) = plan_from_flat_mp4(&flat_input).unwrap();
         let video_track_id = catalog.video_configs().next().unwrap().track_id();
         let audio_track_id = catalog.audio_configs().next().unwrap().track_id();
         let video_ts = catalog.video_configs().next().unwrap().timescale();
         let audio_ts = catalog.audio_configs().next().unwrap().timescale();
+        let video_offset = video_ts as u64; // 1s
+        let audio_offset = audio_ts as u64; // 1s
 
         for plan in &mut plans {
             if plan.track_id == video_track_id {
-                plan.start_offset_ticks = video_ts as u64; // 1s
+                plan.start_offset_ticks = video_offset;
             } else if plan.track_id == audio_track_id {
-                plan.start_offset_ticks = audio_ts as u64; // 1s
+                plan.start_offset_ticks = audio_offset;
             }
         }
-        crate::source::normalize_track_offsets(&mut plans);
 
         let mut out = Vec::new();
         write_flat_mp4(&catalog, &plans, &flat_input, &mut out).unwrap();
 
         let moov = read_moov(&mut Cursor::new(&out)).unwrap();
         for trak in &moov.trak {
-            assert!(
-                trak.edts.is_none(),
-                "track {} should have no elst when its offset matches the min",
-                trak.tkhd.track_id,
-            );
+            let elst = trak
+                .edts
+                .as_ref()
+                .and_then(|e| e.elst.as_ref())
+                .unwrap_or_else(|| panic!(
+                    "track {} should have a synthesized elst for its 1s offset",
+                    trak.tkhd.track_id,
+                ));
+            // 1s in the movie timescale (MOVIE_TIMESCALE = 1000).
+            assert_eq!(elst.entries[0].segment_duration, 1000);
+            assert_eq!(elst.entries[0].media_time, u64::MAX);
         }
 
         let video_tfdt = find_first_tfdt_for_track(&out, video_track_id).unwrap();
         let audio_tfdt = find_first_tfdt_for_track(&out, audio_track_id).unwrap();
-        assert_eq!(video_tfdt, 0);
-        assert_eq!(audio_tfdt, 0);
+        assert_eq!(video_tfdt, video_offset);
+        assert_eq!(audio_tfdt, audio_offset);
     }
 }

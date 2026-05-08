@@ -56,6 +56,12 @@ enum Command {
     Segment(muxl_cli::SegmentArgs),
     /// Concatenate MUXL fMP4 files from stdin, emit CBOR events to stdout.
     Concat,
+    /// Synthesize a multi-segment flat MP4 header from per-segment metadata.
+    /// Reads a single CBOR document on stdin: `{catalog, segments: [...]}`.
+    /// Emits the header bytes (ftyp + moov + mdat-envelope-header) on
+    /// stdout. Streamplace's VOD-finalize pipeline pipes this in front of
+    /// each segment's body bytes (typically via S3 multipart upload).
+    SynthFlat,
     /// Generate HLS playback artifacts (CID-addressed blobs + optional playlists).
     Hls(muxl_cli::HlsArgs),
 }
@@ -206,6 +212,7 @@ pub fn cli_main() {
         Command::Mp4(args) => muxl_cli::cmd_mp4(args).map_err(Into::into),
         Command::Segment(args) => muxl_cli::cmd_segment(args).map_err(Into::into),
         Command::Concat => muxl_cli::cmd_concat().map_err(Into::into),
+        Command::SynthFlat => cmd_synth_flat(),
         Command::Hls(args) => muxl_cli::cmd_hls(args).map_err(Into::into),
     };
     if let Err(e) = result {
@@ -277,6 +284,99 @@ fn cmd_sign_segment(args: SignSegmentArgs) -> Result<()> {
         &track_manifest,
         &wrapper_manifest,
     )
+}
+
+/// Wire shape for `muxl-sign synth-flat`'s stdin: a single CBOR document
+/// carrying the catalog and a sequence of per-segment metadata. The
+/// fields mirror [`muxl::SegmentMetadata`] one-to-one.
+#[derive(serde::Deserialize)]
+struct SynthFlatInput {
+    catalog: muxl::catalog::Catalog,
+    segments: Vec<SynthFlatSegment>,
+}
+
+#[derive(serde::Deserialize)]
+struct SynthFlatSegment {
+    track_byte_sizes: std::collections::BTreeMap<String, u64>,
+    samples: std::collections::BTreeMap<String, SynthFlatTrackSamples>,
+    #[serde(default)]
+    first_decode_times: std::collections::BTreeMap<String, u64>,
+}
+
+#[derive(serde::Deserialize)]
+struct SynthFlatTrackSamples {
+    durations: Vec<u32>,
+    sizes: Vec<u32>,
+    #[serde(default)]
+    cts_offsets: Vec<i32>,
+    #[serde(default)]
+    sync_indices: Vec<u32>,
+    offsets: Vec<u64>,
+}
+
+fn cmd_synth_flat() -> Result<()> {
+    let mut buf = Vec::new();
+    io::stdin().lock().read_to_end(&mut buf)?;
+    let input: SynthFlatInput = dasl::drisl::from_slice(&buf).map_err(|e| {
+        crate::Error::from(muxl::Error::Io(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("decoding synth-flat input: {e}"),
+        )))
+    })?;
+
+    let mut segments: Vec<muxl::SegmentMetadata> = Vec::with_capacity(input.segments.len());
+    for s in input.segments {
+        let track_byte_sizes = parse_track_keyed_map(s.track_byte_sizes)?;
+        let first_decode_times = parse_track_keyed_map(s.first_decode_times)?;
+        let mut samples = std::collections::BTreeMap::new();
+        for (k, v) in s.samples {
+            let tid = parse_track_id(&k)?;
+            let n = v.durations.len();
+            let cts_offsets = if v.cts_offsets.is_empty() {
+                vec![0; n]
+            } else {
+                v.cts_offsets
+            };
+            samples.insert(
+                tid,
+                muxl::segment::TrackSamples {
+                    durations: v.durations,
+                    sizes: v.sizes,
+                    cts_offsets,
+                    sync_indices: v.sync_indices,
+                    offsets_in_track: v.offsets,
+                },
+            );
+        }
+        segments.push(muxl::SegmentMetadata {
+            track_byte_sizes,
+            samples,
+            first_decode_times,
+        });
+    }
+
+    let header = muxl::build_synth_flat_header(&input.catalog, &segments)?;
+    io::stdout().lock().write_all(&header)?;
+    Ok(())
+}
+
+fn parse_track_id(k: &str) -> Result<u32> {
+    k.parse().map_err(|_| {
+        crate::Error::from(muxl::Error::Io(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("non-numeric track id {k:?}"),
+        )))
+    })
+}
+
+fn parse_track_keyed_map<V>(
+    m: std::collections::BTreeMap<String, V>,
+) -> Result<std::collections::BTreeMap<u32, V>> {
+    let mut out = std::collections::BTreeMap::new();
+    for (k, v) in m {
+        out.insert(parse_track_id(&k)?, v);
+    }
+    Ok(out)
 }
 
 fn cmd_bench_sha256(args: BenchSha256Args) -> Result<()> {

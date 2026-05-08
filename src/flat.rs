@@ -116,6 +116,286 @@ pub struct FlatFragment {
     pub is_sync: bool,
 }
 
+/// Per-segment metadata sufficient to synthesize a multi-segment flat MP4
+/// header without holding any sample bytes. Populated on the wire via
+/// [`crate::cbor::CborEvent::Segment`] (the `samples`, `body_size`,
+/// `track_byte_sizes`, etc. fields) — Streamplace stores it alongside its
+/// per-segment DB row, then hands a slice of these back at VOD-finalize
+/// time to build the synth header.
+#[derive(Debug, Clone, Default)]
+pub struct SegmentMetadata {
+    /// Per-track byte size of this segment's contribution to the flat-MP4
+    /// body. Tracks emit in `track_id`-ascending order within each
+    /// segment, so the offset of track T inside this segment's body is
+    /// the sum of byte sizes for tracks with id < T. Sum across tracks
+    /// equals this segment's total body contribution.
+    pub track_byte_sizes: std::collections::BTreeMap<u32, u64>,
+    /// Per-track per-sample arrays. Same shape as the wire CBOR's
+    /// `samples` field.
+    pub samples: std::collections::BTreeMap<u32, crate::segment::TrackSamples>,
+    /// For the *first* segment of a synth VOD, the decode time of each
+    /// track's first sample. Used to populate the synthesized elst when
+    /// the VOD doesn't start at decode_time=0 (e.g. clipped from
+    /// mid-stream). Empty / zero-valued for stream-from-start VODs.
+    /// Values on subsequent segments are ignored.
+    pub first_decode_times: std::collections::BTreeMap<u32, u64>,
+}
+
+/// Synthesize the header bytes of a multi-segment MUXL flat MP4 from
+/// accumulated per-segment metadata, with no sample bytes required.
+///
+/// The returned bytes are: `ftyp + moov + outer-mdat-envelope-header`
+/// (16-byte largesize). The mdat envelope's largesize field encodes the
+/// expected total body length (= sum of every segment's `body_size`), so
+/// downstream uploaders can stream the bodies directly behind these bytes
+/// without further bookkeeping. The moov's `co64` table points at sample
+/// bytes assuming the body layout is segment-major / track-minor:
+///
+/// ```text
+/// [ftyp][moov][mdat-header]
+///   <segment 1 body: track1-bytes track2-bytes ...>
+///   <segment 2 body: track1-bytes track2-bytes ...>
+///   ...
+/// ```
+///
+/// Each track's bytes within a segment match the wire `tracks[tid]` CBOR
+/// field — including any leading c2pa uuid prefix, since the recorded
+/// `offsets_in_track` already accounts for it.
+///
+/// Spec: `canonical-form.md § Multi-Segment Flat MP4`.
+pub fn build_synth_flat_header(
+    catalog: &Catalog,
+    segments: &[SegmentMetadata],
+) -> Result<Vec<u8>> {
+    use std::collections::BTreeMap;
+
+    // Build per-track concatenated sample lists across all segments. The
+    // `Sample.input_offset` field is irrelevant here (we never read sample
+    // bytes); fill with 0. `track_ids` is sorted to match the canonical
+    // emission order.
+    let mut per_track_samples: BTreeMap<u32, Vec<Sample>> = BTreeMap::new();
+    for seg in segments {
+        for (&tid, ts) in &seg.samples {
+            let track_samples = per_track_samples.entry(tid).or_default();
+            for i in 0..ts.durations.len() {
+                let is_sync = ts.sync_indices.contains(&((i + 1) as u32));
+                track_samples.push(Sample {
+                    duration: ts.durations[i],
+                    size: ts.sizes[i],
+                    is_sync,
+                    cts_offset: ts.cts_offsets[i],
+                    input_offset: 0,
+                });
+            }
+        }
+    }
+
+    let mut track_ids: Vec<u32> = per_track_samples.keys().copied().collect();
+    track_ids.sort();
+    if track_ids.is_empty() {
+        return Err(Error::InvalidMp4(
+            "build_synth_flat_header: no segments / no tracks".into(),
+        ));
+    }
+
+    // Build TrackPlan-shaped inputs for the existing helpers (populate_stbl,
+    // build_canonical_elst, etc.). start_offset_ticks comes from the first
+    // segment's first_decode_times; if absent, defaults to 0.
+    let first_seg = &segments[0];
+    let mut plans: Vec<TrackPlan> = Vec::with_capacity(track_ids.len());
+    for &tid in &track_ids {
+        let timescale = catalog
+            .video_configs()
+            .find(|v| v.track_id() == tid)
+            .map(|v| v.timescale())
+            .or_else(|| {
+                catalog
+                    .audio_configs()
+                    .find(|a| a.track_id() == tid)
+                    .map(|a| a.timescale())
+            })
+            .ok_or_else(|| {
+                Error::InvalidMp4(format!(
+                    "build_synth_flat_header: track {tid} not in catalog"
+                ))
+            })?;
+        let is_video = catalog.video_configs().any(|v| v.track_id() == tid);
+        let start_offset_ticks = first_seg
+            .first_decode_times
+            .get(&tid)
+            .copied()
+            .unwrap_or(0);
+        plans.push(TrackPlan {
+            track_id: tid,
+            is_video,
+            timescale,
+            start_offset_ticks,
+            samples: per_track_samples.remove(&tid).unwrap(),
+        });
+    }
+
+    // Pass 1: build moov with placeholder co64 to measure its encoded size.
+    // Per-track byte totals come from each track's measured moof sizes plus
+    // sample/mdat-header bytes — the same accounting `flat::write` does.
+    // Track totals are needed to validate against `track_byte_sizes` from
+    // the segments, but they're effectively a sanity check; the body bytes
+    // come from S3 (the segments' raw bytes) and the synth header just
+    // points at them. The caller is responsible for feeding bodies whose
+    // layout matches the assumption above.
+    let ftyp = Ftyp {
+        major_brand: b"muxl".into(),
+        minor_version: 0,
+        compatible_brands: vec![b"muxl".into(), b"isom".into(), b"iso2".into()],
+    };
+    let mut ftyp_buf = Vec::new();
+    ftyp.write_to(&mut ftyp_buf).map_err(mp4_err)?;
+    let ftyp_size = ftyp_buf.len() as u64;
+
+    let mut traks: Vec<Trak> = Vec::with_capacity(plans.len());
+    let mut track_ts: Vec<u32> = Vec::with_capacity(plans.len());
+    for plan in &plans {
+        let (trak, timescale) = build_base_trak(catalog, plan.track_id)?;
+        traks.push(trak);
+        track_ts.push(timescale);
+    }
+
+    // Per-track total decode_time (sum of sample durations + start_offset).
+    let mut per_track_final_decode_time: Vec<u64> = Vec::with_capacity(plans.len());
+    for plan in &plans {
+        let mut dt = plan.start_offset_ticks;
+        for s in &plan.samples {
+            dt += s.duration as u64;
+        }
+        per_track_final_decode_time.push(dt);
+    }
+
+    for (ti, plan) in plans.iter().enumerate() {
+        let n = plan.samples.len();
+        populate_stbl(&mut traks[ti].mdia.minf.stbl, plan, &vec![0u64; n]);
+        let media_duration = per_track_final_decode_time[ti] - plan.start_offset_ticks;
+        traks[ti].mdia.mdhd.duration = media_duration;
+        traks[ti].edts =
+            build_canonical_elst(plan.start_offset_ticks, media_duration, track_ts[ti]);
+        let tkhd_duration =
+            rescale_to_movie(media_duration + plan.start_offset_ticks, track_ts[ti]);
+        traks[ti].tkhd.duration = tkhd_duration;
+    }
+
+    let movie_duration: u64 = per_track_final_decode_time
+        .iter()
+        .zip(&track_ts)
+        .map(|(md, ts)| rescale_to_movie(*md, *ts))
+        .max()
+        .unwrap_or(0);
+    let max_track_id = track_ids.iter().copied().max().unwrap_or(0);
+    let mvhd = Mvhd {
+        creation_time: 0,
+        modification_time: 0,
+        timescale: MOVIE_TIMESCALE,
+        duration: movie_duration,
+        rate: 1u16.into(),
+        volume: 1u8.into(),
+        matrix: Default::default(),
+        next_track_id: max_track_id + 1,
+    };
+    let mut moov = Moov {
+        mvhd,
+        meta: None,
+        mvex: None,
+        trak: traks,
+        udta: None,
+        ainf: None,
+    };
+
+    let mut moov_buf = Vec::new();
+    moov.write_to(&mut moov_buf).map_err(mp4_err)?;
+    let moov_size = moov_buf.len() as u64;
+
+    const ENVELOPE_HEADER_SIZE: u64 = 16;
+    let mdat_payload_offset = ftyp_size + moov_size + ENVELOPE_HEADER_SIZE;
+
+    // Pass 2: compute final co64 entries using the multi-segment layout.
+    // For sample i of track T in segment s:
+    //   file_offset = mdat_payload_offset
+    //               + cumulative_body_size_before_seg_s
+    //               + sum_byte_sizes_of_smaller_tracks_in_seg_s
+    //               + offsets_in_track[i]
+    // Each track's co64 entries are emitted in segment-order (same order
+    // their samples land in the body).
+    let mut total_body: u64 = 0;
+    let mut per_track_co64: BTreeMap<u32, Vec<u64>> = BTreeMap::new();
+    for seg in segments {
+        // Within a segment, tracks emit in track_id-ascending order.
+        let mut seg_tracks: Vec<u32> = seg.track_byte_sizes.keys().copied().collect();
+        seg_tracks.sort();
+        let mut intra_seg_offset: u64 = 0;
+        for tid in seg_tracks {
+            let ts = seg
+                .samples
+                .get(&tid)
+                .ok_or_else(|| Error::InvalidMp4(format!(
+                    "segment metadata missing samples for track {tid}"
+                )))?;
+            let track_byte_size = seg.track_byte_sizes[&tid];
+            let entries = per_track_co64.entry(tid).or_default();
+            for &off_in_track in &ts.offsets_in_track {
+                let file_offset =
+                    mdat_payload_offset + total_body + intra_seg_offset + off_in_track;
+                entries.push(file_offset);
+            }
+            intra_seg_offset += track_byte_size;
+        }
+        // Body size for this segment = sum of its tracks' byte sizes.
+        let seg_body: u64 = seg.track_byte_sizes.values().sum();
+        total_body += seg_body;
+    }
+
+    // Validate that every track's per_track_co64 length matches its
+    // populated stsz entry count — catches mismatches between
+    // track_byte_sizes (which drives co64 placement) and samples (which
+    // drives stsz/stts).
+    for (ti, plan) in plans.iter().enumerate() {
+        let entries = per_track_co64
+            .get(&plan.track_id)
+            .ok_or_else(|| Error::InvalidMp4(format!(
+                "build_synth_flat_header: track {} present in catalog but no segment had its samples",
+                plan.track_id,
+            )))?;
+        if entries.len() != plan.samples.len() {
+            return Err(Error::InvalidMp4(format!(
+                "track {}: co64 entries ({}) != sample count ({}) — track_byte_sizes / samples mismatch",
+                plan.track_id, entries.len(), plan.samples.len(),
+            )));
+        }
+        moov.trak[ti].mdia.minf.stbl.co64 = Some(Co64 {
+            entries: entries.clone(),
+        });
+    }
+
+    // Re-encode moov with final co64 entries; size must match pass 1.
+    let mut moov_buf2 = Vec::new();
+    moov.write_to(&mut moov_buf2).map_err(mp4_err)?;
+    if moov_buf2.len() as u64 != moov_size {
+        return Err(Error::InvalidMp4(format!(
+            "moov size changed between passes: {} -> {}",
+            moov_size,
+            moov_buf2.len()
+        )));
+    }
+
+    // Assemble the header bytes: ftyp + moov + mdat-envelope-header.
+    let largesize: u64 = ENVELOPE_HEADER_SIZE + total_body;
+    let mut out = Vec::with_capacity(
+        ftyp_size as usize + moov_size as usize + ENVELOPE_HEADER_SIZE as usize,
+    );
+    out.extend_from_slice(&ftyp_buf);
+    out.extend_from_slice(&moov_buf2);
+    out.extend_from_slice(&1u32.to_be_bytes());
+    out.extend_from_slice(b"mdat");
+    out.extend_from_slice(&largesize.to_be_bytes());
+    Ok(out)
+}
+
 /// Convert a flat MP4 into a canonical MUXL flat MP4.
 pub fn flat_mp4_to_flat<R: ReadAt + ?Sized, W: Write>(
     input: &R,
@@ -1243,6 +1523,110 @@ mod tests {
                 CttsEntry { sample_count: 1, sample_offset: -50 },
             ]
         );
+    }
+
+    /// build_synth_flat_header should produce a moov whose co64 entries
+    /// land on real sample bytes when the synth header is concatenated
+    /// with the per-segment bodies. This exercises the full pipeline:
+    /// concat → SegmentMetadata → synth header → assembled flat MP4.
+    /// We then re-parse the synth flat MP4 and verify the moov's
+    /// per-sample sizes match what's at each co64 offset.
+    #[test]
+    fn synth_flat_header_co64_points_at_sample_bytes() {
+        use crate::concat::Concatenator;
+        use crate::push::SegmenterEvent;
+        use crate::segment::TrackSamples;
+        use std::collections::BTreeMap;
+
+        // Build a flat MP4 fixture and feed it through concat to get the
+        // segment events we'd see in production.
+        let data = std::fs::read(fixture_path("h264-opus-frag.mp4")).unwrap();
+        let source = crate::read(&data[..]).unwrap();
+        let mut flat_mp4 = Vec::new();
+        write_flat_mp4(&source.catalog, &source.plan.tracks, &data[..], &mut flat_mp4)
+            .unwrap();
+
+        let mut concat = Concatenator::new();
+        let mut events = concat.feed(&flat_mp4).unwrap();
+        events.extend(concat.flush().unwrap());
+
+        // Extract catalog + collect SegmentMetadata + segment bodies.
+        let catalog = events
+            .iter()
+            .find_map(|e| match e {
+                SegmenterEvent::InitSegment { catalog, .. } => Some(catalog.clone()),
+                _ => None,
+            })
+            .expect("init event");
+        let mut metadatas: Vec<SegmentMetadata> = Vec::new();
+        let mut bodies: Vec<Vec<u8>> = Vec::new();
+        for event in &events {
+            let SegmenterEvent::Segment(gop) = event else { continue };
+            let mut track_byte_sizes: BTreeMap<u32, u64> = BTreeMap::new();
+            let mut samples: BTreeMap<u32, TrackSamples> = BTreeMap::new();
+            let mut body = Vec::new();
+            for (&tid, data) in &gop.tracks {
+                track_byte_sizes.insert(tid, data.len() as u64);
+                samples.insert(tid, gop.samples[&tid].clone());
+                body.extend_from_slice(data);
+            }
+            metadatas.push(SegmentMetadata {
+                track_byte_sizes,
+                samples,
+                first_decode_times: BTreeMap::new(),
+            });
+            bodies.push(body);
+        }
+        assert!(!metadatas.is_empty(), "fixture should produce >=1 segment");
+
+        // Build the synth header and concatenate it with the bodies.
+        let header = build_synth_flat_header(&catalog, &metadatas).unwrap();
+        let mut synth = header.clone();
+        for body in &bodies {
+            synth.extend_from_slice(body);
+        }
+
+        // Re-parse the synth flat MP4 and verify each co64 entry points at
+        // a sample whose size matches the corresponding stsz entry.
+        let moov = read_moov(&mut Cursor::new(&synth)).unwrap();
+        for trak in &moov.trak {
+            let stbl = &trak.mdia.minf.stbl;
+            let co64 = stbl
+                .co64
+                .as_ref()
+                .expect("synth flat MP4 must use co64");
+            let stsz = &stbl.stsz;
+            let sizes: Vec<u32> = match &stsz.samples {
+                StszSamples::Identical { count, size } => {
+                    vec![*size; *count as usize]
+                }
+                StszSamples::Different { sizes } => sizes.clone(),
+            };
+            assert_eq!(
+                co64.entries.len(),
+                sizes.len(),
+                "track {}: co64 length != stsz length",
+                trak.tkhd.track_id,
+            );
+            for (i, &offset) in co64.entries.iter().enumerate() {
+                let off = offset as usize;
+                let end = off + sizes[i] as usize;
+                assert!(
+                    end <= synth.len(),
+                    "track {}, sample {}: co64 offset {}+size {} out of bounds (file is {} bytes)",
+                    trak.tkhd.track_id, i, offset, sizes[i], synth.len(),
+                );
+                // The 8 bytes immediately preceding the sample bytes
+                // should be the per-sample mdat header.
+                let mdat_hdr_start = off - 8;
+                assert_eq!(
+                    &synth[mdat_hdr_start + 4..off],
+                    b"mdat",
+                    "track {}, sample {}: bytes before co64 offset must be mdat header",
+                    trak.tkhd.track_id, i,
+                );
+            }
+        }
     }
 
     #[test]

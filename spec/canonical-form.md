@@ -121,6 +121,25 @@ Given `ftyp` size `F`, `moov` size `M`, and per-sample inner fragment sizes `f_i
 - Sample `i`'s `co64` entry = `P + sum(f_j for j < i) + moof_size_i + 8`
 - Outer `mdat.largesize` = `16 + sum(f_i)`
 
+### Multi-Segment Flat MP4
+
+A flat MP4 produced by concatenating bodies from multiple per-segment fMP4 sources (e.g. Streamplace's livestream-to-VOD pipeline, where each input segment is one signed flat MP4 minted in real time and the VOD is synthesized at finalize time) deviates from the "tracks grouped globally" body layout in one specific way: bodies are grouped **per-segment**, with each segment's tracks internally in `track_id` ascending order.
+
+```
+ftyp
+moov (populated; co64 covers all samples across all segments)
+mdat (64-bit largesize envelope; payload =)
+  segment 1: [track 1 frags...][track 2 frags...]
+  segment 2: [track 1 frags...][track 2 frags...]
+  segment 3: ...
+```
+
+This is what falls out of concatenating per-segment fMP4 bodies (each carrying tracks in id-asc order) without a transcode step. It's still a valid flat MP4 — `co64` entries point wherever they need to, and a flat-MP4 parser doesn't care about the body's internal grouping. It also matches HLS byte-range CMAF's expectation that one byte range per segment covers all tracks for that time slice.
+
+The single-segment layout (tracks grouped globally) and the multi-segment layout (tracks grouped per-segment) are interchangeable for one-segment inputs — they're the same bytes when there's only one segment. Synthesized VODs use the multi-segment layout because it preserves per-segment byte-identity for c2pa verification and avoids re-arranging fragment bytes.
+
+`build_synth_flat_header` (in `src/flat.rs`) constructs the `ftyp + moov + mdat-envelope-header` for a multi-segment flat MP4 from per-segment metadata only — no sample bytes required. The caller assembles the full file by concatenating the synth header with each segment's body bytes (e.g. via S3 multipart UploadPartCopy from the per-segment objects).
+
 ## ftyp
 
 - **major_brand**: `muxl`

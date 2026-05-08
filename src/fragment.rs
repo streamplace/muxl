@@ -201,6 +201,16 @@ pub struct Frame {
     pub is_sync: bool,
     /// Duration of this sample in timescale ticks.
     pub duration: u32,
+    /// Encoded sample size in bytes — the mdat payload length.
+    pub size: u32,
+    /// Composition-time offset of this sample (signed) in timescale ticks.
+    pub cts_offset: i32,
+    /// Size of the encoded moof box at the head of `data`. Combined with
+    /// the 8-byte mdat header, the sample bytes start at
+    /// `data[moof_size + 8 ..]`. Lets downstream callers compute
+    /// per-sample byte offsets within an accumulated track buffer
+    /// without re-parsing the moof.
+    pub moof_size: u32,
     /// Encoded moof+mdat bytes for this single frame.
     pub data: Vec<u8>,
 }
@@ -418,10 +428,18 @@ pub(crate) fn process_moof_mdat(
                     sample_data,
                 )?;
 
+                // moof_size = total - mdat_header (8) - sample_size.
+                let moof_size = (frag_buf.len() as u32)
+                    .saturating_sub(8)
+                    .saturating_sub(frame.size);
+
                 on_frame(Frame {
                     track_id,
                     is_sync: frame.is_sync,
                     duration: frame.duration,
+                    size: frame.size,
+                    cts_offset: frame.cts_offset,
+                    moof_size,
                     data: frag_buf,
                 })?;
 

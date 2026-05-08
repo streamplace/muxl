@@ -39,6 +39,42 @@ pub struct GopSegment {
     pub durations: BTreeMap<u32, u64>,
     /// Per-track sample (frame) count.
     pub sample_counts: BTreeMap<u32, u32>,
+    /// Per-track per-sample metadata. Lets downstream consumers
+    /// reconstruct a flat-MP4 moov (co64/stts/stsz/stss) or build an
+    /// HLS playlist without re-parsing the segment bytes.
+    pub samples: BTreeMap<u32, TrackSamples>,
+    /// Total body bytes this segment contributes when concatenated into a
+    /// flat MP4 (sum of `tracks` values' lengths). Used by downstream
+    /// consumers to compute cumulative byte offsets in the synth flat MP4
+    /// without summing track byte arrays themselves.
+    pub body_size: u64,
+    /// Segment's playable duration in microseconds. Computed from the
+    /// video track if present, otherwise the longest track. Suitable for
+    /// HLS `EXTINF` (just divide by 1e6).
+    pub duration_us: u64,
+}
+
+/// Per-sample metadata as parallel arrays. Same length as the track's
+/// sample count.
+#[derive(Debug, Default, Clone, PartialEq)]
+pub struct TrackSamples {
+    /// Sample durations in the track's media timescale.
+    pub durations: Vec<u32>,
+    /// Encoded sample sizes in bytes (mdat payload, not counting the
+    /// preceding moof or mdat header).
+    pub sizes: Vec<u32>,
+    /// Composition-time offsets, signed.
+    pub cts_offsets: Vec<i32>,
+    /// Sample indices that are sync (key) samples, 1-based — the same
+    /// shape an `stss` table uses. Most tracks have a small number of
+    /// sync samples so a sparse list is more compact than a per-sample
+    /// boolean.
+    pub sync_indices: Vec<u32>,
+    /// Byte offset of each sample's payload (just the mdat data, not
+    /// including the preceding moof or mdat header) within the track's
+    /// segment buffer. Combined with the segment's position in a synth
+    /// flat MP4's body, this is the value `co64` should carry.
+    pub offsets_in_track: Vec<u64>,
 }
 
 /// Segment an fMP4 stream into per-track, GOP-aligned MUXL segments.
@@ -56,11 +92,22 @@ pub fn segment_fmp4<R: Read>(
 
     // Determine which track IDs are video (for keyframe detection)
     let video_track_ids: HashSet<u32> = catalog.video_configs().map(|v| v.track_id()).collect();
+    // Per-track timescales, used to compute segment duration_us.
+    let track_timescales: BTreeMap<u32, u32> = catalog
+        .video_configs()
+        .map(|v| (v.track_id(), v.timescale()))
+        .chain(
+            catalog
+                .audio_configs()
+                .map(|a| (a.track_id(), a.timescale())),
+        )
+        .collect();
 
     // Per-track buffers, ordered by track_id
     let mut track_bufs: BTreeMap<u32, Vec<u8>> = BTreeMap::new();
     let mut track_durations: BTreeMap<u32, u64> = BTreeMap::new();
     let mut track_sample_counts: BTreeMap<u32, u32> = BTreeMap::new();
+    let mut track_samples: BTreeMap<u32, TrackSamples> = BTreeMap::new();
     let mut segment_number: u32 = 0;
     let mut seen_first_keyframe = false;
 
@@ -69,7 +116,15 @@ pub fn segment_fmp4<R: Read>(
 
         if is_video_keyframe && seen_first_keyframe {
             segment_number += 1;
-            if let Some(gop) = flush_track_bufs(&mut track_bufs, &mut track_durations, &mut track_sample_counts, segment_number) {
+            if let Some(gop) = flush_track_bufs(
+                &mut track_bufs,
+                &mut track_durations,
+                &mut track_sample_counts,
+                &mut track_samples,
+                &track_timescales,
+                &video_track_ids,
+                segment_number,
+            ) {
                 on_gop(gop)?;
             }
         }
@@ -78,55 +133,143 @@ pub fn segment_fmp4<R: Read>(
             seen_first_keyframe = true;
         }
 
-        *track_durations.entry(frame.track_id).or_default() += frame.duration as u64;
-        *track_sample_counts.entry(frame.track_id).or_default() += 1;
-        track_bufs
-            .entry(frame.track_id)
-            .or_default()
-            .extend_from_slice(&frame.data);
+        record_frame(
+            &frame,
+            &mut track_bufs,
+            &mut track_durations,
+            &mut track_sample_counts,
+            &mut track_samples,
+        );
     }
 
     // Flush remaining data
     segment_number += 1;
-    if let Some(gop) = flush_track_bufs(&mut track_bufs, &mut track_durations, &mut track_sample_counts, segment_number) {
+    if let Some(gop) = flush_track_bufs(
+        &mut track_bufs,
+        &mut track_durations,
+        &mut track_sample_counts,
+        &mut track_samples,
+        &track_timescales,
+        &video_track_ids,
+        segment_number,
+    ) {
         on_gop(gop)?;
     }
 
     Ok(catalog)
 }
 
+/// Append a frame's bytes + metadata to the per-track buffers, recording
+/// the sample's offset within the buffer (post-append) for later use in
+/// the synthesized flat-MP4 `co64`. The recorded offset points at the
+/// sample payload — i.e. `prior_buffer_size + frame.moof_size + 8` (the
+/// moof preceded by 8 bytes of mdat header).
+pub(crate) fn record_frame(
+    frame: &crate::fragment::Frame,
+    track_bufs: &mut BTreeMap<u32, Vec<u8>>,
+    track_durations: &mut BTreeMap<u32, u64>,
+    track_sample_counts: &mut BTreeMap<u32, u32>,
+    track_samples: &mut BTreeMap<u32, TrackSamples>,
+) {
+    let buf = track_bufs.entry(frame.track_id).or_default();
+    let offset_in_track = buf.len() as u64 + frame.moof_size as u64 + 8;
+    buf.extend_from_slice(&frame.data);
+
+    *track_durations.entry(frame.track_id).or_default() += frame.duration as u64;
+    let count = track_sample_counts.entry(frame.track_id).or_default();
+    *count += 1;
+    let sample_index = *count;
+
+    let samples = track_samples.entry(frame.track_id).or_default();
+    samples.durations.push(frame.duration);
+    samples.sizes.push(frame.size);
+    samples.cts_offsets.push(frame.cts_offset);
+    samples.offsets_in_track.push(offset_in_track);
+    if frame.is_sync {
+        samples.sync_indices.push(sample_index);
+    }
+}
+
 /// Flush all non-empty per-track buffers into a [`GopSegment`].
 ///
-/// Returns `None` if all buffers are empty.
+/// Returns `None` if all buffers are empty. `track_samples` carries the
+/// per-sample arrays accumulated alongside `track_bufs`; it's drained
+/// the same way. `video_track_ids` and `track_timescales` are used to
+/// compute the segment's `duration_us` (preferring video, else longest
+/// track).
 pub(crate) fn flush_track_bufs(
     track_bufs: &mut BTreeMap<u32, Vec<u8>>,
     track_durations: &mut BTreeMap<u32, u64>,
     track_sample_counts: &mut BTreeMap<u32, u32>,
+    track_samples: &mut BTreeMap<u32, TrackSamples>,
+    track_timescales: &BTreeMap<u32, u32>,
+    video_track_ids: &HashSet<u32>,
     segment_number: u32,
 ) -> Option<GopSegment> {
     let mut tracks = BTreeMap::new();
     let mut durations = BTreeMap::new();
     let mut sample_counts = BTreeMap::new();
+    let mut samples = BTreeMap::new();
+    let mut body_size: u64 = 0;
     for (&track_id, buf) in track_bufs.iter_mut() {
         if !buf.is_empty() {
+            body_size += buf.len() as u64;
             tracks.insert(track_id, std::mem::take(buf));
             durations.insert(track_id, track_durations.remove(&track_id).unwrap_or(0));
             sample_counts.insert(track_id, track_sample_counts.remove(&track_id).unwrap_or(0));
+            samples.insert(
+                track_id,
+                track_samples.remove(&track_id).unwrap_or_default(),
+            );
         }
     }
     // Clear any remaining entries for tracks that had no data
     track_durations.clear();
     track_sample_counts.clear();
+    track_samples.clear();
     if tracks.is_empty() {
         None
     } else {
+        let duration_us = compute_duration_us(&durations, track_timescales, video_track_ids);
         Some(GopSegment {
             number: segment_number,
             tracks,
             durations,
             sample_counts,
+            samples,
+            body_size,
+            duration_us,
         })
     }
+}
+
+/// Compute a segment's playable duration in microseconds. Prefers the
+/// first video track; falls back to the track with the longest duration
+/// in microseconds when there is no video. Returns 0 for an empty
+/// segment.
+pub(crate) fn compute_duration_us(
+    durations: &BTreeMap<u32, u64>,
+    track_timescales: &BTreeMap<u32, u32>,
+    video_track_ids: &HashSet<u32>,
+) -> u64 {
+    let to_us = |tid: u32, ticks: u64| -> u64 {
+        let ts = track_timescales.get(&tid).copied().unwrap_or(0);
+        if ts == 0 {
+            return 0;
+        }
+        ticks.saturating_mul(1_000_000) / ts as u64
+    };
+    if let Some((&tid, &ticks)) = durations
+        .iter()
+        .find(|(tid, _)| video_track_ids.contains(tid))
+    {
+        return to_us(tid, ticks);
+    }
+    durations
+        .iter()
+        .map(|(&tid, &ticks)| to_us(tid, ticks))
+        .max()
+        .unwrap_or(0)
 }
 
 #[cfg(test)]

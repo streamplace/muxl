@@ -5,8 +5,15 @@
 //!
 //! ```cbor
 //! {"type": "init", "data": h'<ftyp+moov bytes>', "catalog": {"video": {...}, "audio": {...}}}
-//! {"type": "segment", "tracks": {"1": h'<video moof+mdat>', "2": h'<audio moof+mdat>'},
-//!  "durations": {"1": 60000, "2": 48000}, "sample_counts": {"1": 60, "2": 50}}
+//! {"type": "segment",
+//!  "tracks": {"1": h'<video moof+mdat>', "2": h'<audio moof+mdat>'},
+//!  "durations": {"1": 60000, "2": 48000},
+//!  "sample_counts": {"1": 60, "2": 50},
+//!  "samples": {"1": {"durations": [...], "sizes": [...], "cts_offsets": [...],
+//!                    "sync_indices": [1], "offsets": [...]},
+//!              "2": {...}},
+//!  "body_size": 1296357,
+//!  "duration_us": 1000000}
 //! ```
 
 use std::collections::BTreeMap;
@@ -16,6 +23,7 @@ use serde::{Deserialize, Serialize};
 use crate::catalog::Catalog;
 use crate::init::build_track_init_segments;
 use crate::push::SegmenterEvent;
+use crate::segment::TrackSamples;
 
 /// Wrapper for `Vec<u8>` that serializes as a CBOR byte string.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -52,7 +60,57 @@ pub enum CborEvent {
         /// Per-track sample (frame) count.
         #[serde(default)]
         sample_counts: BTreeMap<String, u32>,
+        /// Per-track per-sample metadata (parallel arrays). Lets
+        /// downstream consumers reconstruct a flat-MP4 moov or build an
+        /// HLS playlist without re-parsing the segment bytes.
+        #[serde(default)]
+        samples: BTreeMap<String, CborTrackSamples>,
+        /// Total body bytes this segment contributes when concatenated
+        /// into a flat MP4. Sum of `tracks` values' lengths.
+        #[serde(default)]
+        body_size: u64,
+        /// Segment's playable duration in microseconds. Suitable for
+        /// HLS `EXTINF` (just divide by 1e6).
+        #[serde(default)]
+        duration_us: u64,
     },
+}
+
+/// CBOR-serializable shape of [`TrackSamples`]. Same fields, parallel
+/// arrays — but the sync sample list rides as a CBOR array of u32 (the
+/// `stss` shape) rather than a packed bitmap, since most segments have
+/// just one or two sync samples.
+#[derive(Serialize, Deserialize, Debug, Default)]
+pub struct CborTrackSamples {
+    pub durations: Vec<u32>,
+    pub sizes: Vec<u32>,
+    pub cts_offsets: Vec<i32>,
+    pub sync_indices: Vec<u32>,
+    pub offsets: Vec<u64>,
+}
+
+impl From<&TrackSamples> for CborTrackSamples {
+    fn from(s: &TrackSamples) -> Self {
+        Self {
+            durations: s.durations.clone(),
+            sizes: s.sizes.clone(),
+            cts_offsets: s.cts_offsets.clone(),
+            sync_indices: s.sync_indices.clone(),
+            offsets: s.offsets_in_track.clone(),
+        }
+    }
+}
+
+impl From<TrackSamples> for CborTrackSamples {
+    fn from(s: TrackSamples) -> Self {
+        Self {
+            durations: s.durations,
+            sizes: s.sizes,
+            cts_offsets: s.cts_offsets,
+            sync_indices: s.sync_indices,
+            offsets: s.offsets_in_track,
+        }
+    }
 }
 
 impl CborEvent {
@@ -87,6 +145,13 @@ impl CborEvent {
                     .iter()
                     .map(|(tid, count)| (tid.to_string(), *count))
                     .collect(),
+                samples: gop
+                    .samples
+                    .iter()
+                    .map(|(tid, s)| (tid.to_string(), s.into()))
+                    .collect(),
+                body_size: gop.body_size,
+                duration_us: gop.duration_us,
             },
         }
     }
@@ -122,6 +187,13 @@ impl CborEvent {
                     .into_iter()
                     .map(|(tid, count)| (tid.to_string(), count))
                     .collect(),
+                samples: gop
+                    .samples
+                    .into_iter()
+                    .map(|(tid, s)| (tid.to_string(), s.into()))
+                    .collect(),
+                body_size: gop.body_size,
+                duration_us: gop.duration_us,
             },
         }
     }

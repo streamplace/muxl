@@ -1,6 +1,7 @@
-//! End-to-end test: sign a multi-track fixture per-track, then read the
-//! wrapper back with `c2pa::Reader` and confirm the per-track ingredients
-//! are present.
+//! End-to-end test: sign a multi-track fixture and confirm the new
+//! per-canonical-segment + wrapper signing shape — the wrapper c2pa-uuid
+//! sits at the file head, and the mdat envelope contains one
+//! `[c2pa-uuid][muxl-uuid][moof+mdat]*` chunk per canonical segment.
 
 use std::io::Cursor;
 use std::path::PathBuf;
@@ -14,8 +15,8 @@ fn repo_path(rel: &str) -> PathBuf {
         .join(rel)
 }
 
-const TRACK_MANIFEST: &str = r#"{
-    "title": "muxl-sign per-track test",
+const SEGMENT_MANIFEST: &str = r#"{
+    "title": "muxl-sign per-segment test",
     "assertions": [
         {
             "label": "c2pa.actions",
@@ -33,6 +34,11 @@ const WRAPPER_MANIFEST: &str = r#"{
         }
     ]
 }"#;
+
+const MUXL_UUID: [u8; 16] = muxl::segment::MUXL_UUID;
+const C2PA_UUID: [u8; 16] = [
+    0xd8, 0xfe, 0xc3, 0xd6, 0x1b, 0x0e, 0x48, 0x3c, 0x92, 0x97, 0x58, 0x28, 0x87, 0x7e, 0xc4, 0x81,
+];
 
 #[test]
 fn sign_per_track_roundtrip_h264_aac() {
@@ -54,7 +60,7 @@ fn sign_per_track_roundtrip_h264_aac() {
         &source,
         &input,
         &signer,
-        TRACK_MANIFEST,
+        SEGMENT_MANIFEST,
         WRAPPER_MANIFEST,
         &mut output,
     )
@@ -62,19 +68,38 @@ fn sign_per_track_roundtrip_h264_aac() {
 
     assert!(!output.is_empty(), "wrapper bytes produced");
 
-    // Read the wrapper back through c2pa-rs and confirm the manifest shape.
+    // Wrapper c2pa-uuid present and validates via c2pa::Reader.
     let reader = c2pa::Reader::from_stream("video/mp4", Cursor::new(&output))
         .expect("Reader::from_stream on signed wrapper");
-    let active = reader.active_manifest().expect("wrapper has an active manifest");
-    assert_eq!(
-        active.ingredients().len(),
-        track_count,
-        "wrapper manifest should reference one ingredient per source track",
+    let _active = reader
+        .active_manifest()
+        .expect("wrapper has an active manifest");
+
+    // Body shape: at least `track_count` canonical segments inside the
+    // outer mdat, each prefixed by a c2pa-uuid (per-segment sig) immediately
+    // followed by a muxl-uuid (catalog).
+    let muxl_count = count_subseq(&output, &MUXL_UUID);
+    let c2pa_count = count_subseq(&output, &C2PA_UUID);
+    assert!(
+        muxl_count >= track_count,
+        "expected ≥{track_count} muxl uuid occurrences inside body, got {muxl_count}"
     );
-    // One manifest per ingredient + one for the wrapper.
-    assert_eq!(
-        reader.manifests().len(),
-        track_count + 1,
-        "store should hold the wrapper manifest plus one per-track ingredient manifest",
+    // One c2pa-uuid at file head (wrapper) + one per canonical segment;
+    // each c2pa identifier byte sequence may also appear inside the JUMBF
+    // payload as part of the assertion exclusion DataMap, so the count is
+    // a lower bound rather than equality.
+    assert!(
+        c2pa_count >= muxl_count + 1,
+        "expected ≥{} c2pa uuid occurrences (1 wrapper + 1 per canonical segment), got {c2pa_count}",
+        muxl_count + 1
     );
+}
+
+fn count_subseq(haystack: &[u8], needle: &[u8]) -> usize {
+    if needle.is_empty() || haystack.len() < needle.len() {
+        return 0;
+    }
+    (0..=haystack.len() - needle.len())
+        .filter(|&i| &haystack[i..i + needle.len()] == needle)
+        .count()
 }

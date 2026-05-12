@@ -10,7 +10,8 @@ path = "src/main.rs"
 
 [dependencies]
 muxl = { path = "../.." }
-c2pa = { git = "https://github.com/streamplace/c2pa-rs.git", rev = "f23cfd398aac79f06cc7114baa633096189d5a37", default-features = false, features = ["rust_native_crypto", "file_io"] }
+c2pa = { git = "https://github.com/streamplace/c2pa-rs.git", rev = "81d737bd", default-features = false, features = ["rust_native_crypto", "file_io"] }
+mp4-atom = { git = "https://github.com/streamplace/mp4-atom.git", branch = "streamplace" }
 clap = { version = "4", features = ["derive"] }
 # ES256K signing is wired through CallbackSigner — c2pa-rs's
 # rust_native_crypto path validates ES256K but doesn't sign with it.

@@ -46,7 +46,7 @@ use crate::init::{build_init_segment, catalog_from_moov};
 use crate::push::SegmenterEvent;
 #[cfg(test)]
 use crate::segment::GopSegment;
-use crate::segment::{MUXL_UUID, TrackSamples, flush_track_bufs, record_frame};
+use crate::segment::{TrackSamples, flush_track_bufs, record_frame};
 
 /// Push-based concatenator for merging multiple MUXL fMP4 or flat MP4 files.
 ///
@@ -172,30 +172,29 @@ impl Concatenator {
                     self.state = ConcatState::WaitingForInit;
                 }
                 b"uuid" => {
-                    // A muxl canonical-segment uuid (carrying a DRISL catalog)
-                    // can appear mid-body when the input was produced by our
-                    // own writers. It's informational at the concat layer —
-                    // we re-mint the canonical-segment prefix from
-                    // `current_catalog` at flush time — so skip it silently
-                    // rather than treating it as a file boundary.
-                    let is_muxl_uuid =
-                        box_data.len() >= 24 && box_data[8..24] == MUXL_UUID;
-                    if is_muxl_uuid {
-                        // intentional no-op
-                    } else {
-                        match &self.state {
-                            ConcatState::WaitingForInit => {
-                                // UUID in init section — capture for later
-                                self.pending_uuid = Some(box_data);
-                            }
-                            ConcatState::Streaming(_) => {
-                                // Non-muxl uuid during streaming — treat as
-                                // new fMP4's init (e.g. c2pa signing wrapper).
-                                self.flush_segment_into(&mut events)?;
-                                self.pending_uuid = Some(box_data);
-                                self.envelope_remaining = None;
-                                self.state = ConcatState::WaitingForInit;
-                            }
+                    // Two uuid shapes appear in muxl files:
+                    //   - muxl canonical-segment uuid (DRISL catalog) at
+                    //     the head of each canonical segment.
+                    //   - c2pa-uuid carrying a manifest: at the file head
+                    //     (wrapper signature) when in WaitingForInit, or
+                    //     mid-body (per-canonical-segment signature) when
+                    //     in Streaming. Other uuid identifiers are
+                    //     ignored.
+                    //
+                    // Concat re-mints the canonical-segment prefix from
+                    // `current_catalog` at flush time, so muxl uuids in
+                    // body are no-ops. c2pa-uuids in body are likewise
+                    // no-ops at this layer — preserving them per-segment
+                    // is a future signing-layer concern; for now we drop
+                    // them and leave wrapper-level signature pass-through
+                    // via `pending_uuid` for the WaitingForInit path.
+                    match &self.state {
+                        ConcatState::WaitingForInit => {
+                            self.pending_uuid = Some(box_data);
+                        }
+                        ConcatState::Streaming(_) => {
+                            // Both muxl and c2pa per-segment uuids are
+                            // informational in body — silently skip.
                         }
                     }
                 }

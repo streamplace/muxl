@@ -1,12 +1,18 @@
-//! Per-track signing + ingredient combine.
+//! Per-canonical-segment signing + wrapper signing.
 //!
-//! Splits a multi-track [`muxl::Source`] into per-track flat MP4s, signs
-//! each one independently with c2pa-rs, and combines the signed per-track
-//! assets as `Ingredient`s in a wrapper signed flat MP4. The result is a
-//! multi-track flat MP4 whose top-level manifest covers cross-track
-//! claims and whose per-track ingredient manifests verify each track in
-//! isolation — losing a track only invalidates that ingredient, not the
-//! wrapper signature or the surviving tracks.
+//! Each canonical segment (one track's fragments for one GoP, prefixed by
+//! the muxl uuid + DRISL catalog) is treated as a standalone .m4s asset
+//! and signed independently with c2pa-rs. Output is a multi-track flat MP4
+//! whose body bytes are `[c2pa-uuid + muxl-uuid + moof+mdat]*` per
+//! canonical segment. A wrapper c2pa-uuid at the file head signs the
+//! synthesized ftyp+moov+mdat-envelope assembly.
+//!
+//! Signature semantics: the per-canonical-segment hash covers exactly the
+//! canonical muxl bytes — `s2pa(muxl(data))`. The wrapper hash covers
+//! everything in the assembly (auto-c2pa-default exclusions: /uuid c2pa,
+//! /ftyp, /mfra). Extracting a canonical segment from the body yields a
+//! self-verifying .m4s asset that doesn't depend on the surrounding flat
+//! MP4 wrapper.
 
 use std::io::{Cursor, Read, Write};
 use std::path::Path;
@@ -262,24 +268,20 @@ fn host_sign_callback(data: &[u8], _alg: SigningAlg) -> std::result::Result<Vec<
     Ok(buf)
 }
 
-/// Sign a multi-track [`Source`] per-track and combine.
+/// Sign a multi-track [`Source`] by signing each canonical segment as a
+/// standalone .m4s asset, then signing the assembled flat MP4 wrapper.
 ///
-/// Steps, in order:
-/// 1. For each track in `source.plan.tracks`, write a single-track flat MP4
-///    (via [`Source::filter_to_track`] + [`muxl::flat::write`]) and sign it
-///    with `track_manifest` to produce a per-track signed asset.
-/// 2. Write the multi-track flat MP4 of the original source.
-/// 3. Build a wrapper [`Builder`] from `wrapper_manifest`, attach each
-///    per-track signed asset as a c2pa `Ingredient`, sign, and write the
-///    wrapper bytes to `output`.
+/// Output shape: `ftyp + c2pa-uuid (wrapper) + moov + mdat-envelope {
+/// [c2pa-uuid (segment) + muxl-uuid + moof+mdat]* }`.
 ///
-/// The same `track_manifest` JSON is used for every track in v1; per-track
-/// templating can come later if needed.
+/// `segment_manifest` is applied to every canonical segment.
+/// `wrapper_manifest` is applied to the assembled flat MP4 at the file
+/// level. Both manifests use the same signer.
 pub fn sign_per_track<R, W>(
     source: &Source,
     input: &R,
     signer: &SignerKey,
-    track_manifest: &str,
+    segment_manifest: &str,
     wrapper_manifest: &str,
     output: &mut W,
 ) -> Result<()>
@@ -290,37 +292,29 @@ where
     init_default_settings();
     let c2pa_signer = signer.build()?;
 
-    // 1. Per-track sign — emit + sign one flat MP4 per track.
-    let mut signed_tracks: Vec<(u32, Vec<u8>)> = Vec::with_capacity(source.plan.tracks.len());
-    for track in &source.plan.tracks {
-        let single = source.filter_to_track(track.track_id).ok_or_else(|| {
-            Error::Muxl(muxl::Error::InvalidMp4(format!(
-                "track {} disappeared during filter",
-                track.track_id
-            )))
-        })?;
-        let mut track_buf = Vec::new();
-        muxl::flat::write(&single, input, &mut track_buf)?;
-        let signed = sign_buf(&track_buf, track_manifest, &*c2pa_signer)?;
-        signed_tracks.push((track.track_id, signed));
-    }
+    // 1. Build the unsigned canonical flat MP4. Body bytes are
+    //    `[muxl-uuid + moof+mdat]*` per canonical segment in time-slice
+    //    order, with co64 entries in moov pointing at sample payload
+    //    inside each fragment's inner mdat.
+    let mut unsigned: Vec<u8> = Vec::new();
+    muxl::flat::write(source, input, &mut unsigned)?;
 
-    // 2. Wrapper flat MP4 — covers all tracks together.
-    let mut wrapper_buf = Vec::new();
-    muxl::flat::write(source, input, &mut wrapper_buf)?;
+    // 2. Sign each canonical segment in the body as .m4s. Returns the
+    //    assembled flat MP4 with signed segments and shifted co64 offsets,
+    //    but no wrapper-level c2pa-uuid yet.
+    let with_signed_segments = sign_canonical_segments_in_body(
+        &unsigned,
+        segment_manifest,
+        &*c2pa_signer,
+    )?;
 
-    // 3. Wrapper sign with per-track signed assets as ingredients.
+    // 3. Sign the wrapper at the file level. c2pa-rs inserts its uuid box
+    //    after ftyp; the default BMFF v3 hash assertion excludes
+    //    /uuid(c2pa) + /ftyp + /mfra and covers the rest (moov +
+    //    mdat-envelope, including the per-segment c2pa-uuids inside as
+    //    inert bytes — segment signatures stand on their own).
     let mut builder = Builder::from_json(wrapper_manifest)?;
-    for (track_id, signed_bytes) in &signed_tracks {
-        let ingredient_json = format!(
-            r#"{{"title": "track-{}", "relationship": "componentOf"}}"#,
-            track_id
-        );
-        let mut ingredient_cursor = Cursor::new(signed_bytes.as_slice());
-        builder.add_ingredient_from_stream(ingredient_json, "video/mp4", &mut ingredient_cursor)?;
-    }
-
-    let mut source_cursor = Cursor::new(wrapper_buf);
+    let mut source_cursor = Cursor::new(with_signed_segments);
     let mut output_buf: Vec<u8> = Vec::new();
     let mut dest_cursor = Cursor::new(&mut output_buf);
     builder.sign(
@@ -332,6 +326,246 @@ where
 
     output.write_all(&output_buf)?;
     Ok(())
+}
+
+/// Layout of a parsed top-level flat MP4 (ftyp + moov + mdat-envelope).
+struct FlatMp4Layout {
+    ftyp_end: usize,
+    moov_start: usize,
+    moov_end: usize,
+    mdat_envelope_start: usize,
+    /// `mdat_envelope_start + 16` (we always use the 64-bit largesize form).
+    mdat_payload_start: usize,
+    mdat_payload_end: usize,
+}
+
+/// Walk top-level boxes and identify ftyp, moov, and mdat envelope spans.
+fn parse_flat_mp4_layout(data: &[u8]) -> Result<FlatMp4Layout> {
+    let mut off = 0usize;
+    let mut ftyp_end: Option<usize> = None;
+    let mut moov_range: Option<(usize, usize)> = None;
+    let mut mdat: Option<(usize, usize, usize)> = None; // (env_start, payload_start, env_end)
+
+    while off + 8 <= data.len() {
+        let size_field =
+            u32::from_be_bytes(data[off..off + 4].try_into().unwrap()) as usize;
+        let kind = &data[off + 4..off + 8];
+        let (box_size, header_size) = if size_field == 1 {
+            if off + 16 > data.len() {
+                return Err(Error::Muxl(muxl::Error::InvalidMp4(
+                    "truncated largesize box header".into(),
+                )));
+            }
+            let largesize = u64::from_be_bytes(
+                data[off + 8..off + 16].try_into().unwrap(),
+            ) as usize;
+            (largesize, 16)
+        } else if size_field == 0 {
+            // size=0 means "to end of file"; treat as remainder.
+            (data.len() - off, 8)
+        } else {
+            (size_field, 8)
+        };
+        if off + box_size > data.len() {
+            return Err(Error::Muxl(muxl::Error::InvalidMp4(format!(
+                "box {:?} extends past asset",
+                std::str::from_utf8(kind).unwrap_or("?")
+            ))));
+        }
+        match kind {
+            b"ftyp" => ftyp_end = Some(off + box_size),
+            b"moov" => moov_range = Some((off, off + box_size)),
+            b"mdat" => mdat = Some((off, off + header_size, off + box_size)),
+            _ => {}
+        }
+        off += box_size;
+    }
+
+    let ftyp_end = ftyp_end.ok_or_else(|| {
+        Error::Muxl(muxl::Error::InvalidMp4("no ftyp in flat MP4".into()))
+    })?;
+    let (moov_start, moov_end) = moov_range.ok_or_else(|| {
+        Error::Muxl(muxl::Error::InvalidMp4("no moov in flat MP4".into()))
+    })?;
+    let (mdat_envelope_start, mdat_payload_start, mdat_payload_end) =
+        mdat.ok_or_else(|| {
+            Error::Muxl(muxl::Error::InvalidMp4("no mdat in flat MP4".into()))
+        })?;
+    Ok(FlatMp4Layout {
+        ftyp_end,
+        moov_start,
+        moov_end,
+        mdat_envelope_start,
+        mdat_payload_start,
+        mdat_payload_end,
+    })
+}
+
+/// Walk top-level boxes inside the mdat envelope payload and return the
+/// byte ranges of each canonical segment. A canonical segment runs from a
+/// muxl-uuid box (identified by [`muxl::segment::MUXL_UUID`]) to the start
+/// of the next muxl-uuid (or end of payload).
+fn locate_muxl_canonical_segments(
+    mdat_payload: &[u8],
+) -> Result<Vec<std::ops::Range<usize>>> {
+    let mut chunks: Vec<std::ops::Range<usize>> = Vec::new();
+    let mut current_start: Option<usize> = None;
+    let mut off = 0usize;
+
+    while off + 8 <= mdat_payload.len() {
+        let size_field =
+            u32::from_be_bytes(mdat_payload[off..off + 4].try_into().unwrap())
+                as usize;
+        let kind = &mdat_payload[off + 4..off + 8];
+        let (box_size, header_size) = if size_field == 1 {
+            if off + 16 > mdat_payload.len() {
+                return Err(Error::Muxl(muxl::Error::InvalidMp4(
+                    "truncated largesize box header inside mdat".into(),
+                )));
+            }
+            let largesize = u64::from_be_bytes(
+                mdat_payload[off + 8..off + 16].try_into().unwrap(),
+            ) as usize;
+            (largesize, 16)
+        } else if size_field == 0 {
+            (mdat_payload.len() - off, 8)
+        } else {
+            (size_field, 8)
+        };
+        if off + box_size > mdat_payload.len() {
+            return Err(Error::Muxl(muxl::Error::InvalidMp4(format!(
+                "box inside mdat extends past payload (off={off}, size={box_size})"
+            ))));
+        }
+        if kind == b"uuid"
+            && box_size >= header_size + 16
+            && mdat_payload[off + header_size..off + header_size + 16]
+                == muxl::segment::MUXL_UUID
+        {
+            if let Some(start) = current_start {
+                chunks.push(start..off);
+            }
+            current_start = Some(off);
+        }
+        off += box_size;
+    }
+    if let Some(start) = current_start {
+        chunks.push(start..mdat_payload.len());
+    }
+    Ok(chunks)
+}
+
+/// Sign each canonical segment in `unsigned`'s mdat envelope as .m4s and
+/// return the reassembled flat MP4 with shifted co64 entries. The output
+/// has no wrapper-level c2pa-uuid (caller wraps separately).
+fn sign_canonical_segments_in_body(
+    unsigned: &[u8],
+    segment_manifest: &str,
+    c2pa_signer: &dyn C2paSigner,
+) -> Result<Vec<u8>> {
+    use mp4_atom::{Header, Moov, ReadAtom, ReadFrom, WriteTo};
+
+    let layout = parse_flat_mp4_layout(unsigned)?;
+    let mdat_payload = &unsigned[layout.mdat_payload_start..layout.mdat_payload_end];
+    let chunks = locate_muxl_canonical_segments(mdat_payload)?;
+    if chunks.is_empty() {
+        return Err(Error::Muxl(muxl::Error::InvalidMp4(
+            "no canonical segments found in mdat envelope".into(),
+        )));
+    }
+
+    // Sign each canonical segment as .m4s.
+    let mut signed_chunks: Vec<Vec<u8>> = Vec::with_capacity(chunks.len());
+    let mut prefix_size: Option<usize> = None;
+    for chunk_range in &chunks {
+        let chunk_bytes = &mdat_payload[chunk_range.clone()];
+        let signed = sign_buf_as(chunk_bytes, segment_manifest, c2pa_signer, "m4s")?;
+        let this_prefix = signed
+            .len()
+            .checked_sub(chunk_bytes.len())
+            .ok_or_else(|| {
+                Error::Muxl(muxl::Error::InvalidMp4(
+                    "signed canonical segment shorter than unsigned".into(),
+                ))
+            })?;
+        match prefix_size {
+            None => prefix_size = Some(this_prefix),
+            Some(p) if p == this_prefix => {}
+            Some(p) => {
+                return Err(Error::Muxl(muxl::Error::InvalidMp4(format!(
+                    "per-segment c2pa-uuid size drift: expected {p}, got {this_prefix}"
+                ))));
+            }
+        }
+        signed_chunks.push(signed);
+    }
+    let prefix_size = prefix_size.unwrap_or(0);
+
+    // Shift co64 entries in moov to account for the c2pa-uuid prefix
+    // prepended to each canonical segment. For each entry at byte offset
+    // O_unsigned in the unsigned file, the new offset is
+    // O_unsigned + chunks_before(O_unsigned) * prefix_size, where
+    // chunks_before(O) counts canonical-segment chunks whose start (in
+    // unsigned file coordinates) is <= O.
+    let chunk_starts_unsigned: Vec<u64> = chunks
+        .iter()
+        .map(|r| (layout.mdat_payload_start + r.start) as u64)
+        .collect();
+    let entry_shift_for = |off: u64| -> u64 {
+        let chunks_before =
+            chunk_starts_unsigned.iter().filter(|&&s| s <= off).count() as u64;
+        chunks_before * prefix_size as u64
+    };
+
+    let moov_bytes = &unsigned[layout.moov_start..layout.moov_end];
+    let mut cursor = Cursor::new(moov_bytes);
+    let header = <Option<Header> as ReadFrom>::read_from(&mut cursor)
+        .map_err(|e| Error::Muxl(muxl::Error::InvalidMp4(e.to_string())))?
+        .ok_or_else(|| {
+            Error::Muxl(muxl::Error::InvalidMp4("empty moov header".into()))
+        })?;
+    let mut moov = Moov::read_atom(&header, &mut cursor)
+        .map_err(|e| Error::Muxl(muxl::Error::InvalidMp4(e.to_string())))?;
+
+    for trak in &mut moov.trak {
+        if let Some(co64) = &mut trak.mdia.minf.stbl.co64 {
+            for entry in &mut co64.entries {
+                *entry += entry_shift_for(*entry);
+            }
+        }
+    }
+
+    let mut new_moov_buf: Vec<u8> = Vec::new();
+    moov.write_to(&mut new_moov_buf)
+        .map_err(|e| Error::Muxl(muxl::Error::InvalidMp4(e.to_string())))?;
+    if new_moov_buf.len() != moov_bytes.len() {
+        return Err(Error::Muxl(muxl::Error::InvalidMp4(format!(
+            "moov size changed during co64 shift: {} -> {}",
+            moov_bytes.len(),
+            new_moov_buf.len()
+        ))));
+    }
+
+    // Assemble: ftyp + new_moov + new mdat envelope { signed canonical segments }.
+    let new_mdat_payload_size: u64 =
+        signed_chunks.iter().map(|s| s.len() as u64).sum();
+    let new_largesize = 16 + new_mdat_payload_size;
+    let total_capacity = layout.ftyp_end
+        + new_moov_buf.len()
+        + 16
+        + new_mdat_payload_size as usize;
+
+    let mut out: Vec<u8> = Vec::with_capacity(total_capacity);
+    out.extend_from_slice(&unsigned[..layout.ftyp_end]);
+    out.extend_from_slice(&new_moov_buf);
+    out.extend_from_slice(&1u32.to_be_bytes());
+    out.extend_from_slice(b"mdat");
+    out.extend_from_slice(&new_largesize.to_be_bytes());
+    for signed in &signed_chunks {
+        out.extend_from_slice(signed);
+    }
+    let _ = layout.mdat_envelope_start; // (kept in struct for documentation)
+    Ok(out)
 }
 
 /// Stream-sign an fMP4 source: consume `input` (an fMP4 byte stream from
@@ -458,11 +692,16 @@ fn sign_one_gop_fmp4(
 /// `Cursor`-backed buffers — c2pa-rs needs `Read+Seek` on input and
 /// `Write+Read+Seek` on output, neither of which our caller's `&mut W:
 /// Write` satisfies on its own.
-fn sign_buf(input: &[u8], manifest: &str, signer: &dyn C2paSigner) -> Result<Vec<u8>> {
+fn sign_buf_as(
+    input: &[u8],
+    manifest: &str,
+    signer: &dyn C2paSigner,
+    format: &str,
+) -> Result<Vec<u8>> {
     let mut builder = Builder::from_json(manifest)?;
     let mut source_cursor = Cursor::new(input);
     let mut output_buf: Vec<u8> = Vec::new();
     let mut dest_cursor = Cursor::new(&mut output_buf);
-    builder.sign(signer, "video/mp4", &mut source_cursor, &mut dest_cursor)?;
+    builder.sign(signer, format, &mut source_cursor, &mut dest_cursor)?;
     Ok(output_buf)
 }

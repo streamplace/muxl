@@ -82,116 +82,83 @@ pub fn write<R: ReadAt + ?Sized, W: Write>(
 ) -> Result<Vec<crate::hls::BlobTrack>> {
     use crate::cid;
     use crate::error::Error;
-    use crate::fragment::{extract_flat_track_info, write_frame_fragment};
+    use crate::flat::compute_gop_partition;
+    use crate::fragment::{FrameInfo, write_frame_fragment};
     use crate::hls::{BlobSegment, BlobTrack};
-    use crate::io::ReadAtCursor;
 
-    // Re-parse the moov from `input` for the per-sample layout (co64 /
-    // chunk offsets live there). Per-track leading offsets come from the
-    // already-normalized `source.plan` instead — that's how this path
-    // picks up the same canonical normalization that `flat::write`
-    // produces. See `canonical-form.md § edts/elst`.
-    let mut cursor = ReadAtCursor::new(input).map_err(Error::Io)?;
-    let catalog = crate::init::catalog_from_mp4(&mut cursor)?;
+    let catalog = source.catalog.clone();
     let init = crate::init::build_init_segment(&catalog)?;
-    let moov = crate::init::read_moov(&mut cursor)?;
     let track_inits = crate::init::build_track_init_segments(&catalog)?;
 
-    let mut track_ids: Vec<u32> = moov.trak.iter().map(|t| t.tkhd.track_id).collect();
-    track_ids.sort();
-
     output.write_all(&init)?;
-    let mut write_offset = init.len() as u64;
+    let init_len = init.len() as u64;
+    let mut write_offset = init_len;
 
-    let mut tracks: Vec<BlobTrack> = Vec::new();
+    // Plans sorted by track_id (Plan::new already does this; defensive sort).
+    let mut ordered_plans: Vec<&crate::source::TrackPlan> = source.plan.tracks.iter().collect();
+    ordered_plans.sort_by_key(|p| p.track_id);
+    let gop_partition = compute_gop_partition(&ordered_plans);
+    let gop_count = gop_partition.first().map(|v| v.len()).unwrap_or(0);
 
-    for &tid in &track_ids {
-        let trak = moov
-            .trak
-            .iter()
-            .find(|t| t.tkhd.track_id == tid)
-            .ok_or_else(|| Error::InvalidMp4(format!("track {tid} not found")))?;
-        let samples = extract_flat_track_info(trak)?;
-        // Pull the canonical (normalized) leading offset from the plan, so
-        // fragmented and flat outputs of the same source agree on
-        // first-fragment tfdts.
-        let mut decode_time: u64 = source
-            .plan
-            .track(tid)
-            .map(|p| p.start_offset_ticks)
-            .unwrap_or(0);
-        let mut segments: Vec<BlobSegment> = Vec::new();
-        let mut cur_seg_offset = write_offset;
-        let mut cur_seg_size: u64 = 0;
-        let mut cur_seg_dur: u64 = 0;
-        let mut cur_seg_samples: u32 = 0;
+    // Per-track running decode times so each sample's first-fragment tfdt is
+    // start_offset_ticks + cumulative durations (matching flat-MP4 emission).
+    let mut per_track_decode_time: Vec<u64> =
+        ordered_plans.iter().map(|p| p.start_offset_ticks).collect();
+    // Per-track HLS BlobSegments — one per GoP, in GoP order.
+    let mut per_track_segments: Vec<Vec<BlobSegment>> =
+        (0..ordered_plans.len()).map(|_| Vec::new()).collect();
 
-        let is_video = catalog.video_configs().any(|v| v.track_id() == tid);
-        let ts = if is_video {
-            catalog
-                .video_configs()
-                .find(|v| v.track_id() == tid)
-                .map(|v| v.timescale())
-                .unwrap_or(1)
-        } else {
-            catalog
-                .audio_configs()
-                .find(|a| a.track_id() == tid)
-                .map(|a| a.timescale())
-                .unwrap_or(1)
-        };
-        // Video: flush at each keyframe. Audio: flush every ~2s.
-        let audio_target_ticks = ts as u64 * 2;
+    for gop in 0..gop_count {
+        for (ti, plan) in ordered_plans.iter().enumerate() {
+            let range = gop_partition[ti][gop].clone();
+            if range.is_empty() {
+                continue;
+            }
+            let seg_offset = write_offset;
+            let mut seg_size: u64 = 0;
+            let mut seg_dur: u64 = 0;
+            let mut seg_samples: u32 = 0;
 
-        for sample in &samples {
-            let should_flush = if is_video {
-                sample.frame.is_sync && cur_seg_size > 0
-            } else {
-                cur_seg_dur >= audio_target_ticks
-            };
-
-            if should_flush {
-                segments.push(BlobSegment {
-                    offset: cur_seg_offset,
-                    size: cur_seg_size,
-                    duration_ticks: cur_seg_dur,
-                    sample_count: cur_seg_samples,
-                });
-                cur_seg_offset = write_offset;
-                cur_seg_size = 0;
-                cur_seg_dur = 0;
-                cur_seg_samples = 0;
+            for si in range {
+                let sample = &plan.samples[si];
+                let frame = FrameInfo {
+                    duration: sample.duration,
+                    size: sample.size,
+                    is_sync: sample.is_sync,
+                    cts_offset: sample.cts_offset,
+                };
+                let mut data = vec![0u8; sample.size as usize];
+                input
+                    .read_exact_at(sample.input_offset, &mut data)
+                    .map_err(Error::Io)?;
+                let bytes_written = write_frame_fragment(
+                    output,
+                    plan.track_id,
+                    per_track_decode_time[ti],
+                    &frame,
+                    &data,
+                )?;
+                seg_size += bytes_written;
+                seg_dur += sample.duration as u64;
+                seg_samples += 1;
+                write_offset += bytes_written;
+                per_track_decode_time[ti] += sample.duration as u64;
             }
 
-            let mut data = vec![0u8; sample.frame.size as usize];
-            input
-                .read_exact_at(sample.file_offset, &mut data)
-                .map_err(Error::Io)?;
-
-            let bytes_written = write_frame_fragment(
-                output,
-                tid,
-                decode_time,
-                &sample.frame,
-                &data,
-            )?;
-
-            cur_seg_size += bytes_written;
-            cur_seg_dur += sample.frame.duration as u64;
-            cur_seg_samples += 1;
-            write_offset += bytes_written;
-            decode_time += sample.frame.duration as u64;
-        }
-
-        if cur_seg_size > 0 {
-            segments.push(BlobSegment {
-                offset: cur_seg_offset,
-                size: cur_seg_size,
-                duration_ticks: cur_seg_dur,
-                sample_count: cur_seg_samples,
+            per_track_segments[ti].push(BlobSegment {
+                offset: seg_offset,
+                size: seg_size,
+                duration_ticks: seg_dur,
+                sample_count: seg_samples,
             });
         }
+    }
 
+    let mut tracks: Vec<BlobTrack> = Vec::with_capacity(ordered_plans.len());
+    for (ti, plan) in ordered_plans.iter().enumerate() {
+        let tid = plan.track_id;
+        let ts = plan.timescale;
+        let segments = std::mem::take(&mut per_track_segments[ti]);
         let init_data = track_inits.get(&tid).cloned().unwrap_or_default();
         let init_cid = cid::from_bytes(&init_data);
 

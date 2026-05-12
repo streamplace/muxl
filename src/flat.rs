@@ -6,8 +6,14 @@
 //! ftyp
 //! moov       (populated sample tables; NO mvex; faststart)
 //! mdat       (64-bit largesize envelope)
-//!   [moof+mdat pairs, grouped by track_id asc]
+//!   [GoP 1: track 1 samples, track 2 samples, ...]
+//!   [GoP 2: track 1 samples, track 2 samples, ...]
+//!   ...
 //! ```
+//!
+//! Time-slice interleaved: each GoP's bytes for all tracks are contiguous
+//! before the next GoP. GoP boundaries follow the canonical segmentation
+//! rule (video keyframes; 1-second buckets if audio-only).
 //!
 //! Two views of the same bytes:
 //!
@@ -653,12 +659,103 @@ pub fn plan_from_flat_mp4<R: ReadAt + ?Sized>(
     Ok((catalog, plans))
 }
 
+/// Per-track-per-GoP sample index ranges, in time-slice write order.
+///
+/// `per_track_per_gop[track_index][gop_index]` is a half-open range into
+/// `plans[track_index].samples`. GoP boundaries follow the canonical
+/// segmentation rule:
+/// - If any track is video, GoPs start at each video sync sample.
+/// - If audio-only, GoPs are 1-second wall-clock buckets in the first
+///   track's timescale.
+pub(crate) fn compute_gop_partition(plans: &[&TrackPlan]) -> Vec<Vec<std::ops::Range<usize>>> {
+    if plans.is_empty() {
+        return Vec::new();
+    }
+
+    // Reference track: first video track if present, else first track.
+    let ref_idx = plans.iter().position(|p| p.is_video).unwrap_or(0);
+    let ref_track = plans[ref_idx];
+    let ref_ts = ref_track.timescale.max(1) as u64;
+
+    // GoP start indices in the reference track.
+    let gop_start_indices: Vec<usize> = if ref_track.is_video {
+        let mut idxs: Vec<usize> = ref_track
+            .samples
+            .iter()
+            .enumerate()
+            .filter(|(_, s)| s.is_sync)
+            .map(|(i, _)| i)
+            .collect();
+        if idxs.first().copied() != Some(0) {
+            idxs.insert(0, 0);
+        }
+        idxs
+    } else {
+        // No video: 1-second buckets in reference track's timescale.
+        let mut idxs = vec![0usize];
+        let mut dt: u64 = ref_track.start_offset_ticks;
+        let bucket = ref_ts;
+        let mut next_boundary = ref_track.start_offset_ticks + bucket;
+        for (i, s) in ref_track.samples.iter().enumerate() {
+            if dt >= next_boundary {
+                idxs.push(i);
+                next_boundary = ref_track.start_offset_ticks + (idxs.len() as u64) * bucket;
+            }
+            dt += s.duration as u64;
+        }
+        idxs
+    };
+
+    let gop_count = gop_start_indices.len().max(1);
+
+    // Absolute decode times of GoP starts, in microseconds (for cross-track
+    // comparison across differing media timescales).
+    let mut gop_start_us: Vec<u128> = Vec::with_capacity(gop_count);
+    {
+        let mut dt: u64 = ref_track.start_offset_ticks;
+        let mut next_gop = 0usize;
+        for (i, s) in ref_track.samples.iter().enumerate() {
+            if next_gop < gop_start_indices.len() && i == gop_start_indices[next_gop] {
+                gop_start_us.push((dt as u128) * 1_000_000 / ref_ts as u128);
+                next_gop += 1;
+            }
+            dt += s.duration as u64;
+        }
+        // Pad with sentinels if reference was shorter than expected.
+        while gop_start_us.len() < gop_count {
+            gop_start_us.push(u128::MAX);
+        }
+    }
+
+    let mut per_track_per_gop: Vec<Vec<std::ops::Range<usize>>> =
+        Vec::with_capacity(plans.len());
+    for plan in plans {
+        let ts = plan.timescale.max(1) as u64;
+        let mut ranges = vec![0..0usize; gop_count];
+        let mut gi = 0usize;
+        let mut dt: u64 = plan.start_offset_ticks;
+        let mut gop_start_sample = 0usize;
+        for (si, s) in plan.samples.iter().enumerate() {
+            let sample_us = (dt as u128) * 1_000_000 / ts as u128;
+            while gi + 1 < gop_count && sample_us >= gop_start_us[gi + 1] {
+                ranges[gi] = gop_start_sample..si;
+                gi += 1;
+                gop_start_sample = si;
+            }
+            dt += s.duration as u64;
+        }
+        ranges[gi] = gop_start_sample..plan.samples.len();
+        per_track_per_gop.push(ranges);
+    }
+    per_track_per_gop
+}
+
 /// Write a canonical MUXL flat MP4.
 ///
-/// Inner moof+mdat pairs are grouped by track_id ascending. Per-sample
+/// Body layout is time-slice interleaved: for each GoP, all tracks'
+/// samples in `track_id`-ascending order, then the next GoP. Per-sample
 /// `co64` entries in the moov point directly at sample bytes inside the
-/// inner mdats, making the file a valid flat MP4 to parsers that don't
-/// peer into the mdat envelope.
+/// inner mdats. Spec: canonical-form.md § MUXL Flat MP4.
 pub fn write_flat_mp4<R: ReadAt + ?Sized, W: Write>(
     catalog: &Catalog,
     plans: &[TrackPlan],
@@ -667,6 +764,8 @@ pub fn write_flat_mp4<R: ReadAt + ?Sized, W: Write>(
 ) -> Result<FlatMp4Info> {
     let mut ordered: Vec<&TrackPlan> = plans.iter().collect();
     ordered.sort_by_key(|p| p.track_id);
+    let gop_partition = compute_gop_partition(&ordered);
+    let gop_count = gop_partition.first().map(|v| v.len()).unwrap_or(0);
 
     // Per-track leading offsets are taken at face value: each track's
     // start_offset_ticks is baked into its first-fragment tfdt and (for
@@ -782,41 +881,54 @@ pub fn write_flat_mp4<R: ReadAt + ?Sized, W: Write>(
     const ENVELOPE_HEADER_SIZE: u64 = 16; // size=1 + "mdat" + 8-byte largesize
     let mdat_payload_offset = ftyp_size + moov_size + ENVELOPE_HEADER_SIZE;
 
-    // Compute per-sample absolute offsets now that mdat_payload_offset is known.
-    // Also build the per-track fragment metadata that HLS needs.
+    // Compute per-sample absolute offsets in time-slice write order: for each
+    // GoP, all tracks' samples in track_id-ascending order, then the next GoP.
+    // co64 entries are appended per-track in natural sample order (since each
+    // track's samples within a GoP are decode-ordered and GoPs are time-sorted).
     let mut running = mdat_payload_offset;
+    let mut per_track_co64: Vec<Vec<u64>> =
+        (0..ordered.len()).map(|i| Vec::with_capacity(ordered[i].samples.len())).collect();
+    let mut per_track_fragments: Vec<Vec<FlatFragment>> =
+        (0..ordered.len()).map(|i| Vec::with_capacity(ordered[i].samples.len())).collect();
+    let mut per_track_first_offset: Vec<Option<u64>> = vec![None; ordered.len()];
+
+    for gop in 0..gop_count {
+        for (ti, plan) in ordered.iter().enumerate() {
+            let range = gop_partition[ti][gop].clone();
+            for si in range {
+                let moof_size = per_sample_moof_sizes[ti][si];
+                let sample_offset = running + moof_size as u64 + 8;
+                per_track_co64[ti].push(sample_offset);
+                let sample = &plan.samples[si];
+                let frag_size = moof_size as u64 + 8 + sample.size as u64;
+                per_track_fragments[ti].push(FlatFragment {
+                    offset: running,
+                    size: frag_size,
+                    duration: sample.duration,
+                    sample_size: sample.size,
+                    is_sync: sample.is_sync,
+                });
+                if per_track_first_offset[ti].is_none() {
+                    per_track_first_offset[ti] = Some(running);
+                }
+                running += frag_size;
+            }
+        }
+    }
+
     let mut track_info: std::collections::BTreeMap<u32, FlatTrackInfo> =
         std::collections::BTreeMap::new();
     for (ti, plan) in ordered.iter().enumerate() {
-        let track_start = running;
-        let n = plan.samples.len();
-        let mut co64_entries = Vec::with_capacity(n);
-        let mut fragments = Vec::with_capacity(n);
-        for si in 0..n {
-            let moof_size = per_sample_moof_sizes[ti][si];
-            let sample_offset = running + moof_size as u64 + 8;
-            co64_entries.push(sample_offset);
-            let sample = &plan.samples[si];
-            let frag_size = moof_size as u64 + 8 + sample.size as u64;
-            fragments.push(FlatFragment {
-                offset: running,
-                size: frag_size,
-                duration: sample.duration,
-                sample_size: sample.size,
-                is_sync: sample.is_sync,
-            });
-            running += frag_size;
-        }
         moov.trak[ti].mdia.minf.stbl.co64 = Some(Co64 {
-            entries: co64_entries,
+            entries: std::mem::take(&mut per_track_co64[ti]),
         });
         track_info.insert(
             plan.track_id,
             FlatTrackInfo {
                 is_video: plan.is_video,
                 timescale: track_ts[ti],
-                track_offset: track_start,
-                fragments,
+                track_offset: per_track_first_offset[ti].unwrap_or(mdat_payload_offset),
+                fragments: std::mem::take(&mut per_track_fragments[ti]),
             },
         );
     }
@@ -843,29 +955,46 @@ pub fn write_flat_mp4<R: ReadAt + ?Sized, W: Write>(
     output.write_all(b"mdat")?;
     output.write_all(&largesize.to_be_bytes())?;
 
-    // Write inner moof+mdat pairs. mfhd.sequence_number is 0 on every fragment.
-    let mut io_buf = vec![0u8; 256 * 1024];
-    for (ti, plan) in ordered.iter().enumerate() {
-        let mut dt: u64 = plan.start_offset_ticks;
-        for (si, sample) in plan.samples.iter().enumerate() {
-            let size = sample.size as usize;
-            if io_buf.len() < size {
-                io_buf.resize(size, 0);
+    // Write inner moof+mdat pairs in time-slice order (matching pass 2 above).
+    // Per-sample decode times are precomputed in natural sample order; we look
+    // them up by (track_index, sample_index).
+    let per_track_sample_decode_times: Vec<Vec<u64>> = ordered
+        .iter()
+        .map(|plan| {
+            let mut times = Vec::with_capacity(plan.samples.len());
+            let mut dt: u64 = plan.start_offset_ticks;
+            for s in &plan.samples {
+                times.push(dt);
+                dt += s.duration as u64;
             }
-            input
-                .read_exact_at(sample.input_offset, &mut io_buf[..size])
-                .map_err(Error::Io)?;
+            times
+        })
+        .collect();
 
-            write_frame_pair(
-                output,
-                plan.track_id,
-                dt,
-                sample,
-                &io_buf[..size],
-                per_sample_moof_sizes[ti][si],
-            )?;
+    let mut io_buf = vec![0u8; 256 * 1024];
+    for gop in 0..gop_count {
+        for (ti, plan) in ordered.iter().enumerate() {
+            let range = gop_partition[ti][gop].clone();
+            for si in range {
+                let sample = &plan.samples[si];
+                let dt = per_track_sample_decode_times[ti][si];
+                let size = sample.size as usize;
+                if io_buf.len() < size {
+                    io_buf.resize(size, 0);
+                }
+                input
+                    .read_exact_at(sample.input_offset, &mut io_buf[..size])
+                    .map_err(Error::Io)?;
 
-            dt += sample.duration as u64;
+                write_frame_pair(
+                    output,
+                    plan.track_id,
+                    dt,
+                    sample,
+                    &io_buf[..size],
+                    per_sample_moof_sizes[ti][si],
+                )?;
+            }
         }
     }
 

@@ -1,146 +1,154 @@
 # MUXL Canonical Form Specification
 
-This document defines the canonical byte layout for MUXL segments and derived formats.
+This document defines the canonical byte layout for MUXL. The formal specification is at [dasl.ing/muxl](https://dasl.ing/muxl); this file mirrors the byte-level rules for implementers working in the muxl repository.
 
 All choices are provisional and subject to revision after playback testing.
 
-## MUXL Segment
+## Layered Model
 
-A MUXL segment contains one track's data for one GoP. Each frame gets its own moof+mdat pair. Segments are per-track — a GoP with N tracks produces N segments.
+MUXL is a three-layer stack:
 
-```
-Segment (track 1, GoP 1):
-  moof(frame 1) + mdat(frame 1)
-  moof(frame 2) + mdat(frame 2)
-  ...
+- **MUXL fragment** — one encoded sample (video frame or audio packet) in a minimal `moof+mdat` pair. The smallest unit. Bit-identical regardless of how it's transported or stored.
+- **MUXL canonical segment** — a `uuid` box (c2pa-shaped, carrying the per-track catalog as a signed assertion) followed by one track's fragments for one GoP. The unit of content addressing, signing, and verification.
+- **Synthesized storage format** — fMP4 (appendable) or flat MP4 (finalized faststart) wrapping N canonical segments together with a derived ISOBMFF header. The header is synthesized from the segments' embedded catalogs. Canonical segments are recoverable byte-for-byte from any storage format.
 
-Segment (track 2, GoP 1):
-  moof(frame 1) + mdat(frame 1)
-  moof(frame 2) + mdat(frame 2)
-  ...
-```
+## MUXL Fragment
 
-Per-track segments enable byte-range addressing (HLS playlists can index a single MUXL fMP4 file) and independent per-track content hashing. Segments for the same track are blindly concatenatable by byte appending.
-
-Track initialization metadata (codec config, timescales) is out-of-band — either in the MUXL fMP4 file's init segment or from an external source.
-
-### Segmentation Rule
-
-Segment boundaries are driven by video sync samples (keyframes). Audio samples are grouped with the video GoP they temporally overlap. Given the same samples with the same timestamps, the segment boundaries are always identical.
+One sample, one `moof+mdat` pair.
 
 ### moof
 
-Each moof covers exactly one sample (frame) from one track.
+Each moof covers exactly one sample from one track.
 
-- **mfhd**: sequence_number, 1-based, incrementing globally across the stream
-- **traf**: exactly one per moof
-  - **tfhd**: track_id; flags = `default_base_is_moof`; no default sample values (all explicit in trun)
-  - **tfdt**: base_media_decode_time in the track's media timescale
-  - **trun**: exactly one entry; flags = `data_offset | sample_duration | sample_size | sample_flags`; add `sample_cts` flag if the sample has a non-zero composition time offset
+- **mfhd**: `sequence_number`, 1-based, incrementing per fragment within a segment (restarts at 1 each segment).
+- **traf**: exactly one per moof.
+  - **tfhd**: `track_id`; flags = `default_base_is_moof`; no default sample values (all explicit in trun).
+  - **tfdt**: `base_media_decode_time` in the track's media timescale, carrying the absolute media time of this sample in the track's stream timeline.
+  - **trun**: exactly one entry; flags = `data_offset | sample_duration | sample_size | sample_flags`; add `sample_cts` flag if the sample has a non-zero composition time offset.
 
 ### trun Sample Flags
 
-- Sync sample: `0x02000000` (sample_depends_on = 2: depends on no other sample)
-- Non-sync sample: `0x01010000` (sample_depends_on = 1: depends on others; sample_is_non_sync = 1)
+- Sync sample: `0x02000000` (`sample_depends_on = 2`: depends on no other sample).
+- Non-sync sample: `0x01010000` (`sample_depends_on = 1`: depends on others; `sample_is_non_sync = 1`).
 
 ### mdat
 
 One mdat per moof, containing exactly one sample's data.
 
-## MUXL fMP4
+## MUXL Canonical Segment
 
-Init segment followed by per-track segments grouped by track.
+A canonical segment is the unit of signing, content addressing, and verification.
+
+### Structure
 
 ```
-ftyp
-moov (init — track config, empty sample tables)
-[track 1 segments: GoP 1, GoP 2, ...]
-[track 2 segments: GoP 1, GoP 2, ...]
+uuid (c2pa manifest box; uuid = d8fec3d6-1b0e-483c-9221-eaf68bcca8d4)
+moof+mdat (sample 1)
+moof+mdat (sample 2)
+...
+moof+mdat (sample K)
+```
+
+Each canonical segment carries fragments for exactly one track and one GoP. A multi-track GoP produces multiple canonical segments — one per track.
+
+### Manifest Assertions
+
+The c2pa manifest's claim signature covers all of its assertions. Required:
+
+1. **Catalog assertion** — label `dasl.muxl.catalog`. A DRISL-encoded single-track MUXL catalog (one entry in `video.renditions` *or* one entry in `audio.renditions`, never both).
+2. **BMFF v3 hash assertion** — covers the byte range from the end of the `uuid` box through the end of the segment, hashing the `moof+mdat` run.
+
+Additional assertions (provenance attribution, custom Streamplace metadata, other s2pa assertions) may follow. All are covered by the claim signature.
+
+Tampering detection:
+- Modifying the catalog changes the catalog assertion's hash → invalidates the claim signature.
+- Modifying any fragment changes the moof+mdat bytes → invalidates the hash assertion → invalidates the claim signature.
+
+The two assertions together pin both "what this stream is" (codec configuration) and "what these samples are" (encoded bytes) into a single signed unit. Verification does not require reconstructing a flat MP4 — the hash is computed directly over the segment's trailing byte range.
+
+### Unsigned Segments
+
+A canonical segment may be unsigned: the manifest is present with its required assertions but no signature claim. The `uuid` box is *always* present — never omitted — so segment boundaries are unambiguous at the byte level.
+
+### Segmentation Rule
+
+Segment boundaries are driven by video sync samples (keyframes). A new segment begins at each video keyframe. Audio samples are grouped with the video GoP they temporally overlap.
+
+For audio-only streams (no video reference), segments are 1-second wall-clock spans.
+
+Given the same samples with the same timestamps, segment boundaries are always identical.
+
+### Per-Segment Properties
+
+- **`mfhd.sequence_number`**: per-segment, restarting at 1 for each segment's first fragment. Within a segment, sequence numbers increment monotonically. Storage-format synthesizers may rewrite to globally monotonic if a downstream player demands it; the canonical segment bytes remain per-segment-anchored.
+- **`tfdt.base_media_decode_time`**: absolute media time of the segment's first sample in the track's stream timeline. Preserved verbatim across storage-format round-trips.
+
+### Round-Trip Property
+
+A canonical segment's bytes are recoverable byte-for-byte from any storage format by stripping the synthesized header and splitting on `uuid` boundaries. This is what lets c2pa signatures survive storage-format conversion.
+
+## Synthesized Storage Formats
+
+Two storage formats wrap N canonical segments with a derived ISOBMFF header. The header is synthesized from the embedded catalogs; the segments' bytes are concatenated verbatim into the body.
+
+### Interleaving Order
+
+Canonical segments are written in time-slice order — for each GoP, all tracks' segments are concatenated contiguously before moving to the next GoP:
+
+```
+GoP 1: [track 1 segment][track 2 segment]...
+GoP 2: [track 1 segment][track 2 segment]...
 ...
 ```
 
-Valid fMP4 file. Each track's segments form a contiguous byte range, enabling HLS byte-range playlists to address individual tracks within a single file. Tracks are ordered by track_id ascending.
+Within a GoP, tracks are ordered by `track_id` ascending. This matches HLS byte-range CMAF expectations (one byte range per time slice covers all tracks).
 
-## MUXL Flat MP4
+### Catalog Stability
 
-A hybrid layout that reads as a flat MP4 at the top level *and* contains inline [Hang CMAF](https://doc.moq.dev/concept/layer/hang) fragments addressable by byte range. One file serves both downloads (LosslessCut, desktop players, editors) and HLS byte-range playlists. This design is adapted from the [OBS Studio hybrid MP4](https://obsproject.com/blog/obs-studio-hybrid-mp4) approach.
+All canonical segments in a single storage-format file must share a compatible catalog (same track set, same codec configurations). A catalog change mid-stream (resolution switch, orientation flip) is out of scope for this revision — handle it by starting a new track or storage-format file. In-codec parameter changes (H.264 SPS/PPS updates at keyframe boundaries) ride through the existing fragment stream unchanged and do not constitute a catalog change.
+
+### MUXL fMP4 (appendable)
+
+```
+ftyp
+moov (init — track config, empty sample tables, mvex present)
+[GoP 1: track 1 seg, track 2 seg, ...]
+[GoP 2: track 1 seg, track 2 seg, ...]
+...
+```
+
+Appendable: new GoPs are byte-appended without rewriting the header. Used during livestream ingest and 24-hour streams.
+
+### MUXL Flat MP4 (finalized)
 
 ```
 ftyp
 moov (populated sample tables; no mvex; faststart)
 mdat (64-bit largesize envelope; payload =)
-  [track 1: moof+mdat, moof+mdat, ...]   ← canonical single-sample MUXL fragments
-  [track 2: moof+mdat, moof+mdat, ...]
+  [GoP 1: track 1 seg, track 2 seg, ...]
+  [GoP 2: track 1 seg, track 2 seg, ...]
   ...
 ```
 
-Top-level view: ftyp + moov + mdat. A flat-MP4 parser uses the populated `stbl` tables; `co64` entries point at sample bytes *inside* the inner mdats, skipping past the inner moof headers.
+Top-level view: a normal flat MP4 with populated stbl. `co64` entries point at sample bytes inside the inner mdats, past each fragment's preceding moof header. The leading `uuid` of each canonical segment lives at the start of that segment's byte range; flat-MP4 parsers ignore it (uuid is a permitted ISOBMFF box at any level).
 
-CMAF byte-range view: the inner `moof+mdat` pairs are canonical MUXL fragments (self-contained, `default-base-is-moof`). An HLS player fetching a byte range sees only the fragment and never parses the outer container.
+HLS byte-range view: the envelope contains canonical-segment-prefixed CMAF fragments. HLS playlist byte ranges target the `moof+mdat` portion; the leading `uuid` is informational and may be addressed separately by signature-aware players.
 
-### Relationship to the MUXL fMP4
+### Layout Arithmetic (Flat MP4)
 
-The inner `moof+mdat` sequence is byte-identical to a MUXL fMP4's body. MUXL fMP4 ↔ flat MP4 conversion is a wrapper swap:
-- MUXL fMP4 → flat: replace `moov_init` with populated `moov`, prepend 16-byte outer mdat header, copy body verbatim.
-- Flat → MUXL fMP4: drop outer envelope header, replace populated `moov` with init `moov`, leave inner fragments untouched.
+Given `ftyp` size `F`, `moov` size `M`, per-segment `uuid` sizes `u_s`, and per-sample inner fragment sizes `f_i = moof_size_i + 8 + sample_size_i`:
 
-No sample bytes are ever touched. Per-sample metadata (durations, sizes, sync flags, cts offsets) is already present in the MUXL fMP4's `trun` entries.
+- Outer mdat payload starts at `P = F + M + 16`.
+- For sample `i` belonging to segment `s`, the absolute file offset is `P + (sum of all u and f preceding sample i) + moof_size_i + 8`.
+- Outer `mdat.largesize` = `16 + sum(u_s) + sum(f_i)`.
 
-### moov
+### Header Synthesis
 
-Same `mvhd`/`trak`/`tkhd`/`mdhd`/`hdlr`/`minf` rules as the init segment, with:
-- Populated `stbl` sample tables (see below).
-- **No** `mvex`. The top-level view is non-fragmented; HLS consumers use an out-of-band init segment.
-- Duration fields (`mvhd.duration`, `tkhd.duration`, `mdhd.duration`) filled in from the samples.
+`build_synth_flat_header` in `src/flat.rs` constructs the `ftyp + moov + mdat-envelope-header` from per-segment metadata only — no sample bytes required. Each segment's metadata contributes: track byte sizes (including its leading uuid), per-sample arrays (duration, size, cts offset, sync index, offset-in-segment), and first decode time. The caller assembles the full file by concatenating the synth header with each segment's body bytes (e.g. via S3 multipart UploadPartCopy from per-segment objects).
 
-### stbl (populated)
+## Box Rules
 
-- **stsd**: same as init segment
-- **stts**: RLE per-sample decode durations (media timescale)
-- **ctts**: version 1 (signed), RLE, present only if any sample has a non-zero composition time offset
-- **stsz**: uniform if all samples have equal size; per-sample list otherwise
-- **stsc**: exactly one entry — `first_chunk=1, samples_per_chunk=1, sample_description_index=1`. Each sample is its own chunk, because each is preceded by its own inner moof+mdat header bytes.
-- **co64**: one entry per sample. Entry `i` = `inner_moof_start + inner_moof_size + 8` (absolute file offset of sample i's bytes inside its inner mdat). Always 64-bit, never `stco`.
-- **stss**: 1-based sync sample indices (video only; omitted for audio and all-sync tracks)
-
-No other `stbl` child boxes (no `stsh`/`stps`/`stdp`/`padb`/`sdtp`).
-
-### Outer mdat
-
-Always 64-bit extended size header (16 bytes: `size=1` + "mdat" + 8-byte `largesize`). Payload is `[moof+mdat]*` grouped by `track_id` ascending, samples within a track in decode order.
-
-### Inner moof+mdat fragments
-
-Canonical MUXL fragments per § MUXL Segment. `mfhd.sequence_number` increments globally across all tracks, starting at 1.
-
-### Layout arithmetic
-
-Given `ftyp` size `F`, `moov` size `M`, and per-sample inner fragment sizes `f_i = moof_size_i + 8 + sample_size_i`:
-
-- Outer mdat payload starts at `P = F + M + 16`
-- Sample `i`'s `co64` entry = `P + sum(f_j for j < i) + moof_size_i + 8`
-- Outer `mdat.largesize` = `16 + sum(f_i)`
-
-### Multi-Segment Flat MP4
-
-A flat MP4 produced by concatenating bodies from multiple per-segment fMP4 sources (e.g. Streamplace's livestream-to-VOD pipeline, where each input segment is one signed flat MP4 minted in real time and the VOD is synthesized at finalize time) deviates from the "tracks grouped globally" body layout in one specific way: bodies are grouped **per-segment**, with each segment's tracks internally in `track_id` ascending order.
-
-```
-ftyp
-moov (populated; co64 covers all samples across all segments)
-mdat (64-bit largesize envelope; payload =)
-  segment 1: [track 1 frags...][track 2 frags...]
-  segment 2: [track 1 frags...][track 2 frags...]
-  segment 3: ...
-```
-
-This is what falls out of concatenating per-segment fMP4 bodies (each carrying tracks in id-asc order) without a transcode step. It's still a valid flat MP4 — `co64` entries point wherever they need to, and a flat-MP4 parser doesn't care about the body's internal grouping. It also matches HLS byte-range CMAF's expectation that one byte range per segment covers all tracks for that time slice.
-
-The single-segment layout (tracks grouped globally) and the multi-segment layout (tracks grouped per-segment) are interchangeable for one-segment inputs — they're the same bytes when there's only one segment. Synthesized VODs use the multi-segment layout because it preserves per-segment byte-identity for c2pa verification and avoids re-arranging fragment bytes.
-
-`build_synth_flat_header` (in `src/flat.rs`) constructs the `ftyp + moov + mdat-envelope-header` for a multi-segment flat MP4 from per-segment metadata only — no sample bytes required. The caller assembles the full file by concatenating the synth header with each segment's body bytes (e.g. via S3 multipart UploadPartCopy from the per-segment objects).
-
-## ftyp
+### ftyp
 
 - **major_brand**: `muxl`
 - **minor_version**: `0`
@@ -148,13 +156,13 @@ The single-segment layout (tracks grouped globally) and the multi-segment layout
 
 `muxl` signals conformance. `isom`/`iso2` keep the file playable by generic ISOBMFF tools. Codec-agnostic; players use stsd for codec detection.
 
-## Init Segment moov
+### Init Segment moov
 
-The moov in the init segment describes track configuration with empty sample tables, zero durations, and no sample entries.
+The init `moov` describes track configuration with empty sample tables, zero durations, and no sample entries. Used in MUXL fMP4 storage.
 
 Required child boxes: `mvhd`, `trak` (one per track), `mvex` (with `trex` per track).
 
-### mvhd
+#### mvhd
 
 - **version**: 0
 - **flags**: 0
@@ -167,7 +175,7 @@ Required child boxes: `mvhd`, `trak` (one per track), `mvex` (with `trex` per tr
 - **matrix**: identity
 - **next_track_id**: max(track_ids) + 1
 
-### mvex
+#### mvex
 
 Required for fMP4 playback — signals that moof+mdat pairs follow the moov.
 
@@ -180,11 +188,11 @@ Required for fMP4 playback — signals that moof+mdat pairs follow the moov.
 
 All sample metadata is explicit in each trun entry, so trex defaults are all zero.
 
-### trak ordering
+#### trak ordering
 
 Sorted by track_id ascending. No udta, meta, or iods.
 
-### tkhd
+#### tkhd
 
 - **version**: 0
 - **flags**: 3 (track_enabled | track_in_movie)
@@ -193,7 +201,7 @@ Sorted by track_id ascending. No udta, meta, or iods.
 - **duration**: 0
 - **matrix, width/height, layer, alternate_group, volume**: from track config
 
-### mdhd
+#### mdhd
 
 - **version**: 0
 - **flags**: 0
@@ -203,23 +211,47 @@ Sorted by track_id ascending. No udta, meta, or iods.
 - **duration**: 0
 - **language**: `"und"`
 
-### hdlr
+#### hdlr
 
 - **version**: 0
 - **flags**: 0
 - **handler_type**: `"vide"` for video, `"soun"` for audio
 - **name**: empty string (name is cosmetic and varies across muxers)
 
-### minf
+#### minf
 
 - **vmhd**: present for video tracks (default values)
 - **smhd**: present for audio tracks (default values)
 - **dinf**: required, contains dref
   - **dref**: one self-contained `url` entry with empty location string (signals data is in the same file)
 
-### stbl (Sample Table)
+#### stbl (init)
 
 stsd populated with codec config, all other tables empty.
+
+### Flat MP4 moov
+
+Same `mvhd`/`trak`/`tkhd`/`mdhd`/`hdlr`/`minf` rules as the init segment, with:
+
+- Populated `stbl` sample tables (see below).
+- **No** `mvex`. The top-level view is non-fragmented; HLS consumers use an out-of-band init segment.
+- Duration fields (`mvhd.duration`, `tkhd.duration`, `mdhd.duration`) filled in from the samples.
+
+#### stbl (populated)
+
+- **stsd**: same as init segment
+- **stts**: RLE per-sample decode durations (media timescale)
+- **ctts**: version 1 (signed), RLE, present only if any sample has a non-zero composition time offset
+- **stsz**: uniform if all samples have equal size; per-sample list otherwise
+- **stsc**: exactly one entry — `first_chunk=1, samples_per_chunk=1, sample_description_index=1`. Each sample is its own chunk, because each is preceded by its own inner moof+mdat header bytes.
+- **co64**: one entry per sample. Entry `i` = absolute file offset of sample i's bytes inside its inner mdat (past the segment's leading `uuid` and the sample's preceding `moof`). Always 64-bit, never `stco`.
+- **stss**: 1-based sync sample indices (video only; omitted for audio and all-sync tracks)
+
+No other `stbl` child boxes (no `stsh`/`stps`/`stdp`/`padb`/`sdtp`).
+
+### Outer mdat (flat MP4)
+
+Always 64-bit extended size header (16 bytes: `size=1` + "mdat" + 8-byte `largesize`). Payload is the time-slice-interleaved sequence of canonical segments (§ Interleaving Order).
 
 ### edts / elst
 

@@ -22,7 +22,7 @@ One sample, one `moof+mdat` pair.
 
 Each moof covers exactly one sample from one track.
 
-- **mfhd**: `sequence_number`, 1-based, incrementing per fragment within a segment (restarts at 1 each segment).
+- **mfhd**: `sequence_number` is hardcoded to `0` on every fragment. CMAF's monotonicity requirement is intentionally violated: any non-zero choice would either break canonical-segment determinism (global-monotonic depends on stream position) or violate monotonicity at segment boundaries anyway (per-segment-restart). Hardcoding to 0 is the simplest deterministic option and is benign in practice — HLS/MSE players drive timing off `tfdt`, not sequence numbers.
 - **traf**: exactly one per moof.
   - **tfhd**: `track_id`; flags = `default_base_is_moof`; no default sample values (all explicit in trun).
   - **tfdt**: `base_media_decode_time` in the track's media timescale, carrying the absolute media time of this sample in the track's stream timeline.
@@ -44,7 +44,7 @@ A canonical segment is the unit of content addressing. Signing is layered on top
 ### Structure
 
 ```
-uuid (muxl catalog box; uuid = 6d75786c-0001-0000-0000-000000000001)
+uuid (muxl catalog box; uuid = 45bf665b-18b8-4aff-b34c-93cc78657b8b)
 moof+mdat (sample 1)
 moof+mdat (sample 2)
 ...
@@ -53,7 +53,7 @@ moof+mdat (sample K)
 
 Each canonical segment carries fragments for exactly one track and one GoP. A multi-track GoP produces multiple canonical segments — one per track.
 
-The leading uuid is *always* present — never omitted — so segment boundaries are unambiguous at the byte level. The 16-byte UUID identifier `6d75786c-0001-0000-0000-000000000001` (leading bytes spell `muxl` in ASCII) is provisional pending DASL registration.
+The leading uuid is *always* present — never omitted — so segment boundaries are unambiguous at the byte level. The 16-byte UUID identifier is `45bf665b-18b8-4aff-b34c-93cc78657b8b`.
 
 ### uuid Body
 
@@ -75,7 +75,7 @@ Given the same samples with the same timestamps, segment boundaries are always i
 
 ### Per-Segment Properties
 
-- **`mfhd.sequence_number`**: per-segment, restarting at 1 for each segment's first fragment. Within a segment, sequence numbers increment monotonically. Storage-format synthesizers may rewrite to globally monotonic if a downstream player demands it; the canonical segment bytes remain per-segment-anchored.
+- **`mfhd.sequence_number`**: hardcoded to `0` on every fragment (see § MUXL Fragment → moof). Storage-format synthesizers preserve the zeros verbatim — rewriting would mutate the canonical bytes and break round-trip recovery.
 - **`tfdt.base_media_decode_time`**: absolute media time of the segment's first sample in the track's stream timeline. Preserved verbatim across storage-format round-trips.
 
 ### Round-Trip Property

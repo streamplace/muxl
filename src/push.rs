@@ -64,6 +64,7 @@ enum State {
 
 struct StreamingState {
     moov: Moov,
+    catalog: Catalog,
     video_track_ids: HashSet<u32>,
     /// Per-track media timescale, used to compute segment duration_us.
     track_timescales: BTreeMap<u32, u32>,
@@ -145,12 +146,13 @@ impl Segmenter {
                             .collect();
 
                         events.push(SegmenterEvent::InitSegment {
-                            catalog,
+                            catalog: catalog.clone(),
                             data: init_data,
                         });
 
                         self.state = State::Streaming(StreamingState {
                             moov,
+                            catalog,
                             video_track_ids,
                             track_timescales,
                             track_state: HashMap::new(),
@@ -214,8 +216,9 @@ impl Segmenter {
                                         &mut ss.track_samples,
                                         &ss.track_timescales,
                                         &ss.video_track_ids,
+                                        &ss.catalog,
                                         ss.segment_number,
-                                    ) {
+                                    )? {
                                         events.push(SegmenterEvent::Segment(gop));
                                     }
                                 }
@@ -258,8 +261,9 @@ impl Segmenter {
                 &mut ss.track_samples,
                 &ss.track_timescales,
                 &ss.video_track_ids,
+                &ss.catalog,
                 ss.segment_number,
-            ) {
+            )? {
                 events.push(SegmenterEvent::Segment(gop));
             }
         }

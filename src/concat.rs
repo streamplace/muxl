@@ -46,7 +46,7 @@ use crate::init::{build_init_segment, catalog_from_moov};
 use crate::push::SegmenterEvent;
 #[cfg(test)]
 use crate::segment::GopSegment;
-use crate::segment::{TrackSamples, flush_track_bufs, record_frame};
+use crate::segment::{MUXL_UUID, TrackSamples, flush_track_bufs, record_frame};
 
 /// Push-based concatenator for merging multiple MUXL fMP4 or flat MP4 files.
 ///
@@ -166,29 +166,42 @@ impl Concatenator {
             match &box_type {
                 b"ftyp" => {
                     // New fMP4 starting — flush any pending segment, reset to init phase
-                    self.flush_segment_into(&mut events);
+                    self.flush_segment_into(&mut events)?;
                     self.pending_uuid = None;
                     self.envelope_remaining = None;
                     self.state = ConcatState::WaitingForInit;
                 }
                 b"uuid" => {
-                    match &self.state {
-                        ConcatState::WaitingForInit => {
-                            // UUID in init section — capture for later
-                            self.pending_uuid = Some(box_data);
-                        }
-                        ConcatState::Streaming(_) => {
-                            // UUID during streaming — treat as new fMP4's init
-                            self.flush_segment_into(&mut events);
-                            self.pending_uuid = Some(box_data);
-                            self.envelope_remaining = None;
-                            self.state = ConcatState::WaitingForInit;
+                    // A muxl canonical-segment uuid (carrying a DRISL catalog)
+                    // can appear mid-body when the input was produced by our
+                    // own writers. It's informational at the concat layer —
+                    // we re-mint the canonical-segment prefix from
+                    // `current_catalog` at flush time — so skip it silently
+                    // rather than treating it as a file boundary.
+                    let is_muxl_uuid =
+                        box_data.len() >= 24 && box_data[8..24] == MUXL_UUID;
+                    if is_muxl_uuid {
+                        // intentional no-op
+                    } else {
+                        match &self.state {
+                            ConcatState::WaitingForInit => {
+                                // UUID in init section — capture for later
+                                self.pending_uuid = Some(box_data);
+                            }
+                            ConcatState::Streaming(_) => {
+                                // Non-muxl uuid during streaming — treat as
+                                // new fMP4's init (e.g. c2pa signing wrapper).
+                                self.flush_segment_into(&mut events)?;
+                                self.pending_uuid = Some(box_data);
+                                self.envelope_remaining = None;
+                                self.state = ConcatState::WaitingForInit;
+                            }
                         }
                     }
                 }
                 b"moov" => {
                     // Flush any pending segment from previous fMP4
-                    self.flush_segment_into(&mut events);
+                    self.flush_segment_into(&mut events)?;
 
                     // Parse moov
                     let mut cursor = Cursor::new(&box_data);
@@ -284,7 +297,7 @@ impl Concatenator {
                         };
 
                         if is_video_keyframe && ss.seen_first_keyframe {
-                            self.flush_segment_into(&mut events);
+                            self.flush_segment_into(&mut events)?;
                         }
 
                         let ss = match &mut self.state {
@@ -319,7 +332,7 @@ impl Concatenator {
                 *rem = rem.saturating_sub(box_total_size);
                 if *rem == 0 {
                     self.envelope_remaining = None;
-                    self.flush_segment_into(&mut events);
+                    self.flush_segment_into(&mut events)?;
                 }
             }
         }
@@ -330,14 +343,26 @@ impl Concatenator {
     /// Signal end of stream. Flushes any remaining partial segment.
     pub fn flush(&mut self) -> Result<Vec<SegmenterEvent>> {
         let mut events = Vec::new();
-        self.flush_segment_into(&mut events);
+        self.flush_segment_into(&mut events)?;
         Ok(events)
     }
 
-    fn flush_segment_into(&mut self, events: &mut Vec<SegmenterEvent>) {
+    fn flush_segment_into(&mut self, events: &mut Vec<SegmenterEvent>) -> Result<()> {
         if !self.track_bufs.values().any(|b| !b.is_empty()) {
-            return;
+            return Ok(());
         }
+        let catalog = match self.current_catalog.as_ref() {
+            Some(c) => c.clone(),
+            None => {
+                // No catalog yet — can't mint canonical segment prefixes.
+                // Drop the buffered fragments rather than emit garbage.
+                self.track_bufs.clear();
+                self.track_durations.clear();
+                self.track_sample_counts.clear();
+                self.track_samples.clear();
+                return Ok(());
+            }
+        };
         self.segment_number += 1;
         let mut gop = match flush_track_bufs(
             &mut self.track_bufs,
@@ -346,16 +371,19 @@ impl Concatenator {
             &mut self.track_samples,
             &self.track_timescales,
             &self.video_track_ids,
+            &catalog,
             self.segment_number,
-        ) {
+        )? {
             Some(g) => g,
-            None => return,
+            None => return Ok(()),
         };
 
-        // Prepend the c2pa uuid (if any) to each track's bytes. The sample
-        // offsets recorded by `record_frame` are relative to the moof+mdat
-        // sequence, so they need to shift by `uuid_len` once the uuid sits
-        // in front; body_size grows by the same per track.
+        // The muxl uuid + DRISL catalog (per canonical-segment spec) was
+        // already prepended inside flush_track_bufs. Optionally prepend any
+        // input-file c2pa uuid in front as a signing-layer pass-through —
+        // signature data from the input flat MP4 is preserved alongside
+        // the canonical-segment bytes, not inside them. Sample offsets and
+        // body_size shift accordingly.
         if let Some(ref uuid) = self.current_uuid {
             let uuid_len = uuid.len();
             for data in gop.tracks.values_mut() {
@@ -373,6 +401,7 @@ impl Concatenator {
         }
 
         events.push(SegmenterEvent::Segment(gop));
+        Ok(())
     }
 }
 

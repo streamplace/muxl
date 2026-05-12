@@ -10,9 +10,36 @@
 use std::collections::{BTreeMap, HashSet};
 use std::io::Read;
 
-use crate::catalog::Catalog;
+use crate::catalog::{Catalog, to_drisl};
 use crate::error::Result;
 use crate::fragment::FMP4Reader;
+
+/// The MUXL canonical-segment UUID identifier
+/// (`45bf665b-18b8-4aff-b34c-93cc78657b8b`). Every canonical segment
+/// begins with a `uuid` box bearing this identifier; the body of the
+/// box is a DRISL-encoded single-track [`Catalog`]. Spec:
+/// `canonical-form.md § MUXL Canonical Segment`.
+pub const MUXL_UUID: [u8; 16] = [
+    0x45, 0xbf, 0x66, 0x5b,
+    0x18, 0xb8, 0x4a, 0xff,
+    0xb3, 0x4c, 0x93, 0xcc,
+    0x78, 0x65, 0x7b, 0x8b,
+];
+
+/// Build the leading `uuid` box for a canonical segment: 4-byte BE size,
+/// `"uuid"` FourCC, 16-byte [`MUXL_UUID`], and the DRISL-encoded
+/// single-track catalog (filtered from `catalog` to just `track_id`).
+pub fn mint_canonical_segment_prefix(catalog: &Catalog, track_id: u32) -> Result<Vec<u8>> {
+    let single = catalog.filter_to_track(track_id);
+    let drisl = to_drisl(&single)?;
+    let total = 24usize + drisl.len();
+    let mut out = Vec::with_capacity(total);
+    out.extend_from_slice(&(total as u32).to_be_bytes());
+    out.extend_from_slice(b"uuid");
+    out.extend_from_slice(&MUXL_UUID);
+    out.extend_from_slice(&drisl);
+    Ok(out)
+}
 
 /// A per-track, GOP-aligned MUXL segment.
 pub struct Segment {
@@ -123,8 +150,9 @@ pub fn segment_fmp4<R: Read>(
                 &mut track_samples,
                 &track_timescales,
                 &video_track_ids,
+                &catalog,
                 segment_number,
-            ) {
+            )? {
                 on_gop(gop)?;
             }
         }
@@ -151,8 +179,9 @@ pub fn segment_fmp4<R: Read>(
         &mut track_samples,
         &track_timescales,
         &video_track_ids,
+        &catalog,
         segment_number,
-    ) {
+    )? {
         on_gop(gop)?;
     }
 
@@ -192,11 +221,12 @@ pub(crate) fn record_frame(
 
 /// Flush all non-empty per-track buffers into a [`GopSegment`].
 ///
-/// Returns `None` if all buffers are empty. `track_samples` carries the
-/// per-sample arrays accumulated alongside `track_bufs`; it's drained
-/// the same way. `video_track_ids` and `track_timescales` are used to
-/// compute the segment's `duration_us` (preferring video, else longest
-/// track).
+/// Returns `None` if all buffers are empty. Each non-empty track buffer
+/// is wrapped into a canonical segment by prepending its single-track
+/// [`mint_canonical_segment_prefix`] (uuid + DRISL catalog) — the
+/// emitted `tracks[tid]` bytes are the full canonical segment.
+/// Per-sample `offsets_in_track` shift by the uuid prefix length so
+/// they keep pointing at sample bytes within the emitted buffer.
 pub(crate) fn flush_track_bufs(
     track_bufs: &mut BTreeMap<u32, Vec<u8>>,
     track_durations: &mut BTreeMap<u32, u64>,
@@ -204,8 +234,9 @@ pub(crate) fn flush_track_bufs(
     track_samples: &mut BTreeMap<u32, TrackSamples>,
     track_timescales: &BTreeMap<u32, u32>,
     video_track_ids: &HashSet<u32>,
+    catalog: &Catalog,
     segment_number: u32,
-) -> Option<GopSegment> {
+) -> Result<Option<GopSegment>> {
     let mut tracks = BTreeMap::new();
     let mut durations = BTreeMap::new();
     let mut sample_counts = BTreeMap::new();
@@ -213,14 +244,20 @@ pub(crate) fn flush_track_bufs(
     let mut body_size: u64 = 0;
     for (&track_id, buf) in track_bufs.iter_mut() {
         if !buf.is_empty() {
-            body_size += buf.len() as u64;
-            tracks.insert(track_id, std::mem::take(buf));
+            let prefix = mint_canonical_segment_prefix(catalog, track_id)?;
+            let prefix_len = prefix.len() as u64;
+            let mut combined = Vec::with_capacity(prefix.len() + buf.len());
+            combined.extend_from_slice(&prefix);
+            combined.append(buf);
+            body_size += combined.len() as u64;
+            tracks.insert(track_id, combined);
             durations.insert(track_id, track_durations.remove(&track_id).unwrap_or(0));
             sample_counts.insert(track_id, track_sample_counts.remove(&track_id).unwrap_or(0));
-            samples.insert(
-                track_id,
-                track_samples.remove(&track_id).unwrap_or_default(),
-            );
+            let mut ts = track_samples.remove(&track_id).unwrap_or_default();
+            for off in &mut ts.offsets_in_track {
+                *off += prefix_len;
+            }
+            samples.insert(track_id, ts);
         }
     }
     // Clear any remaining entries for tracks that had no data
@@ -228,10 +265,10 @@ pub(crate) fn flush_track_bufs(
     track_sample_counts.clear();
     track_samples.clear();
     if tracks.is_empty() {
-        None
+        Ok(None)
     } else {
         let duration_us = compute_duration_us(&durations, track_timescales, video_track_ids);
-        Some(GopSegment {
+        Ok(Some(GopSegment {
             number: segment_number,
             tracks,
             durations,
@@ -239,7 +276,7 @@ pub(crate) fn flush_track_bufs(
             samples,
             body_size,
             duration_us,
-        })
+        }))
     }
 }
 
@@ -318,15 +355,35 @@ mod tests {
 
     #[test]
     fn test_segment_data_is_all_frame_data() {
-        // Total bytes across all per-track segments should equal total frame bytes
+        // Total bytes across all per-track segments should equal total frame
+        // bytes + the leading muxl uuid box on every (track, GoP) chunk.
         let data = read_fixture("h264-opus-frag.mp4");
 
         let mut segment_total = 0usize;
-        segment_fmp4(&mut Cursor::new(&data), |gop| {
+        let mut uuid_overhead = 0usize;
+        let catalog = segment_fmp4(&mut Cursor::new(&data), |gop| {
             segment_total += gop.tracks.values().map(|d| d.len()).sum::<usize>();
             Ok(())
         })
         .unwrap();
+        // Reconstruct expected uuid overhead: one prefix per non-empty
+        // (track, GoP) pair, prefix length per-track from filter_to_track.
+        for tid in catalog
+            .video_configs()
+            .map(|v| v.track_id())
+            .chain(catalog.audio_configs().map(|a| a.track_id()))
+        {
+            let prefix = mint_canonical_segment_prefix(&catalog, tid).unwrap();
+            let mut gop_count = 0usize;
+            segment_fmp4(&mut Cursor::new(&data), |gop| {
+                if gop.tracks.contains_key(&tid) {
+                    gop_count += 1;
+                }
+                Ok(())
+            })
+            .unwrap();
+            uuid_overhead += prefix.len() * gop_count;
+        }
 
         let mut frame_total = 0usize;
         crate::fragment::fragment_fmp4(&mut Cursor::new(&data), |frame| {
@@ -336,8 +393,9 @@ mod tests {
         .unwrap();
 
         assert_eq!(
-            segment_total, frame_total,
-            "segment bytes should equal total frame bytes"
+            segment_total,
+            frame_total + uuid_overhead,
+            "segment bytes should equal frame bytes plus per-(track, GoP) muxl uuid prefixes"
         );
     }
 
@@ -398,6 +456,14 @@ mod tests {
                 use mp4_atom::{Atom, Header, Moof, ReadAtom, ReadFrom};
 
                 let mut cursor = Cursor::new(track_data);
+                // Skip the leading muxl uuid box.
+                let uuid_h = <Option<Header> as ReadFrom>::read_from(&mut cursor)
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(uuid_h.kind, mp4_atom::FourCC::new(b"uuid"));
+                let uuid_size = uuid_h.size.unwrap_or(0);
+                cursor.set_position(cursor.position() + uuid_size as u64);
+
                 let h = <Option<Header> as ReadFrom>::read_from(&mut cursor)
                     .unwrap()
                     .unwrap();

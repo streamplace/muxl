@@ -80,7 +80,7 @@ pub enum CborEvent {
 /// arrays — but the sync sample list rides as a CBOR array of u32 (the
 /// `stss` shape) rather than a packed bitmap, since most segments have
 /// just one or two sync samples.
-#[derive(Serialize, Deserialize, Debug, Default)]
+#[derive(Serialize, Deserialize, Debug, Default, Clone)]
 pub struct CborTrackSamples {
     pub durations: Vec<u32>,
     pub sizes: Vec<u32>,

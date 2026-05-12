@@ -581,12 +581,13 @@ pub fn sign_segment_stream<R: Read, W: Write>(
     input: &mut R,
     output: &mut W,
     signer: &SignerKey,
-    track_manifest: &str,
+    segment_manifest: &str,
     wrapper_manifest: &str,
 ) -> Result<()> {
     init_default_settings();
+    let c2pa_signer = signer.build()?;
     let mut segmenter = Segmenter::new();
-    let mut init_bytes: Option<Vec<u8>> = None;
+    let mut init_seen = false;
     let mut buf = [0u8; 64 * 1024];
 
     loop {
@@ -597,22 +598,24 @@ pub fn sign_segment_stream<R: Read, W: Write>(
         for event in segmenter.feed(&buf[..n])? {
             handle_event(
                 event,
-                &mut init_bytes,
+                &mut init_seen,
                 signer,
-                track_manifest,
+                segment_manifest,
                 wrapper_manifest,
                 output,
+                &*c2pa_signer,
             )?;
         }
     }
     for event in segmenter.flush()? {
         handle_event(
             event,
-            &mut init_bytes,
+            &mut init_seen,
             signer,
-            track_manifest,
+            segment_manifest,
             wrapper_manifest,
             output,
+            &*c2pa_signer,
         )?;
     }
     Ok(())
@@ -620,29 +623,34 @@ pub fn sign_segment_stream<R: Read, W: Write>(
 
 fn handle_event<W: Write>(
     event: SegmenterEvent,
-    init_bytes: &mut Option<Vec<u8>>,
-    signer: &SignerKey,
-    track_manifest: &str,
-    wrapper_manifest: &str,
+    init_seen: &mut bool,
+    _signer: &SignerKey,
+    segment_manifest: &str,
+    _wrapper_manifest: &str,
     output: &mut W,
+    c2pa_signer: &dyn C2paSigner,
 ) -> Result<()> {
+    use muxl::cbor::{ByteString, CborEvent};
     match event {
-        SegmenterEvent::InitSegment { data, .. } => {
-            *init_bytes = Some(data);
-        }
-        SegmenterEvent::Segment(gop) => {
-            let init = init_bytes.as_deref().ok_or_else(|| {
-                Error::Muxl(muxl::Error::InvalidMp4(
-                    "segment received before init segment".into(),
-                ))
-            })?;
-            let signed = sign_one_gop_fmp4(init, &gop, signer, track_manifest, wrapper_manifest)?;
-            let signed_len = signed.len();
-            let number = gop.number;
-            let event = SignedEvent::SignedSegment {
-                number,
-                data: signed,
+        SegmenterEvent::InitSegment { catalog, data } => {
+            *init_seen = true;
+            // Build an Init event with the catalog + per-track init segments
+            // so downstream consumers (Streamplace) have everything they need
+            // to derive HLS playback artifacts without re-parsing.
+            let track_inits: std::collections::BTreeMap<String, ByteString> =
+                muxl::init::build_track_init_segments(&catalog)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|(tid, bytes)| (tid.to_string(), ByteString(bytes)))
+                    .collect();
+            let event = SignedEvent::Init {
+                data,
+                catalog: Some(catalog),
+                track_inits,
             };
+            // Drop the auto-generated `Init` case from CborEvent — we re-emit
+            // through SignedEvent ourselves so the wire type tag matches.
+            let _ = CborEvent::from_event;
             dasl::drisl::to_writer(&mut *output, &event).map_err(|e| {
                 Error::Io(std::io::Error::new(
                     std::io::ErrorKind::Other,
@@ -650,40 +658,84 @@ fn handle_event<W: Write>(
                 ))
             })?;
             output.flush()?;
-            eprintln!("signed segment {}: {} bytes", number, signed_len);
+        }
+        SegmenterEvent::Segment(mut gop) => {
+            if !*init_seen {
+                return Err(Error::Muxl(muxl::Error::InvalidMp4(
+                    "segment received before init segment".into(),
+                )));
+            }
+            // Sign each canonical segment (per track) in this GoP as a bare
+            // .m4s asset. Replace the gop's per-track buffers with the
+            // signed bytes and shift per-sample offsets past the leading
+            // c2pa-uuid prefix.
+            let prefix_size = sign_gop_canonical_segments_in_place(
+                &mut gop,
+                segment_manifest,
+                c2pa_signer,
+            )?;
+            let number = gop.number;
+            let track_count = gop.tracks.len();
+            let signed_total: usize = gop.tracks.values().map(|v| v.len()).sum();
+
+            let event = SignedEvent::signed_from_gop(gop);
+            dasl::drisl::to_writer(&mut *output, &event).map_err(|e| {
+                Error::Io(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    e.to_string(),
+                ))
+            })?;
+            output.flush()?;
+            eprintln!(
+                "signed segment {number}: {track_count} canonical segments, \
+                 {signed_total} bytes (c2pa prefix {prefix_size} bytes/track)"
+            );
         }
     }
     Ok(())
 }
 
-/// Reassemble one GoP's per-track moof+mdat segments back into a self-
-/// contained fMP4 (init + interleaved track data), then drive the
-/// existing `sign_per_track` over it.
-fn sign_one_gop_fmp4(
-    init_bytes: &[u8],
-    gop: &muxl::GopSegment,
-    signer: &SignerKey,
-    track_manifest: &str,
-    wrapper_manifest: &str,
-) -> Result<Vec<u8>> {
-    let body_len: usize = gop.tracks.values().map(|v| v.len()).sum();
-    let mut fmp4 = Vec::with_capacity(init_bytes.len() + body_len);
-    fmp4.extend_from_slice(init_bytes);
-    for data in gop.tracks.values() {
-        fmp4.extend_from_slice(data);
+/// Sign each per-track canonical segment in `gop` as a standalone .m4s
+/// asset. Replaces `gop.tracks[tid]` with `[c2pa-uuid + muxl-uuid + frags]`
+/// and shifts `gop.samples[tid].offsets_in_track` past the c2pa-uuid
+/// prefix. `body_size` grows by `prefix_size * track_count`. Returns the
+/// c2pa-uuid prefix size (asserted constant across all tracks).
+fn sign_gop_canonical_segments_in_place(
+    gop: &mut muxl::GopSegment,
+    segment_manifest: &str,
+    c2pa_signer: &dyn C2paSigner,
+) -> Result<usize> {
+    let mut prefix_size: Option<usize> = None;
+    let mut signed_map: std::collections::BTreeMap<u32, Vec<u8>> =
+        std::collections::BTreeMap::new();
+    for (&tid, canonical) in &gop.tracks {
+        let signed = sign_buf_as(canonical, segment_manifest, c2pa_signer, "m4s")?;
+        let this_prefix = signed.len().checked_sub(canonical.len()).ok_or_else(|| {
+            Error::Muxl(muxl::Error::InvalidMp4(
+                "signed canonical segment shorter than unsigned".into(),
+            ))
+        })?;
+        match prefix_size {
+            None => prefix_size = Some(this_prefix),
+            Some(p) if p == this_prefix => {}
+            Some(p) => {
+                return Err(Error::Muxl(muxl::Error::InvalidMp4(format!(
+                    "per-segment c2pa-uuid size drift across tracks: \
+                     expected {p}, got {this_prefix} for track {tid}"
+                ))));
+            }
+        }
+        signed_map.insert(tid, signed);
     }
-
-    let source = muxl::read(&fmp4)?;
-    let mut signed = Vec::new();
-    sign_per_track(
-        &source,
-        &fmp4,
-        signer,
-        track_manifest,
-        wrapper_manifest,
-        &mut signed,
-    )?;
-    Ok(signed)
+    let prefix_size = prefix_size.unwrap_or(0);
+    gop.tracks = signed_map;
+    for samples in gop.samples.values_mut() {
+        for off in &mut samples.offsets_in_track {
+            *off += prefix_size as u64;
+        }
+    }
+    gop.body_size += (prefix_size as u64) * (gop.tracks.len() as u64);
+    Ok(prefix_size)
 }
 
 /// Sign a single in-memory MP4 buffer with a given manifest.

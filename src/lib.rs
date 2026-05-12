@@ -9,7 +9,7 @@ pub mod flat;
 pub mod fmp4;
 mod fragment;
 pub mod hls;
-mod init;
+pub mod init;
 pub mod io;
 pub mod push;
 pub mod segment;

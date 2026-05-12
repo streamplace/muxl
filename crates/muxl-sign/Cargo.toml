@@ -23,3 +23,11 @@ sha2 = "0.10"
 dasl = "0.2"
 serde = { version = "1", features = ["derive"] }
 serde_bytes = "0.11"
+
+[dev-dependencies]
+# Decode SignedEvent streams in tests as generic CBOR values. dasl's
+# serde-derived deserializer doesn't round-trip internally-tagged enums
+# whose variants nest types with #[serde(with = "serde_bytes")] — the
+# Init event's catalog goes through that path. The Go decoder Streamplace
+# uses doesn't have the issue; we just need wire-shape verification here.
+serde_cbor = "0.11"

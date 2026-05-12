@@ -1797,6 +1797,7 @@ dependencies = [
  "muxl",
  "serde",
  "serde_bytes",
+ "serde_cbor",
  "sha2",
 ]
 

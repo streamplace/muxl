@@ -15,15 +15,15 @@ use crate::error::Result;
 use crate::fragment::FMP4Reader;
 
 /// The MUXL canonical-segment UUID identifier
-/// (`45bf665b-18b8-4aff-b34c-93cc78657b8b`). Every canonical segment
+/// (`e6404ea2-8f01-4305-98da-7bec3c2a9173`). Every canonical segment
 /// begins with a `uuid` box bearing this identifier; the body of the
 /// box is a DRISL-encoded single-track [`Catalog`]. Spec:
 /// `canonical-form.md § MUXL Canonical Segment`.
 pub const MUXL_UUID: [u8; 16] = [
-    0x45, 0xbf, 0x66, 0x5b,
-    0x18, 0xb8, 0x4a, 0xff,
-    0xb3, 0x4c, 0x93, 0xcc,
-    0x78, 0x65, 0x7b, 0x8b,
+    0xe6, 0x40, 0x4e, 0xa2,
+    0x8f, 0x01, 0x43, 0x05,
+    0x98, 0xda, 0x7b, 0xec,
+    0x3c, 0x2a, 0x91, 0x73,
 ];
 
 /// Build the leading `uuid` box for a canonical segment: 4-byte BE size,

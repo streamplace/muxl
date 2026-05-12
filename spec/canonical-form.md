@@ -44,7 +44,7 @@ A canonical segment is the unit of content addressing. Signing is layered on top
 ### Structure
 
 ```
-uuid (muxl catalog box; uuid = 45bf665b-18b8-4aff-b34c-93cc78657b8b)
+uuid (muxl catalog box; uuid = e6404ea2-8f01-4305-98da-7bec3c2a9173)
 moof+mdat (sample 1)
 moof+mdat (sample 2)
 ...
@@ -53,17 +53,17 @@ moof+mdat (sample K)
 
 Each canonical segment carries fragments for exactly one track and one GoP. A multi-track GoP produces multiple canonical segments — one per track.
 
-The leading uuid is *always* present — never omitted — so segment boundaries are unambiguous at the byte level. The 16-byte UUID identifier is `45bf665b-18b8-4aff-b34c-93cc78657b8b`.
+The leading uuid is _always_ present — never omitted — so segment boundaries are unambiguous at the byte level. The 16-byte UUID identifier is `e6404ea2-8f01-4305-98da-7bec3c2a9173`.
 
 ### uuid Body
 
-The `uuid` box body is a single DRISL-encoded MUXL catalog ([[drisl]]) describing exactly one track — one entry in `video.renditions` *or* one entry in `audio.renditions`, never both. The catalog is the entire body of the box; no JSON-LD wrapper, no c2pa manifest, no signature claim.
+The `uuid` box body is a single DRISL-encoded MUXL catalog ([[drisl]]) describing exactly one track — one entry in `video.renditions` _or_ one entry in `audio.renditions`, never both. The catalog is the entire body of the box; no JSON-LD wrapper, no c2pa manifest, no signature claim.
 
 DRISL canonical CBOR encoding makes the uuid body byte-deterministic: any two MUXL implementations producing a canonical segment for the same track configuration produce byte-identical uuid box bytes.
 
 ### Tamper Resistance
 
-Modifying the catalog or any fragment changes the canonical segment's bytes, which changes its CID. Detection at the muxl layer is by content-address comparison alone. Cryptographic provenance (proving *who* generated the bytes, not just *that they are these specific bytes*) is added by the signing layer.
+Modifying the catalog or any fragment changes the canonical segment's bytes, which changes its CID. Detection at the muxl layer is by content-address comparison alone. Cryptographic provenance (proving _who_ generated the bytes, not just _that they are these specific bytes_) is added by the signing layer.
 
 ### Segmentation Rule
 
@@ -256,7 +256,7 @@ Edit lists are a pre-CMAF mechanism for expressing presentation-start offsets (e
 
 Round-trip:
 
-1. **Source → MUXL.** Any leading empty-edit entries (`media_time == -1`) at the head of a source track's `elst` are summed and rescaled from the movie timescale into the track's media timescale, becoming that track's *presentation offset* (`start_offset_ticks` in the canonical sample plan). For an fMP4 input, the same value is read directly from the first fragment's `tfdt.base_media_decode_time`. Any non-empty entries on the source elst beyond the leading empty-edit shape are discarded; a canonical MUXL track's media timeline begins at `media_time == 0`.
+1. **Source → MUXL.** Any leading empty-edit entries (`media_time == -1`) at the head of a source track's `elst` are summed and rescaled from the movie timescale into the track's media timescale, becoming that track's _presentation offset_ (`start_offset_ticks` in the canonical sample plan). For an fMP4 input, the same value is read directly from the first fragment's `tfdt.base_media_decode_time`. Any non-empty entries on the source elst beyond the leading empty-edit shape are discarded; a canonical MUXL track's media timeline begins at `media_time == 0`.
 
    Per-track presentation offsets are preserved verbatim — there is no inter-track normalization. A/V sync rides on the natural delta between each track's offset; absolute time anchoring is preserved as-is. This is load-bearing for livestream-segment workflows, where each segment of a stream carries cumulative-from-stream-start tfdts, and downstream concatenation must produce monotonic output without a rebase step. Same-track-anchor inputs (a segment of a stream at the 5-second mark with both tracks at offset 5000 ticks) preserve that 5000 in the canonical bytes; both tracks emit synthesized elsts.
 
@@ -265,6 +265,7 @@ Round-trip:
    - Entry 2: `segment_duration = media_duration_movie_ts, media_time = 0` (normal play)
 
    A zero offset produces no `edts` box at all.
+
 3. **MUXL → fragments.** First fragment's `tfdt` carries the presentation offset; later fragments' tfdts follow from per-sample durations as usual. No `elst` is ever in play.
 
 Two consequences worth noting:

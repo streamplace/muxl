@@ -692,7 +692,6 @@ pub fn write_flat_mp4<R: ReadAt + ?Sized, W: Write>(
     // the first-fragment tfdt.
     let mut per_sample_moof_sizes: Vec<Vec<u32>> = Vec::with_capacity(ordered.len());
     let mut per_track_byte_totals: Vec<u64> = Vec::with_capacity(ordered.len());
-    let mut seq: u32 = 1;
     let mut per_track_final_decode_time: Vec<u64> = vec![0; ordered.len()];
 
     for (ti, plan) in ordered.iter().enumerate() {
@@ -701,11 +700,10 @@ pub fn write_flat_mp4<R: ReadAt + ?Sized, W: Write>(
         let mut dt: u64 = plan.start_offset_ticks;
 
         for sample in &plan.samples {
-            let moof_size = measure_frame_moof(seq, plan.track_id, dt, sample)?;
+            let moof_size = measure_frame_moof(plan.track_id, dt, sample)?;
             sizes.push(moof_size);
             track_bytes += (moof_size as u64) + 8 + (sample.size as u64);
             dt += sample.duration as u64;
-            seq += 1;
         }
         per_sample_moof_sizes.push(sizes);
         per_track_byte_totals.push(track_bytes);
@@ -845,9 +843,8 @@ pub fn write_flat_mp4<R: ReadAt + ?Sized, W: Write>(
     output.write_all(b"mdat")?;
     output.write_all(&largesize.to_be_bytes())?;
 
-    // Write inner moof+mdat pairs. Use the same seq-number cadence as pass 1.
+    // Write inner moof+mdat pairs. mfhd.sequence_number is 0 on every fragment.
     let mut io_buf = vec![0u8; 256 * 1024];
-    let mut seq: u32 = 1;
     for (ti, plan) in ordered.iter().enumerate() {
         let mut dt: u64 = plan.start_offset_ticks;
         for (si, sample) in plan.samples.iter().enumerate() {
@@ -861,7 +858,6 @@ pub fn write_flat_mp4<R: ReadAt + ?Sized, W: Write>(
 
             write_frame_pair(
                 output,
-                seq,
                 plan.track_id,
                 dt,
                 sample,
@@ -870,7 +866,6 @@ pub fn write_flat_mp4<R: ReadAt + ?Sized, W: Write>(
             )?;
 
             dt += sample.duration as u64;
-            seq += 1;
         }
     }
 
@@ -882,8 +877,8 @@ pub fn write_flat_mp4<R: ReadAt + ?Sized, W: Write>(
 }
 
 /// Build the Moof data structure for a single sample.
+/// mfhd.sequence_number is hardcoded to 0 per canonical-form.md § MUXL Fragment.
 fn build_frame_moof(
-    sequence_number: u32,
     track_id: u32,
     base_decode_time: u64,
     sample: &Sample,
@@ -904,7 +899,7 @@ fn build_frame_moof(
     };
 
     Moof {
-        mfhd: Mfhd { sequence_number },
+        mfhd: Mfhd { sequence_number: 0 },
         traf: vec![Traf {
             tfhd: Tfhd {
                 track_id,
@@ -928,13 +923,12 @@ fn build_frame_moof(
 
 /// Measure the encoded size of the moof for a single sample.
 fn measure_frame_moof(
-    sequence_number: u32,
     track_id: u32,
     base_decode_time: u64,
     sample: &Sample,
 ) -> Result<u32> {
     // data_offset is a fixed-size i32, so its value doesn't affect size.
-    let moof = build_frame_moof(sequence_number, track_id, base_decode_time, sample, 0);
+    let moof = build_frame_moof(track_id, base_decode_time, sample, 0);
     let mut buf = Vec::new();
     moof.encode(&mut buf).map_err(mp4_err)?;
     Ok(buf.len() as u32)
@@ -944,7 +938,6 @@ fn measure_frame_moof(
 /// the pass-1 measurement — the pass-1 value is what was baked into `co64`.
 fn write_frame_pair<W: Write>(
     output: &mut W,
-    sequence_number: u32,
     track_id: u32,
     base_decode_time: u64,
     sample: &Sample,
@@ -953,7 +946,6 @@ fn write_frame_pair<W: Write>(
 ) -> Result<()> {
     let data_offset = (expected_moof_size + 8) as i32;
     let moof = build_frame_moof(
-        sequence_number,
         track_id,
         base_decode_time,
         sample,

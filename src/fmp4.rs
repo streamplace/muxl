@@ -103,7 +103,6 @@ pub fn write<R: ReadAt + ?Sized, W: Write>(
     output.write_all(&init)?;
     let mut write_offset = init.len() as u64;
 
-    let mut sequence_number: u32 = 1;
     let mut tracks: Vec<BlobTrack> = Vec::new();
 
     for &tid in &track_ids {
@@ -171,7 +170,6 @@ pub fn write<R: ReadAt + ?Sized, W: Write>(
 
             let bytes_written = write_frame_fragment(
                 output,
-                sequence_number,
                 tid,
                 decode_time,
                 &sample.frame,
@@ -182,7 +180,6 @@ pub fn write<R: ReadAt + ?Sized, W: Write>(
             cur_seg_dur += sample.frame.duration as u64;
             cur_seg_samples += 1;
             write_offset += bytes_written;
-            sequence_number += 1;
             decode_time += sample.frame.duration as u64;
         }
 

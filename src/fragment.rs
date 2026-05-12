@@ -38,12 +38,14 @@ pub(crate) struct FrameInfo {
 /// Returns the total bytes written (moof + mdat).
 pub(crate) fn write_frame_fragment<W: Write>(
     writer: &mut W,
-    sequence_number: u32,
     track_id: u32,
     base_decode_time: u64,
     frame: &FrameInfo,
     sample_data: &[u8],
 ) -> Result<u64> {
+    // mfhd.sequence_number is hardcoded to 0 on every fragment.
+    // Spec: canonical-form.md § MUXL Fragment → moof.
+    let sequence_number: u32 = 0;
     // Sample flags per ISOBMFF:
     // sync: 0x02000000 (sample_depends_on=2: does not depend on others)
     // non-sync: 0x01010000 (sample_depends_on=1 + sample_is_non_sync=1)
@@ -224,7 +226,7 @@ pub struct FMP4Reader<R> {
     reader: R,
     moov: Moov,
     catalog: Catalog,
-    track_state: std::collections::HashMap<u32, (u64, u32)>,
+    track_state: std::collections::HashMap<u32, u64>,
     /// Buffered frames from the current moof+mdat pair (may contain
     /// multiple frames from multiple tracks).
     pending: Vec<Frame>,
@@ -365,7 +367,7 @@ pub(crate) fn process_moof_mdat(
     moof: &Moof,
     moof_box_size: usize,
     mdat_data: &[u8],
-    track_state: &mut std::collections::HashMap<u32, (u64, u32)>,
+    track_state: &mut std::collections::HashMap<u32, u64>,
     on_frame: &mut impl FnMut(Frame) -> Result<()>,
 ) -> Result<()> {
     // data_offset in trun is relative to the start of the moof box (when
@@ -377,7 +379,7 @@ pub(crate) fn process_moof_mdat(
         let track_id = traf.tfhd.track_id;
         let trex = trex_defaults(moov, track_id);
 
-        let (decode_time, seq) = track_state.entry(track_id).or_insert((0u64, 0u32));
+        let decode_time = track_state.entry(track_id).or_insert(0u64);
 
         // Base decode time from tfdt (if present), otherwise continue from where we left off
         if let Some(ref tfdt) = traf.tfdt {
@@ -417,11 +419,9 @@ pub(crate) fn process_moof_mdat(
                 }
                 let sample_data = &mdat_data[offset..sample_end];
 
-                *seq += 1;
                 let mut frag_buf = Vec::new();
                 write_frame_fragment(
                     &mut frag_buf,
-                    *seq,
                     track_id,
                     *decode_time,
                     &frame,
@@ -609,14 +609,13 @@ pub fn fragment_track<RS: Read + Seek, W: Write>(
     let sample_count = samples.len() as u32;
     let mut decode_time: u64 = 0;
 
-    for (i, sample) in samples.iter().enumerate() {
+    for sample in samples.iter() {
         input.seek(SeekFrom::Start(sample.file_offset))?;
         let mut data = vec![0u8; sample.frame.size as usize];
         input.read_exact(&mut data)?;
 
         write_frame_fragment(
             writer,
-            (i as u32) + 1,
             track_id,
             decode_time,
             &sample.frame,
@@ -666,7 +665,6 @@ pub fn fragment_to_directory<RS: Read + Seek>(
             let mut buf = Vec::new();
             write_frame_fragment(
                 &mut buf,
-                sample_id,
                 track_id,
                 decode_time,
                 &sample.frame,

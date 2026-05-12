@@ -100,6 +100,14 @@ pub fn write<R: ReadAt + ?Sized, W: Write>(
     let gop_partition = compute_gop_partition(&ordered_plans);
     let gop_count = gop_partition.first().map(|v| v.len()).unwrap_or(0);
 
+    // Per-track canonical-segment uuid prefix (muxl uuid + DRISL catalog).
+    // Same bytes for the same track across all GoPs; one copy emitted at the
+    // head of every non-empty (GoP, track) chunk.
+    let per_track_uuid: Vec<Vec<u8>> = ordered_plans
+        .iter()
+        .map(|p| crate::segment::mint_canonical_segment_prefix(&catalog, p.track_id))
+        .collect::<Result<Vec<_>>>()?;
+
     // Per-track running decode times so each sample's first-fragment tfdt is
     // start_offset_ticks + cumulative durations (matching flat-MP4 emission).
     let mut per_track_decode_time: Vec<u64> =
@@ -115,7 +123,10 @@ pub fn write<R: ReadAt + ?Sized, W: Write>(
                 continue;
             }
             let seg_offset = write_offset;
-            let mut seg_size: u64 = 0;
+            // Canonical-segment uuid prefix at head of this chunk.
+            output.write_all(&per_track_uuid[ti])?;
+            write_offset += per_track_uuid[ti].len() as u64;
+            let mut seg_size: u64 = per_track_uuid[ti].len() as u64;
             let mut seg_dur: u64 = 0;
             let mut seg_samples: u32 = 0;
 

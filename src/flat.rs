@@ -767,6 +767,15 @@ pub fn write_flat_mp4<R: ReadAt + ?Sized, W: Write>(
     let gop_partition = compute_gop_partition(&ordered);
     let gop_count = gop_partition.first().map(|v| v.len()).unwrap_or(0);
 
+    // Per-track canonical-segment uuid prefix (uuid box + DRISL catalog). Same
+    // bytes for the same track across all GoPs; one copy emitted at the head
+    // of every non-empty (GoP, track) chunk in the body. Spec:
+    // canonical-form.md § MUXL Canonical Segment.
+    let per_track_uuid: Vec<Vec<u8>> = ordered
+        .iter()
+        .map(|p| crate::segment::mint_canonical_segment_prefix(catalog, p.track_id))
+        .collect::<Result<Vec<_>>>()?;
+
     // Per-track leading offsets are taken at face value: each track's
     // start_offset_ticks is baked into its first-fragment tfdt and (for
     // non-zero values) into a synthesized canonical elst in the moov.
@@ -804,6 +813,11 @@ pub fn write_flat_mp4<R: ReadAt + ?Sized, W: Write>(
             track_bytes += (moof_size as u64) + 8 + (sample.size as u64);
             dt += sample.duration as u64;
         }
+        // Add the canonical-segment uuid prefix to every non-empty (GoP, track)
+        // chunk for this track.
+        let chunks_with_samples =
+            gop_partition[ti].iter().filter(|r| !r.is_empty()).count() as u64;
+        track_bytes += chunks_with_samples * per_track_uuid[ti].len() as u64;
         per_sample_moof_sizes.push(sizes);
         per_track_byte_totals.push(track_bytes);
         per_track_final_decode_time[ti] = dt;
@@ -895,6 +909,15 @@ pub fn write_flat_mp4<R: ReadAt + ?Sized, W: Write>(
     for gop in 0..gop_count {
         for (ti, plan) in ordered.iter().enumerate() {
             let range = gop_partition[ti][gop].clone();
+            if range.is_empty() {
+                continue;
+            }
+            // Canonical segment uuid prefix lives at the head of this chunk;
+            // first fragment / FlatFragment offset comes after.
+            if per_track_first_offset[ti].is_none() {
+                per_track_first_offset[ti] = Some(running);
+            }
+            running += per_track_uuid[ti].len() as u64;
             for si in range {
                 let moof_size = per_sample_moof_sizes[ti][si];
                 let sample_offset = running + moof_size as u64 + 8;
@@ -908,9 +931,6 @@ pub fn write_flat_mp4<R: ReadAt + ?Sized, W: Write>(
                     sample_size: sample.size,
                     is_sync: sample.is_sync,
                 });
-                if per_track_first_offset[ti].is_none() {
-                    per_track_first_offset[ti] = Some(running);
-                }
                 running += frag_size;
             }
         }
@@ -975,6 +995,11 @@ pub fn write_flat_mp4<R: ReadAt + ?Sized, W: Write>(
     for gop in 0..gop_count {
         for (ti, plan) in ordered.iter().enumerate() {
             let range = gop_partition[ti][gop].clone();
+            if range.is_empty() {
+                continue;
+            }
+            // Canonical-segment uuid prefix at the head of this chunk.
+            output.write_all(&per_track_uuid[ti])?;
             for si in range {
                 let sample = &plan.samples[si];
                 let dt = per_track_sample_decode_times[ti][si];

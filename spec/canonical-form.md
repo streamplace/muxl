@@ -9,8 +9,10 @@ All choices are provisional and subject to revision after playback testing.
 MUXL is a three-layer stack:
 
 - **MUXL fragment** — one encoded sample (video frame or audio packet) in a minimal `moof+mdat` pair. The smallest unit. Bit-identical regardless of how it's transported or stored.
-- **MUXL canonical segment** — a `uuid` box (c2pa-shaped, carrying the per-track catalog as a signed assertion) followed by one track's fragments for one GoP. The unit of content addressing, signing, and verification.
+- **MUXL canonical segment** — a `uuid` box carrying the per-track catalog as a DRISL payload, followed by one track's fragments for one GoP. The unit of content addressing.
 - **Synthesized storage format** — fMP4 (appendable) or flat MP4 (finalized faststart) wrapping N canonical segments together with a derived ISOBMFF header. The header is synthesized from the segments' embedded catalogs. Canonical segments are recoverable byte-for-byte from any storage format.
+
+Signing and provenance — c2pa manifests, S2PA assertions, signed claim chains — are layered on top of MUXL by a separate signing format (see `muxl-sign`). MUXL defines what bytes are canonical; the signing layer defines how those bytes are attested. No c2pa structure appears in MUXL's canonical form.
 
 ## MUXL Fragment
 
@@ -37,12 +39,12 @@ One mdat per moof, containing exactly one sample's data.
 
 ## MUXL Canonical Segment
 
-A canonical segment is the unit of signing, content addressing, and verification.
+A canonical segment is the unit of content addressing. Signing is layered on top — see § Signing & Provenance.
 
 ### Structure
 
 ```
-uuid (c2pa manifest box; uuid = d8fec3d6-1b0e-483c-9221-eaf68bcca8d4)
+uuid (muxl catalog box; uuid = 6d75786c-0001-0000-0000-000000000001)
 moof+mdat (sample 1)
 moof+mdat (sample 2)
 ...
@@ -51,24 +53,17 @@ moof+mdat (sample K)
 
 Each canonical segment carries fragments for exactly one track and one GoP. A multi-track GoP produces multiple canonical segments — one per track.
 
-### Manifest Assertions
+The leading uuid is *always* present — never omitted — so segment boundaries are unambiguous at the byte level. The 16-byte UUID identifier `6d75786c-0001-0000-0000-000000000001` (leading bytes spell `muxl` in ASCII) is provisional pending DASL registration.
 
-The c2pa manifest's claim signature covers all of its assertions. Required:
+### uuid Body
 
-1. **Catalog assertion** — label `dasl.muxl.catalog`. A DRISL-encoded single-track MUXL catalog (one entry in `video.renditions` *or* one entry in `audio.renditions`, never both).
-2. **BMFF v3 hash assertion** — covers the byte range from the end of the `uuid` box through the end of the segment, hashing the `moof+mdat` run.
+The `uuid` box body is a single DRISL-encoded MUXL catalog ([[drisl]]) describing exactly one track — one entry in `video.renditions` *or* one entry in `audio.renditions`, never both. The catalog is the entire body of the box; no JSON-LD wrapper, no c2pa manifest, no signature claim.
 
-Additional assertions (provenance attribution, custom Streamplace metadata, other s2pa assertions) may follow. All are covered by the claim signature.
+DRISL canonical CBOR encoding makes the uuid body byte-deterministic: any two MUXL implementations producing a canonical segment for the same track configuration produce byte-identical uuid box bytes.
 
-Tampering detection:
-- Modifying the catalog changes the catalog assertion's hash → invalidates the claim signature.
-- Modifying any fragment changes the moof+mdat bytes → invalidates the hash assertion → invalidates the claim signature.
+### Tamper Resistance
 
-The two assertions together pin both "what this stream is" (codec configuration) and "what these samples are" (encoded bytes) into a single signed unit. Verification does not require reconstructing a flat MP4 — the hash is computed directly over the segment's trailing byte range.
-
-### Unsigned Segments
-
-A canonical segment may be unsigned: the manifest is present with its required assertions but no signature claim. The `uuid` box is *always* present — never omitted — so segment boundaries are unambiguous at the byte level.
+Modifying the catalog or any fragment changes the canonical segment's bytes, which changes its CID. Detection at the muxl layer is by content-address comparison alone. Cryptographic provenance (proving *who* generated the bytes, not just *that they are these specific bytes*) is added by the signing layer.
 
 ### Segmentation Rule
 
@@ -85,7 +80,7 @@ Given the same samples with the same timestamps, segment boundaries are always i
 
 ### Round-Trip Property
 
-A canonical segment's bytes are recoverable byte-for-byte from any storage format by stripping the synthesized header and splitting on `uuid` boundaries. This is what lets c2pa signatures survive storage-format conversion.
+A canonical segment's bytes are recoverable byte-for-byte from any storage format by stripping the synthesized header and splitting on `uuid` boundaries. This is what lets signatures applied by an upper signing layer survive storage-format conversion.
 
 ## Synthesized Storage Formats
 
@@ -275,7 +270,7 @@ Round-trip:
 Two consequences worth noting:
 
 - **Capture-clock anchor preserved.** A source whose first sample lands at decode_time=24000 produces canonical bytes whose first-fragment tfdt is 24000. For HLS playback this is invisible (the playlist anchors the timeline); for direct `<video src>` playback the timeline starts at the encoded position, not at zero. Callers who specifically need a "shift to time zero" transform should apply it explicitly before writing.
-- **Different absolute anchors → different canonical CIDs.** Two source files with the same logical content but different leading offsets produce different canonical bytes (and therefore different CIDs). Same-logical-content / same-CID is not a property of muxl's canonical form; it never has been across all dimensions, and absolute time anchoring is a meaningful axis here. Wall-clock provenance, when needed, can also be carried in c2pa/S2PA assertions.
+- **Different absolute anchors → different canonical CIDs.** Two source files with the same logical content but different leading offsets produce different canonical bytes (and therefore different CIDs). Same-logical-content / same-CID is not a property of muxl's canonical form; it never has been across all dimensions, and absolute time anchoring is a meaningful axis here. Wall-clock provenance, when needed, is carried by an upper signing layer (C2PA/S2PA), not by MUXL itself.
 
 Source `elst` patterns outside the leading-empty-edit shape — media-time offsets used for encoder priming, rate changes, trims — are not converged by MUXL and are tracked in `open-questions.md`. A source file with a priming `elst` (e.g. `media_time = 1024` for AAC) currently loses the priming metadata in the MUXL form; playback is offset by the priming duration until a separate sample-dropping normalization lands.
 

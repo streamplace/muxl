@@ -44,9 +44,8 @@
 use std::io::Write;
 
 use mp4_atom::{
-    Co64, Ctts, CttsEntry, Edts, Elst, ElstEntry, Encode, Ftyp, Mfhd, Moof, Moov, Mvhd, Stbl, Stsc,
-    StscEntry, Stss, Stsz, StszSamples, Stts, SttsEntry, Tfdt, Tfhd, Traf, Trak, Trun, TrunEntry,
-    WriteTo,
+    Co64, Ctts, CttsEntry, Edts, Elst, ElstEntry, Ftyp, Moov, Mvhd, Stbl, Stsc, StscEntry, Stss,
+    Stsz, StszSamples, Stts, SttsEntry, Trak, WriteTo,
 };
 
 use crate::catalog::Catalog;
@@ -145,6 +144,255 @@ pub struct SegmentMetadata {
     /// mid-stream). Empty / zero-valued for stream-from-start VODs.
     /// Values on subsequent segments are ignored.
     pub first_decode_times: std::collections::BTreeMap<u32, u64>,
+}
+
+/// Pre-computed layout for emitting canonical-segment bodies from a
+/// per-track sample plan. Pure metadata — no sample IO. Shared between the
+/// fMP4 and flat-MP4 writers.
+pub(crate) struct CanonicalBodyPlan {
+    /// Per-track canonical-segment uuid prefix (uuid box + DRISL catalog).
+    pub per_track_uuid: Vec<Vec<u8>>,
+    /// Per-track per-sample measured moof sizes, in decode order.
+    pub per_sample_moof_sizes: Vec<Vec<u32>>,
+    /// `gop_partition[ti][gop]` = sample-index range of track `ti`'s
+    /// contribution to GoP `gop`. Empty range = no samples in this GoP.
+    pub gop_partition: Vec<Vec<std::ops::Range<usize>>>,
+    /// Per-GoP segment metadata, suitable for `build_synth_flat_header`.
+    pub per_gop_metadata: Vec<SegmentMetadata>,
+}
+
+/// Compute everything needed to emit the canonical-segment body from a
+/// per-track sample plan, without touching sample bytes: moof sizes,
+/// GoP partitioning, per-GoP `SegmentMetadata`, and per-track uuid
+/// prefixes. The same metadata feeds `build_synth_flat_header` for the
+/// flat-MP4 moov.
+///
+/// `ordered` must be track-id-ascending.
+pub(crate) fn plan_canonical_body(
+    catalog: &Catalog,
+    ordered: &[&TrackPlan],
+) -> Result<CanonicalBodyPlan> {
+    use crate::fragment::{FrameInfo, measure_frame_moof};
+
+    let per_track_uuid: Vec<Vec<u8>> = ordered
+        .iter()
+        .map(|p| crate::segment::mint_canonical_segment_prefix(catalog, p.track_id))
+        .collect::<Result<Vec<_>>>()?;
+
+    // Measure each inner moof's encoded size from sample plan metadata
+    // alone.
+    let mut per_sample_moof_sizes: Vec<Vec<u32>> = Vec::with_capacity(ordered.len());
+    for plan in ordered.iter() {
+        let mut sizes = Vec::with_capacity(plan.samples.len());
+        let mut dt: u64 = plan.start_offset_ticks;
+        for sample in &plan.samples {
+            let frame = FrameInfo {
+                duration: sample.duration,
+                size: sample.size,
+                is_sync: sample.is_sync,
+                cts_offset: sample.cts_offset,
+            };
+            sizes.push(measure_frame_moof(plan.track_id, dt, &frame)?);
+            dt += sample.duration as u64;
+        }
+        per_sample_moof_sizes.push(sizes);
+    }
+
+    let gop_partition = compute_gop_partition(ordered);
+    let gop_count = gop_partition.first().map(|v| v.len()).unwrap_or(0);
+
+    // Per-GoP SegmentMetadata. track_byte_sizes includes the leading uuid
+    // prefix; offsets_in_track point at the sample payload past the
+    // prefix + the inner moof + mdat header.
+    let mut per_gop_metadata: Vec<SegmentMetadata> = Vec::with_capacity(gop_count);
+    for gop in 0..gop_count {
+        let mut meta = SegmentMetadata::default();
+        for (ti, plan) in ordered.iter().enumerate() {
+            let range = gop_partition[ti][gop].clone();
+            if range.is_empty() {
+                continue;
+            }
+            let tid = plan.track_id;
+            let uuid_len = per_track_uuid[ti].len() as u64;
+
+            let mut size: u64 = uuid_len;
+            let mut ts = crate::segment::TrackSamples::default();
+            let mut off: u64 = uuid_len;
+            for (idx, si) in range.clone().enumerate() {
+                let sample = &plan.samples[si];
+                let moof_size = per_sample_moof_sizes[ti][si] as u64;
+                let frag_size = moof_size + 8 + sample.size as u64;
+                ts.durations.push(sample.duration);
+                ts.sizes.push(sample.size);
+                ts.cts_offsets.push(sample.cts_offset);
+                if sample.is_sync {
+                    ts.sync_indices.push((idx + 1) as u32);
+                }
+                ts.offsets_in_track.push(off + moof_size + 8);
+                off += frag_size;
+                size += frag_size;
+            }
+            meta.track_byte_sizes.insert(tid, size);
+            meta.samples.insert(tid, ts);
+        }
+        per_gop_metadata.push(meta);
+    }
+
+    // First-GoP first_decode_times — anchors the synthesized elst when a
+    // VOD starts at a non-zero decode time. Subsequent GoPs' values are
+    // ignored by build_synth_flat_header.
+    if !per_gop_metadata.is_empty() {
+        for plan in ordered.iter() {
+            per_gop_metadata[0]
+                .first_decode_times
+                .insert(plan.track_id, plan.start_offset_ticks);
+        }
+    }
+
+    Ok(CanonicalBodyPlan {
+        per_track_uuid,
+        per_sample_moof_sizes,
+        gop_partition,
+        per_gop_metadata,
+    })
+}
+
+/// Per-fragment / per-segment layout info returned by `write_canonical_body`.
+pub(crate) struct CanonicalBodyOutcome {
+    /// Per-track absolute file offset of the first canonical-segment chunk.
+    /// `None` if a track had no samples.
+    pub per_track_first_offset: Vec<Option<u64>>,
+    /// Per-track FlatFragment metadata for every sample.
+    pub per_track_fragments: Vec<Vec<FlatFragment>>,
+    /// Per-track BlobSegment metadata for every non-empty (track, GoP) chunk.
+    pub per_track_segments: Vec<Vec<crate::hls::BlobSegment>>,
+    /// Total body bytes written (sum of every canonical segment's bytes).
+    pub total_bytes: u64,
+}
+
+/// Stream-write the canonical-segment body to `output` in time-slice
+/// interleaved order. Per-track samples are read on demand from `input`;
+/// per-track moofs are minted via `write_frame_fragment` — the single source
+/// of canonical-fragment bytes.
+///
+/// `body_start_offset` is the absolute file offset where the first byte
+/// of the body will land. Returned per-fragment / per-segment offsets are
+/// absolute (in the final file).
+pub(crate) fn write_canonical_body<R, W>(
+    ordered: &[&TrackPlan],
+    plan: &CanonicalBodyPlan,
+    body_start_offset: u64,
+    input: &R,
+    output: &mut W,
+) -> Result<CanonicalBodyOutcome>
+where
+    R: ReadAt + ?Sized,
+    W: Write,
+{
+    use crate::fragment::{FrameInfo, write_frame_fragment};
+    use crate::hls::BlobSegment;
+
+    let gop_count = plan
+        .gop_partition
+        .first()
+        .map(|v| v.len())
+        .unwrap_or(0);
+
+    let mut per_track_first_offset: Vec<Option<u64>> = vec![None; ordered.len()];
+    let mut per_track_fragments: Vec<Vec<FlatFragment>> = (0..ordered.len())
+        .map(|i| Vec::with_capacity(ordered[i].samples.len()))
+        .collect();
+    let mut per_track_segments: Vec<Vec<BlobSegment>> =
+        (0..ordered.len()).map(|_| Vec::new()).collect();
+
+    let mut per_track_decode_time: Vec<u64> =
+        ordered.iter().map(|p| p.start_offset_ticks).collect();
+
+    let mut absolute_offset = body_start_offset;
+    let mut io_buf = vec![0u8; 256 * 1024];
+
+    for gop in 0..gop_count {
+        for (ti, trk) in ordered.iter().enumerate() {
+            let range = plan.gop_partition[ti][gop].clone();
+            if range.is_empty() {
+                continue;
+            }
+
+            let seg_start = absolute_offset;
+            if per_track_first_offset[ti].is_none() {
+                per_track_first_offset[ti] = Some(seg_start);
+            }
+
+            // Canonical-segment uuid prefix.
+            output.write_all(&plan.per_track_uuid[ti])?;
+            absolute_offset += plan.per_track_uuid[ti].len() as u64;
+
+            let mut seg_dur: u64 = 0;
+            let mut seg_samples: u32 = 0;
+
+            for si in range {
+                let sample = &trk.samples[si];
+                let frame = FrameInfo {
+                    duration: sample.duration,
+                    size: sample.size,
+                    is_sync: sample.is_sync,
+                    cts_offset: sample.cts_offset,
+                };
+                let size = sample.size as usize;
+                if io_buf.len() < size {
+                    io_buf.resize(size, 0);
+                }
+                input
+                    .read_exact_at(sample.input_offset, &mut io_buf[..size])
+                    .map_err(Error::Io)?;
+
+                let moof_offset = absolute_offset;
+                let bytes_written = write_frame_fragment(
+                    output,
+                    trk.track_id,
+                    per_track_decode_time[ti],
+                    &frame,
+                    &io_buf[..size],
+                )?;
+
+                // Sanity check: actual write matches pre-pass measurement.
+                let expected = plan.per_sample_moof_sizes[ti][si] as u64 + 8 + size as u64;
+                if bytes_written != expected {
+                    return Err(Error::InvalidMp4(format!(
+                        "fragment size drift: track {} sample {}: measured {} wrote {}",
+                        trk.track_id, si, expected, bytes_written,
+                    )));
+                }
+
+                per_track_fragments[ti].push(FlatFragment {
+                    offset: moof_offset,
+                    size: bytes_written,
+                    duration: sample.duration,
+                    sample_size: sample.size,
+                    is_sync: sample.is_sync,
+                });
+
+                absolute_offset += bytes_written;
+                seg_dur += sample.duration as u64;
+                seg_samples += 1;
+                per_track_decode_time[ti] += sample.duration as u64;
+            }
+
+            per_track_segments[ti].push(BlobSegment {
+                offset: seg_start,
+                size: absolute_offset - seg_start,
+                duration_ticks: seg_dur,
+                sample_count: seg_samples,
+            });
+        }
+    }
+
+    Ok(CanonicalBodyOutcome {
+        per_track_first_offset,
+        per_track_fragments,
+        per_track_segments,
+        total_bytes: absolute_offset - body_start_offset,
+    })
 }
 
 /// Synthesize the header bytes of a multi-segment MUXL flat MP4 from
@@ -764,363 +1012,55 @@ pub fn write_flat_mp4<R: ReadAt + ?Sized, W: Write>(
 ) -> Result<FlatMp4Info> {
     let mut ordered: Vec<&TrackPlan> = plans.iter().collect();
     ordered.sort_by_key(|p| p.track_id);
-    let gop_partition = compute_gop_partition(&ordered);
-    let gop_count = gop_partition.first().map(|v| v.len()).unwrap_or(0);
 
-    // Per-track canonical-segment uuid prefix (uuid box + DRISL catalog). Same
-    // bytes for the same track across all GoPs; one copy emitted at the head
-    // of every non-empty (GoP, track) chunk in the body. Spec:
-    // canonical-form.md § MUXL Canonical Segment.
-    let per_track_uuid: Vec<Vec<u8>> = ordered
-        .iter()
-        .map(|p| crate::segment::mint_canonical_segment_prefix(catalog, p.track_id))
-        .collect::<Result<Vec<_>>>()?;
+    // Pre-compute moof sizes, GoP partition, uuid prefixes, and per-GoP
+    // SegmentMetadata. Pure metadata pass — no sample IO.
+    let plan = plan_canonical_body(catalog, &ordered)?;
 
-    // Per-track leading offsets are taken at face value: each track's
-    // start_offset_ticks is baked into its first-fragment tfdt and (for
-    // non-zero values) into a synthesized canonical elst in the moov.
-    // No inter-track normalization here — A/V sync rides on the per-track
-    // delta, and absolute time anchoring is preserved as-is. Spec:
-    // canonical-form.md § edts/elst.
+    // Synthesize ftyp + moov + mdat-envelope-header from the per-GoP
+    // metadata. This is the same path Streamplace uses to assemble a VOD
+    // header from frozen segment metadata — the writer here just feeds it
+    // freshly-computed metadata.
+    let header = build_synth_flat_header(catalog, &plan.per_gop_metadata)?;
+    let body_start_offset = header.len() as u64;
+    output.write_all(&header)?;
 
-    // ftyp — canonical-form.md § ftyp
-    let ftyp = Ftyp {
-        major_brand: b"muxl".into(),
-        minor_version: 0,
-        compatible_brands: vec![b"muxl".into(), b"isom".into(), b"iso2".into()],
-    };
-    let mut ftyp_buf = Vec::new();
-    ftyp.write_to(&mut ftyp_buf).map_err(mp4_err)?;
-    let ftyp_size = ftyp_buf.len() as u64;
-
-    // Pass 1: measure each inner moof's size so we know per-sample byte layout.
-    // mfhd sequence numbers increment globally across all tracks, matching the
-    // fMP4 emitter. The initial decode_time per track is the effective
-    // (post-normalization) offset — baking any inter-track A/V delta into
-    // the first-fragment tfdt.
-    let mut per_sample_moof_sizes: Vec<Vec<u32>> = Vec::with_capacity(ordered.len());
-    let mut per_track_byte_totals: Vec<u64> = Vec::with_capacity(ordered.len());
-    let mut per_track_final_decode_time: Vec<u64> = vec![0; ordered.len()];
-
-    for (ti, plan) in ordered.iter().enumerate() {
-        let mut sizes = Vec::with_capacity(plan.samples.len());
-        let mut track_bytes: u64 = 0;
-        let mut dt: u64 = plan.start_offset_ticks;
-
-        for sample in &plan.samples {
-            let moof_size = measure_frame_moof(plan.track_id, dt, sample)?;
-            sizes.push(moof_size);
-            track_bytes += (moof_size as u64) + 8 + (sample.size as u64);
-            dt += sample.duration as u64;
-        }
-        // Add the canonical-segment uuid prefix to every non-empty (GoP, track)
-        // chunk for this track.
-        let chunks_with_samples =
-            gop_partition[ti].iter().filter(|r| !r.is_empty()).count() as u64;
-        track_bytes += chunks_with_samples * per_track_uuid[ti].len() as u64;
-        per_sample_moof_sizes.push(sizes);
-        per_track_byte_totals.push(track_bytes);
-        per_track_final_decode_time[ti] = dt;
-    }
-
-    // Build base traks (tkhd + mdia + empty stbl) from catalog.
-    let mut traks: Vec<Trak> = Vec::with_capacity(ordered.len());
-    let mut track_ts: Vec<u32> = Vec::with_capacity(ordered.len());
-    for plan in &ordered {
-        let (trak, timescale) = build_base_trak(catalog, plan.track_id)?;
-        traks.push(trak);
-        track_ts.push(timescale);
-    }
-
-    // Populate sample tables with placeholder co64 (correct length, zero
-    // values — moov size is invariant under co64 value changes). Durations
-    // exclude the leading effective offset (which lives in the synthesized
-    // elst, not in the media timeline) — `mdhd.duration` is the sum of
-    // sample durations, `tkhd.duration` is that plus the presentation offset.
-    for (ti, plan) in ordered.iter().enumerate() {
-        let n = plan.samples.len() as u32;
-        populate_stbl(
-            &mut traks[ti].mdia.minf.stbl,
-            plan,
-            &vec![0u64; n as usize],
-        );
-        let media_duration = per_track_final_decode_time[ti] - plan.start_offset_ticks;
-        traks[ti].mdia.mdhd.duration = media_duration;
-        // Synthesize a canonical elst for non-zero presentation offsets so
-        // flat-MP4 players honor the same start offset baked into the
-        // first-fragment tfdt. Spec: canonical-form.md § edts/elst.
-        traks[ti].edts =
-            build_canonical_elst(plan.start_offset_ticks, media_duration, track_ts[ti]);
-        let tkhd_duration = rescale_to_movie(
-            media_duration + plan.start_offset_ticks,
-            track_ts[ti],
-        );
-        traks[ti].tkhd.duration = tkhd_duration;
-    }
-
-    let movie_duration: u64 = per_track_final_decode_time
-        .iter()
-        .zip(&track_ts)
-        .map(|(md, ts)| rescale_to_movie(*md, *ts))
-        .max()
-        .unwrap_or(0);
-
-    let max_track_id = ordered.iter().map(|p| p.track_id).max().unwrap_or(0);
-
-    let mvhd = Mvhd {
-        creation_time: 0,
-        modification_time: 0,
-        timescale: MOVIE_TIMESCALE,
-        duration: movie_duration,
-        rate: 1u16.into(),
-        volume: 1u8.into(),
-        matrix: Default::default(),
-        next_track_id: max_track_id + 1,
-    };
-
-    let mut moov = Moov {
-        mvhd: mvhd.clone(),
-        meta: None,
-        mvex: None,
-        trak: traks,
-        udta: None,
-        ainf: None,
-    };
-
-    // Encode moov once to measure its size, with placeholder offsets.
-    let mut moov_buf = Vec::new();
-    moov.write_to(&mut moov_buf).map_err(mp4_err)?;
-    let moov_size = moov_buf.len() as u64;
-
-    const ENVELOPE_HEADER_SIZE: u64 = 16; // size=1 + "mdat" + 8-byte largesize
-    let mdat_payload_offset = ftyp_size + moov_size + ENVELOPE_HEADER_SIZE;
-
-    // Compute per-sample absolute offsets in time-slice write order: for each
-    // GoP, all tracks' samples in track_id-ascending order, then the next GoP.
-    // co64 entries are appended per-track in natural sample order (since each
-    // track's samples within a GoP are decode-ordered and GoPs are time-sorted).
-    let mut running = mdat_payload_offset;
-    let mut per_track_co64: Vec<Vec<u64>> =
-        (0..ordered.len()).map(|i| Vec::with_capacity(ordered[i].samples.len())).collect();
-    let mut per_track_fragments: Vec<Vec<FlatFragment>> =
-        (0..ordered.len()).map(|i| Vec::with_capacity(ordered[i].samples.len())).collect();
-    let mut per_track_first_offset: Vec<Option<u64>> = vec![None; ordered.len()];
-
-    for gop in 0..gop_count {
-        for (ti, plan) in ordered.iter().enumerate() {
-            let range = gop_partition[ti][gop].clone();
-            if range.is_empty() {
-                continue;
-            }
-            // Canonical segment uuid prefix lives at the head of this chunk;
-            // first fragment / FlatFragment offset comes after.
-            if per_track_first_offset[ti].is_none() {
-                per_track_first_offset[ti] = Some(running);
-            }
-            running += per_track_uuid[ti].len() as u64;
-            for si in range {
-                let moof_size = per_sample_moof_sizes[ti][si];
-                let sample_offset = running + moof_size as u64 + 8;
-                per_track_co64[ti].push(sample_offset);
-                let sample = &plan.samples[si];
-                let frag_size = moof_size as u64 + 8 + sample.size as u64;
-                per_track_fragments[ti].push(FlatFragment {
-                    offset: running,
-                    size: frag_size,
-                    duration: sample.duration,
-                    sample_size: sample.size,
-                    is_sync: sample.is_sync,
-                });
-                running += frag_size;
-            }
-        }
-    }
+    // Stream the canonical-segment body verbatim. Sample bytes flow from
+    // `input` through `write_frame_fragment` (the sole moof-minting path).
+    let body = write_canonical_body(&ordered, &plan, body_start_offset, input, output)?;
 
     let mut track_info: std::collections::BTreeMap<u32, FlatTrackInfo> =
         std::collections::BTreeMap::new();
-    for (ti, plan) in ordered.iter().enumerate() {
-        moov.trak[ti].mdia.minf.stbl.co64 = Some(Co64 {
-            entries: std::mem::take(&mut per_track_co64[ti]),
-        });
+    for (ti, trk) in ordered.iter().enumerate() {
+        let timescale = catalog
+            .video_configs()
+            .find(|v| v.track_id() == trk.track_id)
+            .map(|v| v.timescale())
+            .or_else(|| {
+                catalog
+                    .audio_configs()
+                    .find(|a| a.track_id() == trk.track_id)
+                    .map(|a| a.timescale())
+            })
+            .ok_or_else(|| {
+                Error::InvalidMp4(format!("track {} not in catalog", trk.track_id))
+            })?;
         track_info.insert(
-            plan.track_id,
+            trk.track_id,
             FlatTrackInfo {
-                is_video: plan.is_video,
-                timescale: track_ts[ti],
-                track_offset: per_track_first_offset[ti].unwrap_or(mdat_payload_offset),
-                fragments: std::mem::take(&mut per_track_fragments[ti]),
+                is_video: trk.is_video,
+                timescale,
+                track_offset: body.per_track_first_offset[ti].unwrap_or(body_start_offset),
+                fragments: body.per_track_fragments[ti].clone(),
             },
         );
     }
 
-    // Re-encode moov with final offsets.
-    let mut moov_buf2 = Vec::new();
-    moov.write_to(&mut moov_buf2).map_err(mp4_err)?;
-    if moov_buf2.len() as u64 != moov_size {
-        return Err(Error::InvalidMp4(format!(
-            "moov size changed between passes: {} -> {}",
-            moov_size,
-            moov_buf2.len()
-        )));
-    }
-
-    // Write ftyp, moov.
-    output.write_all(&ftyp_buf)?;
-    output.write_all(&moov_buf2)?;
-
-    // Write outer mdat envelope header (64-bit largesize).
-    let total_payload: u64 = per_track_byte_totals.iter().sum();
-    let largesize: u64 = ENVELOPE_HEADER_SIZE + total_payload;
-    output.write_all(&1u32.to_be_bytes())?;
-    output.write_all(b"mdat")?;
-    output.write_all(&largesize.to_be_bytes())?;
-
-    // Write inner moof+mdat pairs in time-slice order (matching pass 2 above).
-    // Per-sample decode times are precomputed in natural sample order; we look
-    // them up by (track_index, sample_index).
-    let per_track_sample_decode_times: Vec<Vec<u64>> = ordered
-        .iter()
-        .map(|plan| {
-            let mut times = Vec::with_capacity(plan.samples.len());
-            let mut dt: u64 = plan.start_offset_ticks;
-            for s in &plan.samples {
-                times.push(dt);
-                dt += s.duration as u64;
-            }
-            times
-        })
-        .collect();
-
-    let mut io_buf = vec![0u8; 256 * 1024];
-    for gop in 0..gop_count {
-        for (ti, plan) in ordered.iter().enumerate() {
-            let range = gop_partition[ti][gop].clone();
-            if range.is_empty() {
-                continue;
-            }
-            // Canonical-segment uuid prefix at the head of this chunk.
-            output.write_all(&per_track_uuid[ti])?;
-            for si in range {
-                let sample = &plan.samples[si];
-                let dt = per_track_sample_decode_times[ti][si];
-                let size = sample.size as usize;
-                if io_buf.len() < size {
-                    io_buf.resize(size, 0);
-                }
-                input
-                    .read_exact_at(sample.input_offset, &mut io_buf[..size])
-                    .map_err(Error::Io)?;
-
-                write_frame_pair(
-                    output,
-                    plan.track_id,
-                    dt,
-                    sample,
-                    &io_buf[..size],
-                    per_sample_moof_sizes[ti][si],
-                )?;
-            }
-        }
-    }
-
     Ok(FlatMp4Info {
-        total_bytes: ftyp_size + moov_size + ENVELOPE_HEADER_SIZE + total_payload,
-        mdat_payload_offset,
+        total_bytes: body_start_offset + body.total_bytes,
+        mdat_payload_offset: body_start_offset,
         tracks: track_info,
     })
-}
-
-/// Build the Moof data structure for a single sample.
-/// mfhd.sequence_number is hardcoded to 0 per canonical-form.md § MUXL Fragment.
-fn build_frame_moof(
-    track_id: u32,
-    base_decode_time: u64,
-    sample: &Sample,
-    data_offset: i32,
-) -> Moof {
-    let sample_flags: u32 = if sample.is_sync {
-        0x02000000
-    } else {
-        0x01010000
-    };
-    let has_cts = sample.cts_offset != 0;
-
-    let entry = TrunEntry {
-        duration: Some(sample.duration),
-        size: Some(sample.size),
-        flags: Some(sample_flags),
-        cts: if has_cts { Some(sample.cts_offset) } else { None },
-    };
-
-    Moof {
-        mfhd: Mfhd { sequence_number: 0 },
-        traf: vec![Traf {
-            tfhd: Tfhd {
-                track_id,
-                base_data_offset: None,
-                sample_description_index: None,
-                default_sample_duration: None,
-                default_sample_size: None,
-                default_sample_flags: None,
-            },
-            tfdt: Some(Tfdt {
-                base_media_decode_time: base_decode_time,
-            }),
-            trun: vec![Trun {
-                data_offset: Some(data_offset),
-                entries: vec![entry],
-            }],
-            ..Default::default()
-        }],
-    }
-}
-
-/// Measure the encoded size of the moof for a single sample.
-fn measure_frame_moof(
-    track_id: u32,
-    base_decode_time: u64,
-    sample: &Sample,
-) -> Result<u32> {
-    // data_offset is a fixed-size i32, so its value doesn't affect size.
-    let moof = build_frame_moof(track_id, base_decode_time, sample, 0);
-    let mut buf = Vec::new();
-    moof.encode(&mut buf).map_err(mp4_err)?;
-    Ok(buf.len() as u32)
-}
-
-/// Write a single moof+mdat pair to `output`. `expected_moof_size` must match
-/// the pass-1 measurement — the pass-1 value is what was baked into `co64`.
-fn write_frame_pair<W: Write>(
-    output: &mut W,
-    track_id: u32,
-    base_decode_time: u64,
-    sample: &Sample,
-    sample_data: &[u8],
-    expected_moof_size: u32,
-) -> Result<()> {
-    let data_offset = (expected_moof_size + 8) as i32;
-    let moof = build_frame_moof(
-        track_id,
-        base_decode_time,
-        sample,
-        data_offset,
-    );
-    let mut moof_buf = Vec::new();
-    moof.encode(&mut moof_buf).map_err(mp4_err)?;
-    if moof_buf.len() as u32 != expected_moof_size {
-        return Err(Error::InvalidMp4(format!(
-            "moof size drift: measured {}, wrote {}",
-            expected_moof_size,
-            moof_buf.len()
-        )));
-    }
-    output.write_all(&moof_buf)?;
-
-    let mdat_total_size = 8u32 + sample_data.len() as u32;
-    output.write_all(&mdat_total_size.to_be_bytes())?;
-    output.write_all(b"mdat")?;
-    output.write_all(sample_data)?;
-    Ok(())
 }
 
 /// Build a base trak (tkhd + mdia + empty stbl) for a track_id from the catalog.
@@ -1373,7 +1313,7 @@ mod tests {
     fn flat_inner_fragments_are_self_contained_cmaf() {
         // Walk the moov to find co64 offsets, then check each sample's preceding
         // bytes form a valid moof+mdat pair that parses back to the same sample data.
-        use mp4_atom::{Atom, Decode, Header, ReadFrom};
+        use mp4_atom::{Atom, Decode, Header, Moof, ReadFrom};
 
         let name = "h264-aac.mp4";
         let out = convert(name);

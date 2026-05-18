@@ -121,6 +121,19 @@ fn mp4_err(e: mp4_atom::Error) -> Error {
     Error::InvalidMp4(e.to_string())
 }
 
+/// Measure the encoded size of the canonical moof for a single sample,
+/// without writing it. Used during pre-pass metadata computation.
+pub(crate) fn measure_frame_moof(
+    track_id: u32,
+    base_decode_time: u64,
+    frame: &FrameInfo,
+) -> Result<u32> {
+    let mut buf = Vec::new();
+    write_frame_fragment(&mut buf, track_id, base_decode_time, frame, &[])?;
+    // bytes_written = moof + 8-byte empty-mdat header; subtract the mdat header.
+    Ok((buf.len() as u32) - 8)
+}
+
 // ---------------------------------------------------------------------------
 // Streaming fMP4 path (no Seek required)
 // ---------------------------------------------------------------------------

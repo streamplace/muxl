@@ -81,95 +81,30 @@ pub fn write<R: ReadAt + ?Sized, W: Write>(
     output: &mut W,
 ) -> Result<Vec<crate::hls::BlobTrack>> {
     use crate::cid;
-    use crate::error::Error;
-    use crate::flat::compute_gop_partition;
-    use crate::fragment::{FrameInfo, write_frame_fragment};
-    use crate::hls::{BlobSegment, BlobTrack};
+    use crate::flat::{plan_canonical_body, write_canonical_body};
+    use crate::hls::BlobTrack;
 
     let catalog = source.catalog.clone();
     let init = crate::init::build_init_segment(&catalog)?;
     let track_inits = crate::init::build_track_init_segments(&catalog)?;
 
     output.write_all(&init)?;
-    let init_len = init.len() as u64;
-    let mut write_offset = init_len;
+    let body_start_offset = init.len() as u64;
 
     // Plans sorted by track_id (Plan::new already does this; defensive sort).
     let mut ordered_plans: Vec<&crate::source::TrackPlan> = source.plan.tracks.iter().collect();
     ordered_plans.sort_by_key(|p| p.track_id);
-    let gop_partition = compute_gop_partition(&ordered_plans);
-    let gop_count = gop_partition.first().map(|v| v.len()).unwrap_or(0);
 
-    // Per-track canonical-segment uuid prefix (muxl uuid + DRISL catalog).
-    // Same bytes for the same track across all GoPs; one copy emitted at the
-    // head of every non-empty (GoP, track) chunk.
-    let per_track_uuid: Vec<Vec<u8>> = ordered_plans
-        .iter()
-        .map(|p| crate::segment::mint_canonical_segment_prefix(&catalog, p.track_id))
-        .collect::<Result<Vec<_>>>()?;
-
-    // Per-track running decode times so each sample's first-fragment tfdt is
-    // start_offset_ticks + cumulative durations (matching flat-MP4 emission).
-    let mut per_track_decode_time: Vec<u64> =
-        ordered_plans.iter().map(|p| p.start_offset_ticks).collect();
-    // Per-track HLS BlobSegments — one per GoP, in GoP order.
-    let mut per_track_segments: Vec<Vec<BlobSegment>> =
-        (0..ordered_plans.len()).map(|_| Vec::new()).collect();
-
-    for gop in 0..gop_count {
-        for (ti, plan) in ordered_plans.iter().enumerate() {
-            let range = gop_partition[ti][gop].clone();
-            if range.is_empty() {
-                continue;
-            }
-            let seg_offset = write_offset;
-            // Canonical-segment uuid prefix at head of this chunk.
-            output.write_all(&per_track_uuid[ti])?;
-            write_offset += per_track_uuid[ti].len() as u64;
-            let mut seg_size: u64 = per_track_uuid[ti].len() as u64;
-            let mut seg_dur: u64 = 0;
-            let mut seg_samples: u32 = 0;
-
-            for si in range {
-                let sample = &plan.samples[si];
-                let frame = FrameInfo {
-                    duration: sample.duration,
-                    size: sample.size,
-                    is_sync: sample.is_sync,
-                    cts_offset: sample.cts_offset,
-                };
-                let mut data = vec![0u8; sample.size as usize];
-                input
-                    .read_exact_at(sample.input_offset, &mut data)
-                    .map_err(Error::Io)?;
-                let bytes_written = write_frame_fragment(
-                    output,
-                    plan.track_id,
-                    per_track_decode_time[ti],
-                    &frame,
-                    &data,
-                )?;
-                seg_size += bytes_written;
-                seg_dur += sample.duration as u64;
-                seg_samples += 1;
-                write_offset += bytes_written;
-                per_track_decode_time[ti] += sample.duration as u64;
-            }
-
-            per_track_segments[ti].push(BlobSegment {
-                offset: seg_offset,
-                size: seg_size,
-                duration_ticks: seg_dur,
-                sample_count: seg_samples,
-            });
-        }
-    }
+    // Stream the canonical-segment body — same path the flat writer uses.
+    let plan = plan_canonical_body(&catalog, &ordered_plans)?;
+    let body = write_canonical_body(&ordered_plans, &plan, body_start_offset, input, output)?;
+    let write_offset = body_start_offset + body.total_bytes;
 
     let mut tracks: Vec<BlobTrack> = Vec::with_capacity(ordered_plans.len());
-    for (ti, plan) in ordered_plans.iter().enumerate() {
-        let tid = plan.track_id;
-        let ts = plan.timescale;
-        let segments = std::mem::take(&mut per_track_segments[ti]);
+    for (ti, plan_) in ordered_plans.iter().enumerate() {
+        let tid = plan_.track_id;
+        let ts = plan_.timescale;
+        let segments = body.per_track_segments[ti].clone();
         let init_data = track_inits.get(&tid).cloned().unwrap_or_default();
         let init_cid = cid::from_bytes(&init_data);
 

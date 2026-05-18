@@ -305,8 +305,13 @@ where
     let mut per_track_segments: Vec<Vec<BlobSegment>> =
         (0..ordered.len()).map(|_| Vec::new()).collect();
 
-    let mut per_track_decode_time: Vec<u64> =
-        ordered.iter().map(|p| p.start_offset_ticks).collect();
+    // Per-track running state (decode time + sequence number) — opaque to
+    // this body-layout loop, advanced inside `write_frame_fragment`. Spec:
+    // canonical-form.md § MUXL Fragment → moof.
+    let mut per_track_progress: Vec<crate::fragment::TrackProgress> = ordered
+        .iter()
+        .map(|p| crate::fragment::TrackProgress::starting_at(p.start_offset_ticks))
+        .collect();
 
     let mut absolute_offset = body_start_offset;
     let mut io_buf = vec![0u8; 256 * 1024];
@@ -350,7 +355,7 @@ where
                 let bytes_written = write_frame_fragment(
                     output,
                     trk.track_id,
-                    per_track_decode_time[ti],
+                    &mut per_track_progress[ti],
                     &frame,
                     &io_buf[..size],
                 )?;
@@ -375,7 +380,6 @@ where
                 absolute_offset += bytes_written;
                 seg_dur += sample.duration as u64;
                 seg_samples += 1;
-                per_track_decode_time[ti] += sample.duration as u64;
             }
 
             per_track_segments[ti].push(BlobSegment {

@@ -33,19 +33,56 @@ pub(crate) struct FrameInfo {
     pub cts_offset: i32,
 }
 
-/// Write a single-sample moof+mdat fragment.
+/// Per-track running state across moof+mdat pairs: cumulative decode time
+/// and the count of fragments already emitted for the track. The next-minted
+/// fragment carries `mfhd.sequence_number = fragments_emitted + 1` and
+/// `tfdt.base_media_decode_time = decode_time`. Spec: canonical-form.md
+/// § MUXL Fragment → moof.
+///
+/// All canonical-fragment minting flows through `write_frame_fragment`,
+/// which reads from and advances this state. Body-layout code (in flat.rs,
+/// fmp4.rs) holds `TrackProgress` opaquely and never touches its fields
+/// directly.
+#[derive(Default, Clone, Copy)]
+pub(crate) struct TrackProgress {
+    decode_time: u64,
+    fragments_emitted: u32,
+}
+
+impl TrackProgress {
+    /// New progress starting at `base_decode_time` with no fragments emitted.
+    /// The first minted fragment will land at this `tfdt` with
+    /// `sequence_number = 1`.
+    pub fn starting_at(base_decode_time: u64) -> Self {
+        Self {
+            decode_time: base_decode_time,
+            fragments_emitted: 0,
+        }
+    }
+
+    /// Set the next-fragment decode time. Used when an inbound fMP4 fragment
+    /// carries an explicit `tfdt` that resets the running clock (typical for
+    /// segmented livestream sources).
+    pub fn set_decode_time(&mut self, t: u64) {
+        self.decode_time = t;
+    }
+}
+
+/// Mint a single-sample canonical moof+mdat fragment, writing it to `writer`
+/// and advancing `progress` by one fragment. Spec: canonical-form.md § MUXL
+/// Fragment → moof.
 ///
 /// Returns the total bytes written (moof + mdat).
 pub(crate) fn write_frame_fragment<W: Write>(
     writer: &mut W,
     track_id: u32,
-    base_decode_time: u64,
+    progress: &mut TrackProgress,
     frame: &FrameInfo,
     sample_data: &[u8],
 ) -> Result<u64> {
-    // mfhd.sequence_number is hardcoded to 0 on every fragment.
-    // Spec: canonical-form.md § MUXL Fragment → moof.
-    let sequence_number: u32 = 0;
+    progress.fragments_emitted += 1;
+    let sequence_number = progress.fragments_emitted;
+    let base_decode_time = progress.decode_time;
     // Sample flags per ISOBMFF:
     // sync: 0x02000000 (sample_depends_on=2: does not depend on others)
     // non-sync: 0x01010000 (sample_depends_on=1 + sample_is_non_sync=1)
@@ -114,6 +151,8 @@ pub(crate) fn write_frame_fragment<W: Write>(
     writer.write_all(b"mdat")?;
     writer.write_all(sample_data)?;
 
+    progress.decode_time += frame.duration as u64;
+
     Ok(moof_buf.len() as u64 + mdat_total_size as u64)
 }
 
@@ -123,13 +162,18 @@ fn mp4_err(e: mp4_atom::Error) -> Error {
 
 /// Measure the encoded size of the canonical moof for a single sample,
 /// without writing it. Used during pre-pass metadata computation.
+///
+/// `mfhd.sequence_number` is a fixed-size u32 and `tfdt` is a fixed-size
+/// u64 — neither value affects the encoded size, so a throwaway
+/// `TrackProgress` suffices.
 pub(crate) fn measure_frame_moof(
     track_id: u32,
     base_decode_time: u64,
     frame: &FrameInfo,
 ) -> Result<u32> {
     let mut buf = Vec::new();
-    write_frame_fragment(&mut buf, track_id, base_decode_time, frame, &[])?;
+    let mut throwaway = TrackProgress::starting_at(base_decode_time);
+    write_frame_fragment(&mut buf, track_id, &mut throwaway, frame, &[])?;
     // bytes_written = moof + 8-byte empty-mdat header; subtract the mdat header.
     Ok((buf.len() as u32) - 8)
 }
@@ -239,7 +283,7 @@ pub struct FMP4Reader<R> {
     reader: R,
     moov: Moov,
     catalog: Catalog,
-    track_state: std::collections::HashMap<u32, u64>,
+    track_state: std::collections::HashMap<u32, TrackProgress>,
     /// Buffered frames from the current moof+mdat pair (may contain
     /// multiple frames from multiple tracks).
     pending: Vec<Frame>,
@@ -380,7 +424,7 @@ pub(crate) fn process_moof_mdat(
     moof: &Moof,
     moof_box_size: usize,
     mdat_data: &[u8],
-    track_state: &mut std::collections::HashMap<u32, u64>,
+    track_state: &mut std::collections::HashMap<u32, TrackProgress>,
     on_frame: &mut impl FnMut(Frame) -> Result<()>,
 ) -> Result<()> {
     // data_offset in trun is relative to the start of the moof box (when
@@ -392,11 +436,11 @@ pub(crate) fn process_moof_mdat(
         let track_id = traf.tfhd.track_id;
         let trex = trex_defaults(moov, track_id);
 
-        let decode_time = track_state.entry(track_id).or_insert(0u64);
+        let progress = track_state.entry(track_id).or_default();
 
         // Base decode time from tfdt (if present), otherwise continue from where we left off
         if let Some(ref tfdt) = traf.tfdt {
-            *decode_time = tfdt.base_media_decode_time;
+            progress.set_decode_time(tfdt.base_media_decode_time);
         }
 
         for trun in &traf.trun {
@@ -436,7 +480,7 @@ pub(crate) fn process_moof_mdat(
                 write_frame_fragment(
                     &mut frag_buf,
                     track_id,
-                    *decode_time,
+                    progress,
                     &frame,
                     sample_data,
                 )?;
@@ -456,7 +500,6 @@ pub(crate) fn process_moof_mdat(
                     data: frag_buf,
                 })?;
 
-                *decode_time += frame.duration as u64;
                 offset = sample_end;
             }
         }
@@ -620,7 +663,7 @@ pub fn fragment_track<RS: Read + Seek, W: Write>(
 
     let samples = extract_flat_track_info(trak)?;
     let sample_count = samples.len() as u32;
-    let mut decode_time: u64 = 0;
+    let mut progress = TrackProgress::default();
 
     for sample in samples.iter() {
         input.seek(SeekFrom::Start(sample.file_offset))?;
@@ -630,11 +673,10 @@ pub fn fragment_track<RS: Read + Seek, W: Write>(
         write_frame_fragment(
             writer,
             track_id,
-            decode_time,
+            &mut progress,
             &sample.frame,
             &data,
         )?;
-        decode_time += sample.frame.duration as u64;
     }
 
     Ok(sample_count)
@@ -665,7 +707,7 @@ pub fn fragment_to_directory<RS: Read + Seek>(
         std::fs::create_dir_all(&track_dir)?;
 
         let sample_count = samples.len() as u32;
-        let mut decode_time: u64 = 0;
+        let mut progress = TrackProgress::default();
         let mut total_bytes: u64 = 0;
 
         for (i, sample) in samples.iter().enumerate() {
@@ -679,7 +721,7 @@ pub fn fragment_to_directory<RS: Read + Seek>(
             write_frame_fragment(
                 &mut buf,
                 track_id,
-                decode_time,
+                &mut progress,
                 &sample.frame,
                 &data,
             )?;
@@ -687,7 +729,6 @@ pub fn fragment_to_directory<RS: Read + Seek>(
             let filename = track_dir.join(format!("{:06}.cmaf", sample_id));
             std::fs::write(&filename, &buf)?;
             total_bytes += buf.len() as u64;
-            decode_time += sample.frame.duration as u64;
         }
 
         let handler = trak.mdia.hdlr.handler;

@@ -95,7 +95,7 @@ enum ConcatState {
 
 struct StreamingState {
     moov: Moov,
-    track_state: HashMap<u32, u64>,
+    track_state: HashMap<u32, fragment::TrackProgress>,
     seen_first_keyframe: bool,
     pending_moof: Option<PendingMoof>,
 }

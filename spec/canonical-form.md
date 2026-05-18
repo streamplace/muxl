@@ -22,7 +22,7 @@ One sample, one `moof+mdat` pair.
 
 Each moof covers exactly one sample from one track.
 
-- **mfhd**: `sequence_number` is hardcoded to `0` on every fragment. CMAF's monotonicity requirement is intentionally violated: any non-zero choice would either break canonical-segment determinism (global-monotonic depends on stream position) or violate monotonicity at segment boundaries anyway (per-segment-restart). Hardcoding to 0 is the simplest deterministic option and is benign in practice — HLS/MSE players drive timing off `tfdt`, not sequence numbers.
+- **mfhd**: `sequence_number` increments by 1 per fragment within a track, starting at `1` for the first fragment of each track. Per-track counters are independent — when multiple tracks share a storage container, the same sequence_number appears once per track at each per-track index (e.g. both track 1's and track 2's first fragment have `sequence_number = 1`), but within a single track the sequence is strictly monotonic with no gaps. This is a *per-track* CMAF monotonicity guarantee rather than the *per-container* guarantee CMAF nominally requires; the per-track relaxation is what keeps fragment bytes a deterministic function of the track's own fragment index, independent of how many other tracks coexist in the container. HLS/MSE players drive timing off `tfdt` rather than sequence numbers, so the per-track scoping is benign in practice.
 - **traf**: exactly one per moof.
   - **tfhd**: `track_id`; flags = `default_base_is_moof`; no default sample values (all explicit in trun).
   - **tfdt**: `base_media_decode_time` in the track's media timescale, carrying the absolute media time of this sample in the track's stream timeline.
@@ -75,7 +75,7 @@ Given the same samples with the same timestamps, segment boundaries are always i
 
 ### Per-Segment Properties
 
-- **`mfhd.sequence_number`**: hardcoded to `0` on every fragment (see § MUXL Fragment → moof). Storage-format synthesizers preserve the zeros verbatim — rewriting would mutate the canonical bytes and break round-trip recovery.
+- **`mfhd.sequence_number`**: per-track 1-based, monotonic across the track's fragment stream (see § MUXL Fragment → moof). The first fragment of a canonical segment for track T carries `prior_fragment_count_in_track + 1`; subsequent fragments in the segment increment by 1. Storage-format synthesizers preserve these values verbatim — rewriting would mutate the canonical bytes and break round-trip recovery. A consequence: a canonical segment's bytes are a function of the segment's position in its track, not of the segment in isolation. Fresh-minting "GoP 5 of track 1" with no stream context requires knowing how many fragments came before; recovering it from a storage format gives the original bytes back unchanged.
 - **`tfdt.base_media_decode_time`**: absolute media time of the segment's first sample in the track's stream timeline. Preserved verbatim across storage-format round-trips.
 
 ### Round-Trip Property

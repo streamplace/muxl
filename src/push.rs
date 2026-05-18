@@ -68,7 +68,7 @@ struct StreamingState {
     video_track_ids: HashSet<u32>,
     /// Per-track media timescale, used to compute segment duration_us.
     track_timescales: BTreeMap<u32, u32>,
-    track_state: HashMap<u32, u64>,
+    track_state: HashMap<u32, fragment::TrackProgress>,
     /// Per-track segment buffers, ordered by track_id.
     track_bufs: BTreeMap<u32, Vec<u8>>,
     /// Per-track accumulated duration in timescale ticks.

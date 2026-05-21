@@ -19,6 +19,17 @@ k256 = { version = "0.13", features = ["ecdsa", "pkcs8", "pem"] }
 # Used by the `bench-sha256` subcommand (the in-wasm baseline that the
 # host-callback variant compares against).
 sha2 = "0.10"
+# S2PA leaf cert generation. `der`/`spki`/`const-oid` are already in our
+# tree transitively via k256; `x509-cert` is one new pure-rust crate that
+# pins to the same version line and gives us a typed X.509 builder.
+x509-cert = { version = "0.2", features = ["pem", "builder"] }
+der = { version = "0.7", features = ["alloc", "oid"] }
+spki = { version = "0.7", features = ["alloc"] }
+const-oid = { version = "0.9", features = ["db"] }
+# SHA-1 for SubjectKeyIdentifier / AuthorityKeyIdentifier "method 1"
+# of RFC 5280 § 4.2.1.2 — used only as a fingerprint label inside the
+# cert, not as a cryptographic primitive.
+sha1 = "0.10"
 # Streaming CBOR/DRISL output for the `segment` subcommand.
 dasl = "0.2"
 serde = { version = "1", features = ["derive"] }

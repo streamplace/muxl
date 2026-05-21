@@ -15,7 +15,9 @@ use std::time::Instant;
 use clap::{ArgGroup, Parser, Subcommand, ValueEnum};
 use muxl::cli as muxl_cli;
 
-use crate::{Result, SignerKey, SigningAlg, sign_per_track, sign_segment_stream};
+use crate::{
+    Result, SignerKey, SigningAlg, cert, sign_per_track, sign_segment_stream,
+};
 
 #[derive(Parser)]
 #[command(
@@ -44,6 +46,15 @@ enum Command {
     /// what a host-SHA256 path could save before committing to a
     /// full-crate sha2 patch in c2pa-rs's hot path.
     BenchSha256(BenchSha256Args),
+
+    /// Generate a fresh secp256k1 (ES256K) private key as PKCS#8 PEM.
+    /// Pair with `gen-cert` to produce a signer for muxl-sign.
+    GenKey(GenKeyArgs),
+    /// Generate an S2PA self-signed leaf certificate (X.509 v3) for an
+    /// existing secp256k1 PKCS#8 PEM private key. The cert's
+    /// `commonName` is the DID identifying the signer — defaults to the
+    /// `did:key` of the embedded public key.
+    GenCert(GenCertArgs),
 
     // muxl subcommands, lifted verbatim. --------------------------------------
     /// Extract catalog (track config) from an MP4.
@@ -149,6 +160,33 @@ struct SignSegmentArgs {
 }
 
 #[derive(clap::Args)]
+struct GenKeyArgs {
+    /// Path to write the PKCS#8 PEM private key. Use `-` for stdout.
+    #[arg(long, value_name = "PATH")]
+    out: PathBuf,
+}
+
+#[derive(clap::Args)]
+struct GenCertArgs {
+    /// PKCS#8 PEM secp256k1 private key. Use `-` for stdin.
+    #[arg(long, value_name = "PATH")]
+    key: PathBuf,
+    /// DID for the cert's `commonName`. Defaults to the `did:key`
+    /// identifier of the key's public key.
+    #[arg(long, value_name = "DID")]
+    did: Option<String>,
+    /// Optional `organizationName` attribute alongside `commonName` in
+    /// the DN. Included for compatibility with C2PA libraries that
+    /// expect more than just a CN. Streamplace's production certs use
+    /// "Streamplace" here.
+    #[arg(long, value_name = "ORG")]
+    organization: Option<String>,
+    /// Path to write the PEM-encoded cert. Use `-` for stdout.
+    #[arg(long, value_name = "PATH")]
+    out: PathBuf,
+}
+
+#[derive(clap::Args)]
 struct BenchSha256Args {
     /// Bytes of pseudo-random input per iteration.
     #[arg(long, default_value_t = 1_048_576)]
@@ -204,6 +242,8 @@ pub fn cli_main() {
         Command::SignPerTrack(args) => cmd_sign_per_track(args),
         Command::SignSegment(args) => cmd_sign_segment(args),
         Command::BenchSha256(args) => cmd_bench_sha256(args),
+        Command::GenKey(args) => cmd_gen_key(args),
+        Command::GenCert(args) => cmd_gen_cert(args),
         // muxl subcommands delegate to muxl::cli::dispatch via its
         // matching enum variant — we just rebuild the muxl Command from
         // our payload and hand it off.
@@ -377,6 +417,68 @@ fn parse_track_keyed_map<V>(
         out.insert(parse_track_id(&k)?, v);
     }
     Ok(out)
+}
+
+fn cmd_gen_key(args: GenKeyArgs) -> Result<()> {
+    let key = cert::generate_key();
+    let pem = cert::key_to_pem(&key)?;
+    write_out(&args.out, pem.as_bytes())?;
+    if args.out.as_os_str() != "-" {
+        let did = cert::did_key_for(&key.public_key());
+        eprintln!("wrote {} ({})", args.out.display(), did);
+    }
+    Ok(())
+}
+
+fn cmd_gen_cert(args: GenCertArgs) -> Result<()> {
+    use k256::pkcs8::DecodePrivateKey;
+    let key_pem = read_in(&args.key)?;
+    let key_str = std::str::from_utf8(&key_pem).map_err(|_| {
+        crate::Error::from(muxl::Error::Io(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "key file is not UTF-8 PEM",
+        )))
+    })?;
+    let key = k256::SecretKey::from_pkcs8_pem(key_str).map_err(|e| {
+        crate::Error::from(muxl::Error::Io(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("parsing PKCS#8 PEM key: {e}"),
+        )))
+    })?;
+    let der = cert::generate_cert(
+        &key,
+        args.did.as_deref(),
+        args.organization.as_deref(),
+    )?;
+    let pem = cert::cert_to_pem(&der);
+    write_out(&args.out, pem.as_bytes())?;
+    if args.out.as_os_str() != "-" {
+        let did = args
+            .did
+            .clone()
+            .unwrap_or_else(|| cert::did_key_for(&key.public_key()));
+        eprintln!("wrote {} (CN={})", args.out.display(), did);
+    }
+    Ok(())
+}
+
+fn read_in(path: &PathBuf) -> Result<Vec<u8>> {
+    if path.as_os_str() == "-" {
+        let mut buf = Vec::new();
+        io::stdin().lock().read_to_end(&mut buf)?;
+        Ok(buf)
+    } else {
+        Ok(fs::read(path)?)
+    }
+}
+
+fn write_out(path: &PathBuf, bytes: &[u8]) -> Result<()> {
+    if path.as_os_str() == "-" {
+        io::stdout().lock().write_all(bytes)?;
+    } else {
+        fs::write(path, bytes)?;
+    }
+    Ok(())
 }
 
 fn cmd_bench_sha256(args: BenchSha256Args) -> Result<()> {

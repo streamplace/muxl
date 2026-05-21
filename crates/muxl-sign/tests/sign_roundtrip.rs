@@ -95,6 +95,51 @@ fn sign_per_track_roundtrip_h264_aac() {
     );
 }
 
+#[test]
+fn sign_with_generated_s2pa_cert() {
+    // End-to-end check that an S2PA-shaped self-signed leaf produced by
+    // `muxl_sign::cert::generate_cert` is accepted by c2pa-rs's sign and
+    // verify paths. If c2pa-rs's cert profile check rejects self-signed
+    // leaves we'll see it here as a SignerKey::from_pem_bytes failure or
+    // a Builder::sign error.
+    let input_path = repo_path("samples/fixtures/h264-aac.mp4");
+    let input = FileReadAt::open(&input_path).expect("open fixture");
+    let source = muxl::read(&input).expect("read source");
+
+    // Fresh keypair + cert. CN defaults to did:key(pubkey). Streamplace's
+    // production certs carry organizationName="Streamplace"; we set one
+    // too so the cert profile shape matches.
+    let key = muxl_sign::generate_key();
+    let cert_der = muxl_sign::generate_cert(&key, None, Some("S2PA test"))
+        .expect("generate_cert");
+    let cert_pem = muxl_sign::cert_to_pem(&cert_der);
+    let key_pem = muxl_sign::key_to_pem(&key).expect("key_to_pem");
+
+    let signer = SignerKey::from_pem_bytes(
+        cert_pem.into_bytes(),
+        key_pem.into_bytes(),
+        SigningAlg::Es256K,
+    );
+
+    let mut output: Vec<u8> = Vec::new();
+    sign_per_track(
+        &source,
+        &input,
+        &signer,
+        SEGMENT_MANIFEST,
+        WRAPPER_MANIFEST,
+        &mut output,
+    )
+    .expect("sign_per_track with generated S2PA cert");
+
+    assert!(!output.is_empty(), "wrapper bytes produced");
+    let reader = c2pa::Reader::from_stream("video/mp4", Cursor::new(&output))
+        .expect("Reader::from_stream on signed wrapper");
+    let _active = reader
+        .active_manifest()
+        .expect("wrapper has an active manifest");
+}
+
 fn count_subseq(haystack: &[u8], needle: &[u8]) -> usize {
     if needle.is_empty() || haystack.len() < needle.len() {
         return 0;

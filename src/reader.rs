@@ -149,7 +149,7 @@ pub fn aggregate_catalog(segments: &[Segment<'_>]) -> Catalog {
 /// Read an ISOBMFF box header at `pos`, returning `(fourcc, body_start,
 /// box_end)`. Handles the 32-bit, 64-bit-`largesize` (size==1), and
 /// to-EOF (size==0) forms.
-fn read_box_header(bytes: &[u8], pos: usize) -> Result<([u8; 4], usize, usize)> {
+pub(crate) fn read_box_header(bytes: &[u8], pos: usize) -> Result<([u8; 4], usize, usize)> {
     if pos + 8 > bytes.len() {
         return Err(Error::InvalidMp4("truncated box header".into()));
     }

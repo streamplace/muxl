@@ -64,8 +64,9 @@ pub enum WrapFormat {
     /// Appendable fMP4: ftyp+moov(init) + verbatim segments. Streamable; the
     /// segment bytes (and any signatures over them) are untouched.
     Fmp4,
-    /// Finalized flat MP4 (faststart). Interim: routes through the Source-based
-    /// flat writer, so it needs an fMP4/flat input (not a bare m4s stream).
+    /// Finalized flat MP4 (faststart): synthesized moov over the verbatim
+    /// segment stream. Fast-forward + m4s-native; accepts fMP4, flat, or bare
+    /// m4s input.
     Flat,
 }
 
@@ -457,12 +458,14 @@ pub fn cmd_wrap(args: WrapArgs) -> crate::Result<()> {
             eprintln!("fMP4: wrapped {} segments", segments.len());
         }
         WrapFormat::Flat => {
-            // Interim: whole-file flatten via the Source-based writer until the
-            // m4s→flat-header extractor lands in `present`.
-            let source = crate::read(&bytes)?;
-            let info = crate::flat::write(&source, &bytes, &mut out)?;
+            // Fast-forward + m4s-native: unwrap to verbatim segments, then
+            // synthesize the flat moov from their parsed metadata.
+            let segments = crate::reader::unwrap(&bytes)?;
+            let catalog = crate::reader::aggregate_catalog(&segments);
+            let slices: Vec<&[u8]> = segments.iter().map(|s| s.data).collect();
+            crate::present::write_flat_from_m4s(&catalog, &slices, &mut out)?;
             out.flush()?;
-            eprintln!("flat MP4: {} bytes ({} tracks)", info.total_bytes, info.tracks.len());
+            eprintln!("flat MP4: wrapped {} segments", segments.len());
         }
     }
     Ok(())

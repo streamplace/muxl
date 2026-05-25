@@ -8,19 +8,22 @@
 //!
 //! - [`init`] / [`init_per_track`] — catalog → fMP4 init segment (`ftyp+moov`).
 //! - [`write_fmp4`] — init + verbatim segments = an appendable MUXL fMP4.
+//! - [`write_flat`] — finalize a flat MP4 from GoP segments that carry their
+//!   per-sample metadata (e.g. straight from the segmenter).
 //! - [`flat_header`] — catalog + per-segment metadata → flat MP4 header bytes
 //!   (no sample bytes required; for byte-free assembly, e.g. S3 multipart).
 //!
-//! The flat *writer* over raw m4s bytes (deriving the per-sample metadata by
-//! parsing each segment's moofs) is still TODO; callers that already hold the
-//! metadata use [`flat_header`], and the Source-based [`crate::flat::write`]
-//! remains for whole-file flattening in the meantime.
+//! Deriving the per-sample metadata from raw m4s bytes alone (so a stream of
+//! `unwrap`ped segments could be flattened without their segmenter metadata)
+//! is still TODO; the Source-based [`crate::flat::write`] remains for
+//! whole-file flattening in the meantime.
 
 use std::collections::BTreeMap;
 use std::io::Write;
 
 use crate::catalog::Catalog;
 use crate::error::Result;
+use crate::segment::GopSegment;
 
 pub use crate::flat::SegmentMetadata;
 
@@ -58,6 +61,51 @@ pub fn write_fmp4<'a, W: Write>(
     out.write_all(&init(catalog)?)?;
     for seg in segments {
         out.write_all(seg)?;
+    }
+    Ok(())
+}
+
+/// Finalize a flat MP4 from GoP segments. Each [`GopSegment`] carries its
+/// per-track bytes and the per-sample metadata the segmenter already
+/// computed, so the synthesized `moov` (populated `stbl` + `co64`) is built
+/// without re-parsing the segment bytes. The body is the GoP segments written
+/// verbatim in interleave order (per GoP, tracks ascending) inside the outer
+/// `mdat` envelope.
+///
+/// `first_decode_times` is the presentation anchor (per track media ticks) for
+/// the first GoP — used to synthesize an `elst` when a VOD starts mid-stream;
+/// pass an empty map for a stream that starts at time zero.
+///
+/// This is the segment-native equivalent of [`crate::flat::write`] and
+/// produces byte-identical output for the same content.
+pub fn write_flat<W: Write>(
+    catalog: &Catalog,
+    gops: &[GopSegment],
+    first_decode_times: &BTreeMap<u32, u64>,
+    out: &mut W,
+) -> Result<()> {
+    let mut metas: Vec<SegmentMetadata> = Vec::with_capacity(gops.len());
+    for (gi, gop) in gops.iter().enumerate() {
+        let mut meta = SegmentMetadata::default();
+        for (&tid, bytes) in &gop.tracks {
+            meta.track_byte_sizes.insert(tid, bytes.len() as u64);
+            if let Some(ts) = gop.samples.get(&tid) {
+                meta.samples.insert(tid, ts.clone());
+            }
+        }
+        if gi == 0 {
+            meta.first_decode_times = first_decode_times.clone();
+        }
+        metas.push(meta);
+    }
+
+    out.write_all(&flat_header(catalog, &metas)?)?;
+    // Body: GoP segments verbatim, tracks ascending within each GoP (BTreeMap
+    // iteration order), matching the co64 offsets the header was built from.
+    for gop in gops {
+        for bytes in gop.tracks.values() {
+            out.write_all(bytes)?;
+        }
     }
     Ok(())
 }
@@ -102,5 +150,40 @@ mod tests {
         for (rec, seg) in recovered.iter().zip(ordered.iter()) {
             assert_eq!(rec.data, seg.as_slice(), "segment bytes must survive wrap→unwrap");
         }
+    }
+
+    #[test]
+    fn write_flat_matches_source_based_flat_writer() {
+        // Oracle: present::write_flat (segment-native) must produce a flat MP4
+        // byte-identical to the Source-based flat::write for the same content.
+        let data = read_fixture("h264-opus-frag.mp4");
+
+        let source = crate::read(&data).unwrap();
+        let mut flat_ref = Vec::new();
+        crate::flat::write(&source, &data, &mut flat_ref).unwrap();
+
+        // Presentation anchor per track (start_offset_ticks), so the
+        // synthesized elst matches the reference writer's.
+        let fdt: std::collections::BTreeMap<u32, u64> = source
+            .plan
+            .tracks
+            .iter()
+            .map(|t| (t.track_id, t.start_offset_ticks))
+            .collect();
+
+        let mut gops = Vec::new();
+        let catalog = crate::segment::segment_fmp4(&mut Cursor::new(&data), |g| {
+            gops.push(g);
+            Ok(())
+        })
+        .unwrap();
+
+        let mut flat_mine = Vec::new();
+        write_flat(&catalog, &gops, &fdt, &mut flat_mine).unwrap();
+
+        assert_eq!(
+            flat_mine, flat_ref,
+            "present::write_flat must match flat::write byte-for-byte"
+        );
     }
 }

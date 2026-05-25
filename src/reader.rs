@@ -177,6 +177,102 @@ pub fn aggregate_catalog(segments: &[Segment<'_>]) -> Catalog {
     agg
 }
 
+/// Re-derive the canonical per-track event stream from a stored MUXL wrapper
+/// (bare m4s, fMP4, or flat MP4). The per-track segment bytes are returned
+/// **verbatim** — any C2PA/S2PA signature is preserved — while per-track
+/// durations and sample counts are recomputed by parsing each segment's
+/// moofs.
+///
+/// Emits the same [`crate::cbor::CborEvent`] shape the live segmenter
+/// produces (one `Init`, then one `Segment` per GoP), so stored segments
+/// drive live HLS / live-to-VOD / DVR exactly like freshly-segmented ones —
+/// without re-minting (and thus invalidating the signatures on) the bytes.
+pub fn segment_events(bytes: &[u8]) -> Result<Vec<crate::cbor::CborEvent>> {
+    use crate::cbor::{ByteString, CborEvent};
+    use std::collections::BTreeMap;
+
+    let segments = unwrap(bytes)?;
+    if segments.is_empty() {
+        return Ok(Vec::new());
+    }
+    let catalog = aggregate_catalog(&segments);
+
+    // track id -> media timescale, for each GoP's wall-clock duration_us.
+    let mut timescales: BTreeMap<u32, u32> = BTreeMap::new();
+    for v in catalog.video_configs() {
+        timescales.insert(v.track_id(), v.timescale());
+    }
+    for a in catalog.audio_configs() {
+        timescales.insert(a.track_id(), a.timescale());
+    }
+
+    let mut events: Vec<CborEvent> = Vec::new();
+    let track_inits: BTreeMap<String, ByteString> = crate::init::build_track_init_segments(&catalog)?
+        .into_iter()
+        .map(|(tid, b)| (tid.to_string(), ByteString(b)))
+        .collect();
+    events.push(CborEvent::Init {
+        data: crate::init::build_init_segment(&catalog)?,
+        catalog: Some(catalog.clone()),
+        track_inits,
+    });
+
+    // Group segments into GoPs: a new GoP begins whenever the track id is <=
+    // the previous one (tracks ascend within a GoP), matching unwrap's
+    // interleave order.
+    struct Gop {
+        tracks: BTreeMap<String, ByteString>,
+        durations: BTreeMap<String, u64>,
+        sample_counts: BTreeMap<String, u32>,
+        samples: BTreeMap<String, crate::cbor::CborTrackSamples>,
+        body_size: u64,
+        duration_us: u64,
+    }
+    let mut gops: Vec<Gop> = Vec::new();
+    let mut last_tid: Option<u32> = None;
+    for seg in &segments {
+        let (tid, ts, _dts) = crate::present::segment_index(seg.data)?;
+        if last_tid.is_none_or(|prev| tid <= prev) {
+            gops.push(Gop {
+                tracks: BTreeMap::new(),
+                durations: BTreeMap::new(),
+                sample_counts: BTreeMap::new(),
+                samples: BTreeMap::new(),
+                body_size: 0,
+                duration_us: 0,
+            });
+        }
+        let gop = gops.last_mut().unwrap();
+        let dur_ticks: u64 = ts.durations.iter().map(|&d| d as u64).sum();
+        if let Some(&tsc) = timescales.get(&tid) {
+            if tsc > 0 {
+                // The GoP's playable span is the longest of its tracks.
+                let us = dur_ticks * 1_000_000 / tsc as u64;
+                gop.duration_us = gop.duration_us.max(us);
+            }
+        }
+        let key = tid.to_string();
+        gop.body_size += seg.data.len() as u64;
+        gop.durations.insert(key.clone(), dur_ticks);
+        gop.sample_counts.insert(key.clone(), ts.durations.len() as u32);
+        gop.samples.insert(key.clone(), (&ts).into());
+        gop.tracks.insert(key, ByteString(seg.data.to_vec()));
+        last_tid = Some(tid);
+    }
+
+    for gop in gops {
+        events.push(CborEvent::Segment {
+            tracks: gop.tracks,
+            durations: gop.durations,
+            sample_counts: gop.sample_counts,
+            samples: gop.samples,
+            body_size: gop.body_size,
+            duration_us: gop.duration_us,
+        });
+    }
+    Ok(events)
+}
+
 /// Read an ISOBMFF box header at `pos`, returning `(fourcc, body_start,
 /// box_end)`. Handles the 32-bit, 64-bit-`largesize` (size==1), and
 /// to-EOF (size==0) forms.
@@ -377,6 +473,42 @@ mod tests {
         for (r, b) in recovered.iter().zip(baseline.iter()) {
             assert_eq!(r.data, b.data, "segments recovered verbatim past the wrapper box");
         }
+    }
+
+    #[test]
+    fn segment_events_reconstructs_event_stream() {
+        use crate::cbor::CborEvent;
+        // Build a MUXL fMP4 (init + canonical segments), then re-derive the
+        // event stream from it: one Init, then one Segment per GoP with
+        // verbatim bytes + recomputed durations/sample counts.
+        let data = read_fixture("h264-opus-frag.mp4");
+        let (catalog, ordered) = segments_in_order(&data);
+        let mut fmp4 = build_init_segment(&catalog).unwrap();
+        for (_, seg) in &ordered {
+            fmp4.extend_from_slice(seg);
+        }
+
+        let events = segment_events(&fmp4).unwrap();
+        assert!(matches!(events[0], CborEvent::Init { .. }), "first event is Init");
+
+        let mut seg_count = 0;
+        let mut byte_total = 0u64;
+        for e in &events {
+            if let CborEvent::Segment { durations, sample_counts, body_size, .. } = e {
+                seg_count += 1;
+                byte_total += body_size;
+                assert!(!durations.is_empty(), "segment has tracks");
+                for d in durations.values() {
+                    assert!(*d > 0, "duration must be non-zero");
+                }
+                for c in sample_counts.values() {
+                    assert!(*c > 0, "sample count must be non-zero");
+                }
+            }
+        }
+        assert!(seg_count >= 2, "fixture should yield multiple GoPs, got {seg_count}");
+        let expected: u64 = ordered.iter().map(|(_, b)| b.len() as u64).sum();
+        assert_eq!(byte_total, expected, "verbatim segment bytes preserved");
     }
 
     #[test]

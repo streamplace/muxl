@@ -164,7 +164,7 @@ pub fn write_flat_from_m4s<W: Write>(
 /// moofs (skipping the leading uuid prefix and any c2pa prefix). Returns
 /// `(track_id, per-sample arrays, first decode time)`. Offsets are relative to
 /// the segment start, matching `segment::TrackSamples::offsets_in_track`.
-fn segment_index(data: &[u8]) -> Result<(u32, TrackSamples, u64)> {
+pub(crate) fn segment_index(data: &[u8]) -> Result<(u32, TrackSamples, u64)> {
     let zero = TrackDefaults {
         default_sample_duration: 0,
         default_sample_size: 0,

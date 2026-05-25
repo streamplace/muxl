@@ -52,13 +52,44 @@ fn locate_segment_stream(bytes: &[u8]) -> Result<&[u8]> {
             // Flat MP4 outer envelope: its payload is the verbatim segment stream.
             b"mdat" => return Ok(&bytes[body_start..box_end]),
             // Start of a bare / fMP4 segment stream.
-            b"uuid" | b"moof" => return Ok(&bytes[pos..]),
+            b"moof" => return Ok(&bytes[pos..]),
+            b"uuid" => {
+                let is_muxl =
+                    body_start + 16 <= box_end && bytes[body_start..body_start + 16] == MUXL_UUID;
+                if is_muxl {
+                    // A MUXL uuid heads the canonical segment stream.
+                    return Ok(&bytes[pos..]);
+                }
+                // A non-MUXL uuid is either a signed segment's leading c2pa/S2PA
+                // box — immediately followed by its MUXL uuid, so the bare
+                // segment stream starts here — or a wrapper-level box that
+                // sign_per_track places after ftyp, *before* moov, which is
+                // container framing to skip.
+                if next_box_is_muxl(bytes, box_end) {
+                    return Ok(&bytes[pos..]);
+                }
+                pos = box_end;
+            }
             // Unknown leading box — skip conservatively.
             _ => pos = box_end,
         }
     }
     // No recognizable framing: treat the whole input as the segment stream.
     Ok(bytes)
+}
+
+/// Whether the box at `pos` is a MUXL `uuid` box — used to tell a signed
+/// segment's leading c2pa prefix (followed by its MUXL uuid) apart from a
+/// wrapper-level c2pa box (followed by `moov`).
+fn next_box_is_muxl(bytes: &[u8], pos: usize) -> bool {
+    match read_box_header(bytes, pos) {
+        Ok((kind, body_start, box_end)) => {
+            &kind == b"uuid"
+                && body_start + 16 <= box_end
+                && bytes[body_start..body_start + 16] == MUXL_UUID
+        }
+        Err(_) => false,
+    }
 }
 
 /// Split a segment stream on MUXL `uuid` boundaries into verbatim segments.
@@ -303,6 +334,48 @@ mod tests {
         for (rec, expected) in recovered.iter().zip(signed.iter()) {
             assert_eq!(rec.data, expected.as_slice(), "c2pa prefix must stay with its segment");
             assert!(rec.data.starts_with(&[0, 0, 0]), "segment should start with the c2pa uuid box");
+        }
+    }
+
+    #[test]
+    fn unwrap_skips_wrapper_c2pa_before_moov() {
+        // sign_per_track output shape: ftyp + c2pa-uuid(wrapper) + moov +
+        // mdat{segments}. unwrap must skip the wrapper uuid (it sits before
+        // moov, followed by moov not a muxl uuid) and still descend the mdat
+        // envelope — unlike a signed segment's c2pa prefix, which precedes a
+        // MUXL uuid.
+        let data = read_fixture("h264-opus-frag.mp4");
+        let source = crate::read(&data).unwrap();
+        let mut flat = Vec::new();
+        crate::flat::write(&source, &data, &mut flat).unwrap();
+        let baseline = unwrap(&flat).unwrap();
+
+        // Splice a fake (non-MUXL) wrapper uuid box in right after ftyp.
+        let (kind, _bs, ftyp_end) = read_box_header(&flat, 0).unwrap();
+        assert_eq!(&kind, b"ftyp");
+        let wrapper = {
+            let body = b"fake wrapper manifest";
+            let total = 24 + body.len();
+            let mut b = Vec::new();
+            b.extend_from_slice(&(total as u32).to_be_bytes());
+            b.extend_from_slice(b"uuid");
+            b.extend_from_slice(&[0xd8u8; 16]); // non-MUXL usertype
+            b.extend_from_slice(body);
+            b
+        };
+        let mut wrapped = Vec::new();
+        wrapped.extend_from_slice(&flat[..ftyp_end]);
+        wrapped.extend_from_slice(&wrapper);
+        wrapped.extend_from_slice(&flat[ftyp_end..]);
+
+        let recovered = unwrap(&wrapped).unwrap();
+        assert_eq!(
+            recovered.len(),
+            baseline.len(),
+            "wrapper uuid must not change the recovered segment count"
+        );
+        for (r, b) in recovered.iter().zip(baseline.iter()) {
+            assert_eq!(r.data, b.data, "segments recovered verbatim past the wrapper box");
         }
     }
 

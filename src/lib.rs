@@ -12,6 +12,7 @@ pub mod hls;
 pub mod init;
 pub mod io;
 pub mod push;
+pub mod reader;
 pub mod segment;
 pub mod source;
 #[cfg(feature = "wasm")]

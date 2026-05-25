@@ -1,15 +1,15 @@
-//! muxl-sign — per-track C2PA signing for MUXL flat MP4s.
+//! muxl-sign — C2PA/S2PA signing + verification for MUXL canonical segments.
 //!
-//! Wraps c2pa-rs's `Builder` around `muxl::flat`-emitted per-track flat MP4s,
-//! producing a wrapper container that carries each per-track signed asset as
-//! a c2pa `Ingredient`. The result is a multi-track flat MP4 whose top-level
-//! signature covers the cross-track manifest and whose ingredient manifests
-//! verify each track independently — drop a track and the rest still verify.
+//! Each canonical segment (one track's fragments for one GoP, prefixed by the
+//! muxl uuid + DRISL catalog) is signed independently with c2pa-rs as a
+//! standalone `.m4s` asset, so each verifies on its own — drop a track or a
+//! segment and the rest still verify.
 //!
 //! Entry points:
-//! - [`SignerKey`] — PEM cert chain + private key + signing alg.
-//! - [`sign_per_track`] — split a multi-track [`muxl::Source`] into per-track
-//!   flat MP4s, sign each, and combine into a wrapper signed flat MP4.
+//! - [`SignerKey`] — PEM cert chain + private key (or host callback) + alg.
+//! - [`sign_segment_stream`] — stream an fMP4 in, emit one CBOR
+//!   `signed-segment` event per GoP (per-track signed canonical segments).
+//! - [`verify_segments`] — validate the signatures on a signed MUXL wrapper.
 
 pub mod cbor;
 pub mod cert;
@@ -23,5 +23,5 @@ pub use cbor::SignedEvent;
 pub use cert::{cert_to_pem, did_key_for, generate_cert, generate_key, key_to_pem};
 pub use cli::cli_main;
 pub use error::{Error, Result};
-pub use sign::{SignerKey, sign_per_track, sign_segment_stream};
+pub use sign::{SignerKey, sign_segment_stream};
 pub use verify::verify_segments;

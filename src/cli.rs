@@ -46,10 +46,25 @@ pub enum Command {
     Mp4(Mp4Args),
     /// Segment an fMP4 into per-GoP MUXL segments.
     Segment(SegmentArgs),
+    /// Wrap MUXL segments into a presentation MP4 (fMP4 or flat).
+    Wrap(WrapArgs),
+    /// Unwrap any MUXL wrapper (fMP4/flat/m4s) into its canonical segments.
+    Unwrap(UnwrapArgs),
     /// Concatenate MUXL fMP4 files from stdin, emit CBOR events to stdout.
     Concat,
     /// Generate HLS playback artifacts (CID-addressed blobs + optional playlists).
     Hls(HlsArgs),
+}
+
+/// Output container for `muxl wrap`.
+#[derive(Clone, Copy, Debug, ValueEnum)]
+pub enum WrapFormat {
+    /// Appendable fMP4: ftyp+moov(init) + verbatim segments. Streamable; the
+    /// segment bytes (and any signatures over them) are untouched.
+    Fmp4,
+    /// Finalized flat MP4 (faststart). Interim: routes through the Source-based
+    /// flat writer, so it needs an fMP4/flat input (not a bare m4s stream).
+    Flat,
 }
 
 #[derive(Args)]
@@ -98,6 +113,27 @@ pub struct SegmentArgs {
 }
 
 #[derive(Args)]
+pub struct WrapArgs {
+    /// Input MUXL wrapper: fMP4, flat MP4, or a bare m4s segment stream.
+    pub input: PathBuf,
+    /// Output MP4 path.
+    pub output: PathBuf,
+    /// Presentation container to synthesize.
+    #[arg(long, value_enum, default_value = "fmp4")]
+    pub format: WrapFormat,
+}
+
+#[derive(Args)]
+pub struct UnwrapArgs {
+    /// Input MUXL wrapper: fMP4, flat MP4, or a bare m4s segment stream.
+    pub input: PathBuf,
+    /// Write recovered segments here — one `.m4s` per segment under
+    /// `track<id>/`, plus a per-track `init.mp4`. Omit for a stderr summary.
+    #[arg(long, value_name = "DIR")]
+    pub dir: Option<PathBuf>,
+}
+
+#[derive(Args)]
 pub struct HlsArgs {
     /// Input MP4 file (flat or fragmented).
     pub input: PathBuf,
@@ -128,6 +164,8 @@ pub fn dispatch(cmd: Command) -> crate::Result<()> {
         Command::Fmp4(args) => cmd_fmp4(args),
         Command::Mp4(args) => cmd_mp4(args),
         Command::Segment(args) => cmd_segment(args),
+        Command::Wrap(args) => cmd_wrap(args),
+        Command::Unwrap(args) => cmd_unwrap(args),
         Command::Concat => cmd_concat(),
         Command::Hls(args) => cmd_hls(args),
     }
@@ -387,6 +425,70 @@ pub fn cmd_hls(args: HlsArgs) -> crate::Result<()> {
         write_playlists: playlists,
     };
     crate::hls::emit(&input, &output_dir, &opts)?;
+    Ok(())
+}
+
+/// Wrap canonical MUXL segments (recovered from any input wrapper) into a
+/// presentation MP4. fMP4 is the verbatim fast-forward path; flat is the
+/// interim Source-based flatten.
+pub fn cmd_wrap(args: WrapArgs) -> crate::Result<()> {
+    let WrapArgs { input, output, format } = args;
+    let bytes = fs::read(&input)?;
+    let mut out = BufWriter::new(fs::File::create(&output)?);
+    match format {
+        WrapFormat::Fmp4 => {
+            let segments = crate::reader::unwrap(&bytes)?;
+            let catalog = crate::reader::aggregate_catalog(&segments);
+            crate::present::write_fmp4(&catalog, segments.iter().map(|s| s.data), &mut out)?;
+            out.flush()?;
+            eprintln!("fMP4: wrapped {} segments", segments.len());
+        }
+        WrapFormat::Flat => {
+            // Interim: whole-file flatten via the Source-based writer until the
+            // m4s→flat-header extractor lands in `present`.
+            let source = crate::read(&bytes)?;
+            let info = crate::flat::write(&source, &bytes, &mut out)?;
+            out.flush()?;
+            eprintln!("flat MP4: {} bytes ({} tracks)", info.total_bytes, info.tracks.len());
+        }
+    }
+    Ok(())
+}
+
+/// Unwrap any MUXL wrapper into its canonical segments via the fast-forward
+/// reader. With `--dir`, writes one `.m4s` per segment under `track<id>/`
+/// plus a per-track `init.mp4`; otherwise prints a summary.
+pub fn cmd_unwrap(args: UnwrapArgs) -> crate::Result<()> {
+    use std::collections::{BTreeMap, HashSet};
+    let UnwrapArgs { input, dir } = args;
+    let bytes = fs::read(&input)?;
+    let segments = crate::reader::unwrap(&bytes)?;
+
+    if let Some(dir) = dir {
+        let mut counters: BTreeMap<u32, u32> = BTreeMap::new();
+        let mut inited: HashSet<u32> = HashSet::new();
+        for seg in &segments {
+            let tid = seg.track_id;
+            let track_dir = dir.join(format!("track{tid}"));
+            fs::create_dir_all(&track_dir)?;
+            if inited.insert(tid) {
+                fs::write(track_dir.join("init.mp4"), crate::present::init(&seg.catalog)?)?;
+            }
+            let n = counters.entry(tid).or_default();
+            fs::write(track_dir.join(format!("segment_{n:04}.m4s")), seg.data)?;
+            *n += 1;
+        }
+        eprintln!(
+            "unwrapped {} segments across {} tracks",
+            segments.len(),
+            counters.len()
+        );
+    } else {
+        for (i, seg) in segments.iter().enumerate() {
+            eprintln!("segment {i}: track {} ({} bytes)", seg.track_id, seg.data.len());
+        }
+        eprintln!("{} segments total", segments.len());
+    }
     Ok(())
 }
 

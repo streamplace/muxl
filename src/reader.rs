@@ -119,6 +119,33 @@ fn push_segment<'a>(
     Ok(())
 }
 
+/// Merge the single-track catalogs of unwrapped `segments` into one
+/// multi-track [`Catalog`] — what [`crate::present::init`] needs to build a
+/// combined `moov` when re-wrapping. Renditions dedupe by name (same track →
+/// same config); video `display`/`rotation`/`flip` are taken from the first
+/// segment that carries them.
+pub fn aggregate_catalog(segments: &[Segment<'_>]) -> Catalog {
+    let mut agg = Catalog::default();
+    for seg in segments {
+        if let Some(v) = &seg.catalog.video {
+            for (name, cfg) in &v.renditions {
+                agg.insert_video(name.clone(), cfg.clone());
+            }
+            if let Some(av) = agg.video.as_mut() {
+                av.display = av.display.or(v.display);
+                av.rotation = av.rotation.or(v.rotation);
+                av.flip = av.flip.or(v.flip);
+            }
+        }
+        if let Some(a) = &seg.catalog.audio {
+            for (name, cfg) in &a.renditions {
+                agg.insert_audio(name.clone(), cfg.clone());
+            }
+        }
+    }
+    agg
+}
+
 /// Read an ISOBMFF box header at `pos`, returning `(fourcc, body_start,
 /// box_end)`. Handles the 32-bit, 64-bit-`largesize` (size==1), and
 /// to-EOF (size==0) forms.

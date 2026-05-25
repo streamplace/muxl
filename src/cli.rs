@@ -54,6 +54,8 @@ pub enum Command {
     Concat,
     /// Generate HLS playback artifacts (CID-addressed blobs + optional playlists).
     Hls(HlsArgs),
+    /// Print the BDASL CID of a file, or of each canonical segment.
+    Cid(CidArgs),
 }
 
 /// Output container for `muxl wrap`.
@@ -147,6 +149,16 @@ pub struct HlsArgs {
     pub playlists: bool,
 }
 
+#[derive(Args)]
+pub struct CidArgs {
+    /// Input file. Any bytes for a whole-file CID; a MUXL wrapper with --segments.
+    pub input: PathBuf,
+    /// Unwrap the input and print the CID of each canonical segment (the
+    /// content-addressed unit) instead of one CID for the whole file.
+    #[arg(long)]
+    pub segments: bool,
+}
+
 /// Run the parsed `muxl` CLI: parse argv into a [`Command`] and [`dispatch`] it.
 pub fn cli_main() {
     let cli = Cli::parse();
@@ -168,6 +180,7 @@ pub fn dispatch(cmd: Command) -> crate::Result<()> {
         Command::Unwrap(args) => cmd_unwrap(args),
         Command::Concat => cmd_concat(),
         Command::Hls(args) => cmd_hls(args),
+        Command::Cid(args) => cmd_cid(args),
     }
 }
 
@@ -488,6 +501,32 @@ pub fn cmd_unwrap(args: UnwrapArgs) -> crate::Result<()> {
             eprintln!("segment {i}: track {} ({} bytes)", seg.track_id, seg.data.len());
         }
         eprintln!("{} segments total", segments.len());
+    }
+    Ok(())
+}
+
+/// Print the BDASL CID of a file. With --segments, unwrap the input and print
+/// the CID of each canonical segment (track and per-track index alongside).
+pub fn cmd_cid(args: CidArgs) -> crate::Result<()> {
+    let CidArgs { input, segments } = args;
+    if segments {
+        use std::collections::BTreeMap;
+        let bytes = fs::read(&input)?;
+        let segs = crate::reader::unwrap(&bytes)?;
+        let mut idx: BTreeMap<u32, u32> = BTreeMap::new();
+        for seg in &segs {
+            let n = idx.entry(seg.track_id).or_default();
+            println!(
+                "{}\ttrack{} seg{}\t{} bytes",
+                crate::cid::from_bytes(seg.data),
+                seg.track_id,
+                n,
+                seg.data.len()
+            );
+            *n += 1;
+        }
+    } else {
+        println!("{}", crate::cid::from_file(&input)?);
     }
     Ok(())
 }

@@ -294,6 +294,60 @@ pub fn from_input<R: crate::io::ReadAt + ?Sized>(input: &R) -> Result<Catalog> {
     crate::init::catalog_from_moov(&moov)
 }
 
+/// Extract the single-track catalog embedded in a MUXL canonical segment's
+/// leading `uuid` box (id [`crate::segment::MUXL_UUID`]).
+///
+/// Scans top-level boxes from the start of `bytes`, skipping any boxes that
+/// precede the MUXL uuid — notably a prepended C2PA/S2PA `uuid` manifest box
+/// in a signed segment (`[uuid-c2pa][uuid-muxl][moof][mdat]…`) — then
+/// DRISL-decodes the body of the MUXL uuid box.
+///
+/// This is the read-side inverse of
+/// [`crate::segment::mint_canonical_segment_prefix`]: a segment minted with
+/// that prefix round-trips back to its (single-track) catalog here. Unlike
+/// [`from_input`] it parses no `moov`; the catalog is read straight from the
+/// segment's own self-describing prefix, so it needs no out-of-band init.
+pub fn from_segment(bytes: &[u8]) -> Result<Catalog> {
+    let mut pos = 0usize;
+    while pos + 8 <= bytes.len() {
+        let size32 = u32::from_be_bytes(bytes[pos..pos + 4].try_into().unwrap());
+        let kind = &bytes[pos + 4..pos + 8];
+        // Resolve [body_start, box_end) for this box, honoring the 32-bit,
+        // 64-bit-largesize (size==1), and to-EOF (size==0) ISOBMFF forms.
+        let (body_start, box_end) = match size32 {
+            1 => {
+                if pos + 16 > bytes.len() {
+                    break;
+                }
+                let large = u64::from_be_bytes(bytes[pos + 8..pos + 16].try_into().unwrap());
+                let end = (large as usize)
+                    .checked_add(pos)
+                    .filter(|&e| e >= pos + 16 && e <= bytes.len())
+                    .ok_or_else(|| Error::InvalidMp4("segment uuid box size out of range".into()))?;
+                (pos + 16, end)
+            }
+            0 => (pos + 8, bytes.len()),
+            n => {
+                let end = (n as usize)
+                    .checked_add(pos)
+                    .filter(|&e| e >= pos + 8 && e <= bytes.len())
+                    .ok_or_else(|| Error::InvalidMp4("segment uuid box size out of range".into()))?;
+                (pos + 8, end)
+            }
+        };
+        if kind == b"uuid"
+            && body_start + 16 <= box_end
+            && bytes[body_start..body_start + 16] == crate::segment::MUXL_UUID
+        {
+            return from_drisl(&bytes[body_start + 16..box_end]);
+        }
+        pos = box_end;
+    }
+    Err(Error::InvalidMp4(
+        "no MUXL uuid box found in segment prefix".into(),
+    ))
+}
+
 /// Encode the catalog as DRISL (deterministic CBOR). This is the
 /// canonical / content-addressed form — the bytes are BLAKE3-hashed to
 /// produce the catalog's CID. Binary fields (`description`) stay binary.
@@ -509,6 +563,50 @@ mod tests {
         assert_eq!(from_hang_json(&json).unwrap(), c);
         let drisl = to_drisl(&c).unwrap();
         assert_eq!(from_drisl(&drisl).unwrap(), c);
+    }
+
+    #[test]
+    fn from_segment_recovers_single_track_catalog() {
+        // mint_canonical_segment_prefix(catalog, tid) writes the uuid box for
+        // the track filtered to `tid`; from_segment must recover exactly that.
+        let c = sample_catalog();
+        for tid in [1u32, 2u32] {
+            let prefix = crate::segment::mint_canonical_segment_prefix(&c, tid).unwrap();
+            // Trailing bytes (a stand-in for moof+mdat) must not confuse the scan.
+            let mut seg = prefix.clone();
+            seg.extend_from_slice(b"\x00\x00\x00\x08moof");
+            let recovered = from_segment(&seg).unwrap();
+            assert_eq!(recovered, c.filter_to_track(tid));
+        }
+    }
+
+    #[test]
+    fn from_segment_skips_leading_c2pa_uuid() {
+        // A signed segment is [uuid-c2pa][uuid-muxl][moof]…; from_segment must
+        // skip the unrelated leading uuid box and find the MUXL one.
+        let c = sample_catalog();
+        let muxl_prefix = crate::segment::mint_canonical_segment_prefix(&c, 1).unwrap();
+
+        // Fabricate a c2pa-shaped uuid box with a different usertype + body.
+        let c2pa_body = b"fake c2pa manifest bytes";
+        let c2pa_id = [0xd8u8; 16];
+        let total = 24 + c2pa_body.len();
+        let mut seg = Vec::new();
+        seg.extend_from_slice(&(total as u32).to_be_bytes());
+        seg.extend_from_slice(b"uuid");
+        seg.extend_from_slice(&c2pa_id);
+        seg.extend_from_slice(c2pa_body);
+        seg.extend_from_slice(&muxl_prefix);
+
+        let recovered = from_segment(&seg).unwrap();
+        assert_eq!(recovered, c.filter_to_track(1));
+    }
+
+    #[test]
+    fn from_segment_errs_without_muxl_uuid() {
+        // A plain moof box (no uuid) yields a clear error, not a panic.
+        let bytes = b"\x00\x00\x00\x08moof".to_vec();
+        assert!(from_segment(&bytes).is_err());
     }
 
     #[test]

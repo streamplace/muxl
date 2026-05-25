@@ -118,12 +118,18 @@ pub struct SegmentArgs {
 #[derive(Args)]
 pub struct WrapArgs {
     /// Input MUXL wrapper: fMP4, flat MP4, or a bare m4s segment stream.
+    /// "-" reads stdin.
     pub input: PathBuf,
-    /// Output MP4 path.
+    /// Output MP4 path. "-" writes stdout.
     pub output: PathBuf,
     /// Presentation container to synthesize.
     #[arg(long, value_enum, default_value = "fmp4")]
     pub format: WrapFormat,
+    /// Emit only the synthesized init segment (ftyp+moov) — the EXT-X-MAP
+    /// target for HLS playback — instead of init+segments. Requires
+    /// --format fmp4.
+    #[arg(long)]
+    pub init_only: bool,
 }
 
 #[derive(Args)]
@@ -446,13 +452,47 @@ pub fn cmd_hls(args: HlsArgs) -> crate::Result<()> {
 /// presentation MP4. fMP4 is the verbatim fast-forward path; flat is the
 /// interim Source-based flatten.
 pub fn cmd_wrap(args: WrapArgs) -> crate::Result<()> {
-    let WrapArgs { input, output, format } = args;
-    let bytes = fs::read(&input)?;
-    let mut out = BufWriter::new(fs::File::create(&output)?);
+    let WrapArgs { input, output, format, init_only } = args;
+
+    // "-" reads stdin / writes stdout, so a wasm host can pipe the hot bytes
+    // without touching the filesystem (matching `mp4` and `sign-per-track`).
+    let bytes: Vec<u8> = if input.as_os_str() == "-" {
+        let mut buf = Vec::new();
+        io::stdin().lock().read_to_end(&mut buf)?;
+        buf
+    } else {
+        fs::read(&input)?
+    };
+    let mut out: Box<dyn Write> = if output.as_os_str() == "-" {
+        Box::new(BufWriter::new(io::stdout().lock()))
+    } else {
+        Box::new(BufWriter::new(fs::File::create(&output)?))
+    };
+
+    let segments = crate::reader::unwrap(&bytes)?;
+    let catalog = crate::reader::aggregate_catalog(&segments);
+
+    if init_only {
+        if !matches!(format, WrapFormat::Fmp4) {
+            return Err(crate::Error::InvalidMp4(
+                "--init-only requires --format fmp4".into(),
+            ));
+        }
+        // Synthesize just the combined ftyp+moov from the segments' embedded
+        // catalogs — the per-stream init the HLS read side maps to.
+        let init = crate::present::init(&catalog)?;
+        out.write_all(&init)?;
+        out.flush()?;
+        eprintln!(
+            "init segment: {} bytes (from {} segments)",
+            init.len(),
+            segments.len()
+        );
+        return Ok(());
+    }
+
     match format {
         WrapFormat::Fmp4 => {
-            let segments = crate::reader::unwrap(&bytes)?;
-            let catalog = crate::reader::aggregate_catalog(&segments);
             crate::present::write_fmp4(&catalog, segments.iter().map(|s| s.data), &mut out)?;
             out.flush()?;
             eprintln!("fMP4: wrapped {} segments", segments.len());
@@ -460,8 +500,6 @@ pub fn cmd_wrap(args: WrapArgs) -> crate::Result<()> {
         WrapFormat::Flat => {
             // Fast-forward + m4s-native: unwrap to verbatim segments, then
             // synthesize the flat moov from their parsed metadata.
-            let segments = crate::reader::unwrap(&bytes)?;
-            let catalog = crate::reader::aggregate_catalog(&segments);
             let slices: Vec<&[u8]> = segments.iter().map(|s| s.data).collect();
             crate::present::write_flat_from_m4s(&catalog, &slices, &mut out)?;
             out.flush()?;

@@ -72,6 +72,14 @@ enum Command {
     Mp4(muxl_cli::Mp4Args),
     /// Segment an fMP4 into per-GoP MUXL segments.
     Segment(muxl_cli::SegmentArgs),
+    /// Wrap MUXL segments into a presentation MP4 (fMP4 or flat); "-" reads
+    /// stdin / writes stdout. With --init-only, emit just the synthesized
+    /// init segment (the inbound header-synthesis the host runs per segment).
+    Wrap(muxl_cli::WrapArgs),
+    /// Unwrap any MUXL wrapper (fMP4/flat/bare m4s) into its canonical segments.
+    Unwrap(muxl_cli::UnwrapArgs),
+    /// Print the BDASL CID of a whole file, or of each canonical segment.
+    Cid(muxl_cli::CidArgs),
     /// Concatenate MUXL fMP4 files from stdin, emit CBOR events to stdout.
     Concat,
     /// Synthesize a multi-segment flat MP4 header from per-segment metadata.
@@ -259,6 +267,9 @@ pub fn cli_main() {
         Command::Fmp4(args) => muxl_cli::cmd_fmp4(args).map_err(Into::into),
         Command::Mp4(args) => muxl_cli::cmd_mp4(args).map_err(Into::into),
         Command::Segment(args) => muxl_cli::cmd_segment(args).map_err(Into::into),
+        Command::Wrap(args) => muxl_cli::cmd_wrap(args).map_err(Into::into),
+        Command::Unwrap(args) => muxl_cli::cmd_unwrap(args).map_err(Into::into),
+        Command::Cid(args) => muxl_cli::cmd_cid(args).map_err(Into::into),
         Command::Concat => muxl_cli::cmd_concat().map_err(Into::into),
         Command::SynthFlat => cmd_synth_flat(),
         Command::Hls(args) => muxl_cli::cmd_hls(args).map_err(Into::into),

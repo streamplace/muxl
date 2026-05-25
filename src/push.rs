@@ -30,7 +30,7 @@ use crate::catalog::Catalog;
 use crate::error::{Error, Result};
 use crate::fragment::{self, Frame};
 use crate::init::{build_init_segment, catalog_from_moov};
-use crate::segment::{GopSegment, TrackSamples, flush_track_bufs, record_frame};
+use crate::segment::{GopSegment, TrackSamples, audio_only_boundary, flush_track_bufs, record_frame};
 
 /// Events emitted by the push-based segmenter.
 pub enum SegmenterEvent {
@@ -207,7 +207,15 @@ impl Segmenter {
                                 let is_video_keyframe =
                                     ss.video_track_ids.contains(&frame.track_id) && frame.is_sync;
 
-                                if is_video_keyframe && ss.seen_first_keyframe {
+                                // New segment at a video keyframe (after the
+                                // first), or a 1s span for audio-only streams.
+                                let boundary = if ss.video_track_ids.is_empty() {
+                                    audio_only_boundary(&ss.track_durations, &ss.track_timescales)
+                                } else {
+                                    is_video_keyframe && ss.seen_first_keyframe
+                                };
+
+                                if boundary {
                                     ss.segment_number += 1;
                                     if let Some(gop) = flush_track_bufs(
                                         &mut ss.track_bufs,

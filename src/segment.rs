@@ -135,13 +135,22 @@ pub fn segment_fmp4<R: Read>(
     let mut track_durations: BTreeMap<u32, u64> = BTreeMap::new();
     let mut track_sample_counts: BTreeMap<u32, u32> = BTreeMap::new();
     let mut track_samples: BTreeMap<u32, TrackSamples> = BTreeMap::new();
+    let has_video = !video_track_ids.is_empty();
     let mut segment_number: u32 = 0;
     let mut seen_first_keyframe = false;
 
     while let Some(frame) = fmp4.next_frame()? {
         let is_video_keyframe = video_track_ids.contains(&frame.track_id) && frame.is_sync;
 
-        if is_video_keyframe && seen_first_keyframe {
+        // A new segment opens at each video keyframe (after the first), or —
+        // for audio-only streams — at each 1-second wall-clock span.
+        let boundary = if has_video {
+            is_video_keyframe && seen_first_keyframe
+        } else {
+            audio_only_boundary(&track_durations, &track_timescales)
+        };
+
+        if boundary {
             segment_number += 1;
             if let Some(gop) = flush_track_bufs(
                 &mut track_bufs,
@@ -307,6 +316,29 @@ pub(crate) fn compute_duration_us(
         .map(|(&tid, &ticks)| to_us(tid, ticks))
         .max()
         .unwrap_or(0)
+}
+
+/// Segment-boundary test for audio-only streams (no video reference track).
+///
+/// Spec (`canonical-form.md § Segmentation Rule`): audio-only streams cut at
+/// 1-second wall-clock spans. `track_durations` holds each track's media
+/// ticks accumulated since the last flush; the reference clock is the
+/// smallest-id track present. Returns `true` once the reference track has
+/// accumulated at least one second, meaning the *next* frame should open a
+/// new segment (mirroring how a video keyframe opens the next GoP). Returns
+/// `false` right after a flush (the map is empty) so a fresh segment never
+/// cuts on its very first frame.
+pub(crate) fn audio_only_boundary(
+    track_durations: &BTreeMap<u32, u64>,
+    track_timescales: &BTreeMap<u32, u32>,
+) -> bool {
+    match track_durations.iter().next() {
+        Some((tid, &ticks)) => {
+            let ts = track_timescales.get(tid).copied().unwrap_or(0);
+            ts > 0 && ticks >= ts as u64
+        }
+        None => false,
+    }
 }
 
 #[cfg(test)]
@@ -518,5 +550,56 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn audio_only_boundary_fires_at_one_second() {
+        let ts: BTreeMap<u32, u32> = [(1u32, 48_000u32)].into_iter().collect();
+        assert!(!audio_only_boundary(&BTreeMap::new(), &ts), "empty (post-flush) → no cut");
+        let below: BTreeMap<u32, u64> = [(1u32, 47_040u64)].into_iter().collect();
+        assert!(!audio_only_boundary(&below, &ts), "<1s accumulated → no cut");
+        let at: BTreeMap<u32, u64> = [(1u32, 48_000u64)].into_iter().collect();
+        assert!(audio_only_boundary(&at, &ts), ">=1s accumulated → cut");
+    }
+
+    #[test]
+    fn test_audio_only_stream_segments_at_one_second() {
+        // opus-audio-only.mp4 is a flat ~2s single Opus track. Convert it to
+        // fMP4 via muxl, then segment: the audio-only 1-second rule must split
+        // it into multiple ~1s segments. Before this fix the streaming
+        // segmenter only cut on video keyframes, so an audio-only stream never
+        // segmented until EOF (one giant segment).
+        let flat = read_fixture("opus-audio-only.mp4");
+        let source = crate::read(&flat).unwrap();
+        let mut fmp4 = Vec::new();
+        crate::fmp4::write(&source, &flat, &mut fmp4).unwrap();
+
+        let mut segs = Vec::new();
+        let catalog = segment_fmp4(&mut Cursor::new(&fmp4), |gop| {
+            segs.push(gop);
+            Ok(())
+        })
+        .unwrap();
+
+        assert!(
+            catalog.video_configs().next().is_none(),
+            "fixture must be audio-only for this test"
+        );
+        assert!(
+            segs.len() >= 2,
+            "audio-only ~2s stream should split into multiple 1s segments, got {}",
+            segs.len()
+        );
+        // Each non-final segment should span ~1 second.
+        for gop in &segs[..segs.len() - 1] {
+            assert!(
+                gop.duration_us >= 900_000,
+                "non-final audio segment should be ~1s, got {} us",
+                gop.duration_us
+            );
+        }
+        // Segmentation must not drop or duplicate frames.
+        let total: u32 = segs.iter().flat_map(|g| g.sample_counts.values().copied()).sum();
+        assert_eq!(total, 101, "all 101 opus frames must survive segmentation");
     }
 }

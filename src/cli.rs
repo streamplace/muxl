@@ -135,7 +135,14 @@ pub struct WrapArgs {
 #[derive(Args)]
 pub struct UnwrapArgs {
     /// Input MUXL wrapper: fMP4, flat MP4, or a bare m4s segment stream.
+    /// "-" reads stdin.
     pub input: PathBuf,
+    /// Re-derive the per-track CBOR event stream (init + one segment per GoP;
+    /// bytes verbatim, durations recomputed) to stdout — the inverse of
+    /// `segment --stdout` for already-stored segments. Mutually exclusive
+    /// with --dir.
+    #[arg(long)]
+    pub events: bool,
     /// Write recovered segments here — one `.m4s` per segment under
     /// `track<id>/`, plus a per-track `init.mp4`. Omit for a stderr summary.
     #[arg(long, value_name = "DIR")]
@@ -514,8 +521,30 @@ pub fn cmd_wrap(args: WrapArgs) -> crate::Result<()> {
 /// plus a per-track `init.mp4`; otherwise prints a summary.
 pub fn cmd_unwrap(args: UnwrapArgs) -> crate::Result<()> {
     use std::collections::{BTreeMap, HashSet};
-    let UnwrapArgs { input, dir } = args;
-    let bytes = fs::read(&input)?;
+    let UnwrapArgs { input, dir, events } = args;
+    let bytes: Vec<u8> = if input.as_os_str() == "-" {
+        let mut buf = Vec::new();
+        io::stdin().lock().read_to_end(&mut buf)?;
+        buf
+    } else {
+        fs::read(&input)?
+    };
+
+    // --events: re-emit the per-track CBOR event stream (for a host that
+    // drives the live-HLS window off already-stored segments).
+    if events {
+        let mut stdout = io::stdout().lock();
+        let evs = crate::reader::segment_events(&bytes)?;
+        for ev in &evs {
+            dasl::drisl::to_writer(&mut stdout, ev).map_err(|e| {
+                crate::Error::Io(io::Error::new(io::ErrorKind::Other, e.to_string()))
+            })?;
+        }
+        stdout.flush()?;
+        eprintln!("emitted {} events", evs.len());
+        return Ok(());
+    }
+
     let segments = crate::reader::unwrap(&bytes)?;
 
     if let Some(dir) = dir {

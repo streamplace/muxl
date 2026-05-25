@@ -13,10 +13,19 @@
 //! /ftyp, /mfra). Extracting a canonical segment from the body yields a
 //! self-verifying .m4s asset that doesn't depend on the surrounding flat
 //! MP4 wrapper.
+//!
+//! Per-segment time: the streaming signer [`sign_segment_stream`] stamps each
+//! GoP's signing time into its manifest's `cawg.metadata`/`dc:date` (RFC 3339
+//! UTC, millisecond precision — `2019-09-22T18:22:57.000Z`), mutating an
+//! existing `cawg.metadata` assertion or appending one. The time lives in
+//! `dc:date` rather than a bespoke assertion for interop with other C2PA
+//! tooling; the host reads it back as the segment's start time, and because
+//! it's part of the signed claim every node sees the same value.
 
 use std::io::{Cursor, Read, Write};
 use std::path::Path;
 use std::sync::Once;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use c2pa::{Builder, CallbackSigner, Signer as C2paSigner, SigningAlg};
 use muxl::{Segmenter, SegmenterEvent, Source};
@@ -586,6 +595,13 @@ pub fn sign_segment_stream<R: Read, W: Write>(
 ) -> Result<()> {
     init_default_settings();
     let c2pa_signer = signer.build()?;
+    // Parse the base segment manifest once. Each GoP is signed with a clone
+    // that carries this segment's signing time in cawg.metadata/`dc:date`
+    // (see stamp_segment_manifest), so every canonical .m4s holds its own
+    // provenance date — the value Streamplace reads back as the segment's
+    // StartTime.
+    let segment_base: serde_json::Value = serde_json::from_str(segment_manifest)
+        .map_err(|e| Error::C2pa(c2pa::Error::BadParam(format!("segment manifest JSON: {e}"))))?;
     let mut segmenter = Segmenter::new();
     let mut init_seen = false;
     let mut buf = [0u8; 64 * 1024];
@@ -600,7 +616,7 @@ pub fn sign_segment_stream<R: Read, W: Write>(
                 event,
                 &mut init_seen,
                 signer,
-                segment_manifest,
+                &segment_base,
                 wrapper_manifest,
                 output,
                 &*c2pa_signer,
@@ -612,7 +628,7 @@ pub fn sign_segment_stream<R: Read, W: Write>(
             event,
             &mut init_seen,
             signer,
-            segment_manifest,
+            &segment_base,
             wrapper_manifest,
             output,
             &*c2pa_signer,
@@ -621,11 +637,87 @@ pub fn sign_segment_stream<R: Read, W: Write>(
     Ok(())
 }
 
+/// Stamp the per-segment signing time into the base segment manifest's
+/// `cawg.metadata` assertion as `dc:date`, returning the manifest JSON to
+/// sign for this GoP.
+///
+/// We keep the time inside `cawg.metadata`/`dc:date` (rather than a bespoke
+/// assertion) for interop with other C2PA tooling. If the base manifest
+/// already carries a `cawg.metadata` assertion (Streamplace's does, with
+/// creator/title) its `dc:date` is overwritten; otherwise a minimal
+/// `cawg.metadata` assertion carrying just the dc context + date is appended.
+/// `when` is an RFC 3339 UTC string (`2019-09-22T18:22:57.000Z`).
+fn stamp_segment_manifest(base: &serde_json::Value, when: &str) -> String {
+    use serde_json::{Value, json};
+    let mut m = base.clone();
+    if let Some(arr) = m.get_mut("assertions").and_then(Value::as_array_mut) {
+        if let Some(a) = arr
+            .iter_mut()
+            .find(|a| a.get("label").and_then(Value::as_str) == Some("cawg.metadata"))
+        {
+            if let Some(data) = a.get_mut("data").and_then(Value::as_object_mut) {
+                data.insert("dc:date".into(), Value::String(when.into()));
+            } else if let Some(obj) = a.as_object_mut() {
+                obj.insert("data".into(), json!({ "dc:date": when }));
+            }
+        } else {
+            arr.push(json!({
+                "label": "cawg.metadata",
+                "data": { "@context": { "dc": "http://purl.org/dc/elements/1.1/" }, "dc:date": when }
+            }));
+        }
+    } else if let Some(obj) = m.as_object_mut() {
+        obj.insert(
+            "assertions".into(),
+            json!([{
+                "label": "cawg.metadata",
+                "data": { "@context": { "dc": "http://purl.org/dc/elements/1.1/" }, "dc:date": when }
+            }]),
+        );
+    }
+    m.to_string()
+}
+
+/// Current wall-clock as an RFC 3339 UTC string with millisecond precision
+/// (`2019-09-22T18:22:57.000Z`). Streamplace's aqtime parses it via
+/// RFC3339Nano and normalizes to exactly this layout.
+fn now_rfc3339_utc() -> String {
+    let d = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default();
+    rfc3339_from_unix(d.as_secs() as i64, d.subsec_millis())
+}
+
+/// Format `secs` since the Unix epoch (+ `millis`) as an RFC 3339 UTC string,
+/// `YYYY-MM-DDTHH:MM:SS.mmmZ`. Pure (no clock) so it's unit-testable.
+fn rfc3339_from_unix(secs: i64, millis: u32) -> String {
+    let days = secs.div_euclid(86_400);
+    let tod = secs.rem_euclid(86_400);
+    let (h, mi, s) = (tod / 3600, (tod % 3600) / 60, tod % 60);
+    let (y, mo, d) = civil_from_days(days);
+    format!("{y:04}-{mo:02}-{d:02}T{h:02}:{mi:02}:{s:02}.{millis:03}Z")
+}
+
+/// Civil (year, month, day) from days since 1970-01-01, via Howard Hinnant's
+/// algorithm (proleptic Gregorian; handles leap years across the full range).
+fn civil_from_days(z: i64) -> (i64, u32, u32) {
+    let z = z + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097; // [0, 146096]
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365; // [0, 399]
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // [0, 365]
+    let mp = (5 * doy + 2) / 153; // [0, 11]
+    let d = (doy - (153 * mp + 2) / 5 + 1) as u32; // [1, 31]
+    let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32; // [1, 12]
+    (if m <= 2 { y + 1 } else { y }, m, d)
+}
+
 fn handle_event<W: Write>(
     event: SegmenterEvent,
     init_seen: &mut bool,
     _signer: &SignerKey,
-    segment_manifest: &str,
+    segment_base: &serde_json::Value,
     _wrapper_manifest: &str,
     output: &mut W,
     c2pa_signer: &dyn C2paSigner,
@@ -665,13 +757,16 @@ fn handle_event<W: Write>(
                     "segment received before init segment".into(),
                 )));
             }
-            // Sign each canonical segment (per track) in this GoP as a bare
-            // .m4s asset. Replace the gop's per-track buffers with the
-            // signed bytes and shift per-sample offsets past the leading
-            // c2pa-uuid prefix.
+            // Stamp this segment's signing time into cawg.metadata/`dc:date`
+            // so the canonical .m4s carries its own provenance date (read back
+            // as the segment StartTime), then sign each canonical segment (per
+            // track) as a bare .m4s asset. Signing replaces the gop's per-track
+            // buffers with the signed bytes and shifts per-sample offsets past
+            // the leading c2pa-uuid prefix.
+            let segment_manifest = stamp_segment_manifest(segment_base, &now_rfc3339_utc());
             let prefix_size = sign_gop_canonical_segments_in_place(
                 &mut gop,
-                segment_manifest,
+                &segment_manifest,
                 c2pa_signer,
             )?;
             let number = gop.number;
@@ -756,4 +851,72 @@ fn sign_buf_as(
     let mut dest_cursor = Cursor::new(&mut output_buf);
     builder.sign(signer, format, &mut source_cursor, &mut dest_cursor)?;
     Ok(output_buf)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn rfc3339_known_values() {
+        assert_eq!(rfc3339_from_unix(0, 0), "1970-01-01T00:00:00.000Z");
+        assert_eq!(rfc3339_from_unix(0, 123), "1970-01-01T00:00:00.123Z");
+        // Unix billennium.
+        assert_eq!(rfc3339_from_unix(1_000_000_000, 0), "2001-09-09T01:46:40.000Z");
+        // Leap day.
+        assert_eq!(rfc3339_from_unix(1_582_934_400, 0), "2020-02-29T00:00:00.000Z");
+    }
+
+    #[test]
+    fn stamp_mutates_existing_cawg_metadata() {
+        let base = json!({
+            "title": "stream",
+            "assertions": [
+                { "label": "c2pa.actions", "data": { "actions": [] } },
+                { "label": "cawg.metadata", "data": {
+                    "@context": { "dc": "http://purl.org/dc/elements/1.1/" },
+                    "dc:creator": "did:example", "dc:title": "t",
+                    "dc:date": "1970-01-01T00:00:00.000Z"
+                }}
+            ]
+        });
+        let out: serde_json::Value =
+            serde_json::from_str(&stamp_segment_manifest(&base, "2020-02-29T00:00:00.000Z")).unwrap();
+        let cawg: Vec<_> = out["assertions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|a| a["label"] == "cawg.metadata")
+            .collect();
+        assert_eq!(cawg.len(), 1, "must not duplicate cawg.metadata");
+        assert_eq!(cawg[0]["data"]["dc:date"], "2020-02-29T00:00:00.000Z");
+        // Creator/title preserved.
+        assert_eq!(cawg[0]["data"]["dc:creator"], "did:example");
+        assert_eq!(cawg[0]["data"]["dc:title"], "t");
+    }
+
+    #[test]
+    fn stamp_appends_when_cawg_absent() {
+        let base = json!({ "assertions": [ { "label": "c2pa.actions", "data": {} } ] });
+        let out: serde_json::Value =
+            serde_json::from_str(&stamp_segment_manifest(&base, "2001-09-09T01:46:40.000Z")).unwrap();
+        let cawg = out["assertions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|a| a["label"] == "cawg.metadata")
+            .expect("a cawg.metadata assertion should have been appended");
+        assert_eq!(cawg["data"]["dc:date"], "2001-09-09T01:46:40.000Z");
+        assert!(cawg["data"]["@context"]["dc"].is_string());
+    }
+
+    #[test]
+    fn stamp_creates_assertions_when_missing() {
+        let base = json!({ "title": "x" });
+        let out: serde_json::Value =
+            serde_json::from_str(&stamp_segment_manifest(&base, "1970-01-01T00:00:00.000Z")).unwrap();
+        assert_eq!(out["assertions"].as_array().unwrap().len(), 1);
+        assert_eq!(out["assertions"][0]["label"], "cawg.metadata");
+    }
 }

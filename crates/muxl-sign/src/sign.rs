@@ -215,7 +215,7 @@ impl SignerKey {
 }
 
 /// Host-supplied signing import. The wasm runtime is expected to provide
-/// this function under module name `streamplace`; signs `data` and writes
+/// this function under module name `muxl`; signs `data` and writes
 /// the raw r||s (or DER, per `alg`) signature into `[out_sig_ptr,
 /// out_sig_max)`. Returns the signature length, or `u32::MAX` on error.
 ///
@@ -223,7 +223,7 @@ impl SignerKey {
 /// returns the error sentinel so [`SignBackend::Host`] simply doesn't
 /// work outside of a wasm runtime that wires it up.
 #[cfg(target_family = "wasm")]
-#[link(wasm_import_module = "streamplace")]
+#[link(wasm_import_module = "muxl")]
 unsafe extern "C" {
     fn host_sign(data_ptr: u32, data_len: u32, out_sig_ptr: u32, out_sig_max: u32) -> u32;
     /// Compute SHA-256 of `data` host-side, write the 32-byte digest at

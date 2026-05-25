@@ -16,7 +16,7 @@ use clap::{ArgGroup, Parser, Subcommand, ValueEnum};
 use muxl::cli as muxl_cli;
 
 use crate::{
-    Result, SignerKey, SigningAlg, cert, sign_per_track, sign_segment_stream,
+    Result, SignerKey, SigningAlg, cert, sign_per_track, sign_segment_stream, verify_segments,
 };
 
 #[derive(Parser)]
@@ -41,6 +41,13 @@ enum Command {
     /// MUXL segmenter, produce one signed flat MP4 (per-track + wrapper)
     /// as a CBOR `signed-segment` event on stdout.
     SignSegment(SignSegmentArgs),
+    /// Verify the C2PA/S2PA signatures on a signed MUXL wrapper read from
+    /// stdin (bare .m4s stream, fMP4, or flat MP4). Each canonical segment
+    /// is validated standalone as an `m4s` asset. Emits a JSON document
+    /// `{"segments":[{track_id,manifest,cert,validation_results,validation_state}]}`
+    /// on stdout — the per-track equivalent of the manifest+cert blob the
+    /// host used to get from the iroh-streamplace c2pa binding.
+    Verify,
     /// Microbenchmark: hash N×size bytes via either in-wasm sha2 or the
     /// `streamplace.host_sha256` import. Used to size the upper bound on
     /// what a host-SHA256 path could save before committing to a
@@ -241,6 +248,7 @@ pub fn cli_main() {
     let result = match cli.command {
         Command::SignPerTrack(args) => cmd_sign_per_track(args),
         Command::SignSegment(args) => cmd_sign_segment(args),
+        Command::Verify => cmd_verify(),
         Command::BenchSha256(args) => cmd_bench_sha256(args),
         Command::GenKey(args) => cmd_gen_key(args),
         Command::GenCert(args) => cmd_gen_cert(args),
@@ -324,6 +332,14 @@ fn cmd_sign_segment(args: SignSegmentArgs) -> Result<()> {
         &track_manifest,
         &wrapper_manifest,
     )
+}
+
+fn cmd_verify() -> Result<()> {
+    let mut buf = Vec::new();
+    io::stdin().lock().read_to_end(&mut buf)?;
+    let json = verify_segments(&buf)?;
+    io::stdout().lock().write_all(json.as_bytes())?;
+    Ok(())
 }
 
 /// Wire shape for `muxl-sign synth-flat`'s stdin: a single CBOR document

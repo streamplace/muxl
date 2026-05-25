@@ -34,6 +34,9 @@ sha1 = "0.10"
 dasl = "0.2"
 serde = { version = "1", features = ["derive"] }
 serde_bytes = "0.11"
+# `verify` emits the manifest+cert+validation JSON the host consumes —
+# the same shape the old iroh-streamplace uniffi binding produced.
+serde_json = "1"
 
 [dev-dependencies]
 # Decode SignedEvent streams in tests as generic CBOR values. dasl's

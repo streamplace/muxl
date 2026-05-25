@@ -54,7 +54,7 @@ enabled = false
 
 static SETTINGS_INIT: Once = Once::new();
 
-fn init_default_settings() {
+pub(crate) fn init_default_settings() {
     SETTINGS_INIT.call_once(|| {
         c2pa::settings::Settings::from_toml(MUXL_SIGN_DEFAULTS_TOML)
             .expect("muxl-sign default settings TOML should always parse");

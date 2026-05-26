@@ -9,6 +9,9 @@
 //! - [`SignerKey`] — PEM cert chain + private key (or host callback) + alg.
 //! - [`sign_segment_stream`] — stream an fMP4 in, emit one CBOR
 //!   `signed-segment` event per GoP (per-track signed canonical segments).
+//! - [`sign_transcode_segment`] — sign a transcoded segment that declares
+//!   the segment it was transcoded from as a `parentOf` ingredient, carrying
+//!   a `c2pa.transcoded` action (the Livepeer-orchestrator provenance step).
 //! - [`verify_segments`] — validate the signatures on a signed MUXL wrapper.
 
 pub mod cbor;
@@ -23,5 +26,7 @@ pub use cbor::SignedEvent;
 pub use cert::{cert_to_pem, did_key_for, generate_cert, generate_key, key_to_pem};
 pub use cli::cli_main;
 pub use error::{Error, Result};
-pub use sign::{SignerKey, sign_segment_stream};
+pub use sign::{
+    SignerKey, TRANSCODE_INGREDIENT_LABEL, sign_segment_stream, sign_transcode_segment,
+};
 pub use verify::verify_segments;

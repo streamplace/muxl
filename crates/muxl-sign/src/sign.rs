@@ -552,6 +552,83 @@ fn sign_buf_as(
     Ok(output_buf)
 }
 
+/// Label binding the transcode source segment — added as a `parentOf`
+/// ingredient by [`sign_transcode_segment`] — to the actions that reference
+/// it. A manifest passed to [`sign_transcode_segment`] declares the link by
+/// listing this string in an action's `org.cai.ingredientIds` parameter:
+///
+/// ```json
+/// { "label": "c2pa.actions", "data": { "actions": [
+///     { "action": "c2pa.opened",     "parameters": { "org.cai.ingredientIds": ["muxl.source"] } },
+///     { "action": "c2pa.transcoded", "parameters": { "org.cai.ingredientIds": ["muxl.source"] } }
+/// ]}}
+/// ```
+///
+/// At sign time c2pa-rs resolves the label to the ingredient's hashed URI
+/// (see [`Builder`]'s ingredient/action mapping), so the signed claim names
+/// the exact source bytes the output was derived from.
+pub const TRANSCODE_INGREDIENT_LABEL: &str = "muxl.source";
+
+/// Sign one transcoded canonical MUXL segment, declaring the segment it was
+/// transcoded from as a `parentOf` ingredient.
+///
+/// `output` is the unsigned canonical MUXL `.m4s` produced by transcoding +
+/// re-segmenting; `source` is the canonical MUXL `.m4s` that was transcoded
+/// (typically itself S2PA-signed, so the provenance chain stays unbroken).
+/// `segment_manifest` is a C2PA manifest JSON that should carry a
+/// `c2pa.actions` assertion whose `c2pa.transcoded` action references the
+/// source via [`TRANSCODE_INGREDIENT_LABEL`] (see that constant's docs).
+///
+/// Returns the signed output — `[c2pa-uuid][muxl-uuid][moof][mdat]…` — which
+/// verifies standalone as an `m4s` asset and whose manifest names `source`
+/// as its parent. This is the provenance step a Livepeer orchestrator runs
+/// after transcoding a signed MUXL segment: the output carries, in its own
+/// signed claim, the identity of the exact input it came from.
+///
+/// Per-segment time is stamped into `cawg.metadata`/`dc:date` exactly as in
+/// [`sign_segment_stream`], so each signed `.m4s` holds its own provenance
+/// date.
+pub fn sign_transcode_segment(
+    output: &[u8],
+    source: &[u8],
+    signer: &SignerKey,
+    segment_manifest: &str,
+) -> Result<Vec<u8>> {
+    init_default_settings();
+    let c2pa_signer = signer.build()?;
+    let base: serde_json::Value = serde_json::from_str(segment_manifest)
+        .map_err(|e| Error::C2pa(c2pa::Error::BadParam(format!("segment manifest JSON: {e}"))))?;
+    let manifest = stamp_segment_manifest(&base, &now_rfc3339_utc());
+    sign_buf_as_transcode(output, source, &manifest, &*c2pa_signer, "m4s")
+}
+
+/// Sign `output` as a standalone asset that declares `source` as a
+/// `parentOf` ingredient. Sibling of [`sign_buf_as`] with the ingredient
+/// step added: c2pa-rs hashes `source` (and pulls in its manifest, if it's
+/// signed) and records it as the parent, then the manifest's actions bind to
+/// it via [`TRANSCODE_INGREDIENT_LABEL`].
+fn sign_buf_as_transcode(
+    output: &[u8],
+    source: &[u8],
+    manifest: &str,
+    signer: &dyn C2paSigner,
+    format: &str,
+) -> Result<Vec<u8>> {
+    let mut builder = Builder::from_json(manifest)?;
+
+    // `source` is the parent ingredient: `output` is a transcode *of* it. The
+    // label lets the manifest's actions reference this ingredient by id.
+    let ingredient_json = format!(
+        r#"{{"title":"source segment","relationship":"parentOf","label":"{TRANSCODE_INGREDIENT_LABEL}"}}"#
+    );
+    builder.add_ingredient_from_stream(ingredient_json, format, &mut Cursor::new(source))?;
+
+    let mut asset = Cursor::new(output);
+    let mut signed: Vec<u8> = Vec::new();
+    builder.sign(signer, format, &mut asset, &mut Cursor::new(&mut signed))?;
+    Ok(signed)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

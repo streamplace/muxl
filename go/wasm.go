@@ -8,6 +8,8 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"os"
+	"path/filepath"
 	"sync"
 	"sync/atomic"
 	"testing/fstest"
@@ -243,6 +245,34 @@ func (e *WASMEngine) GenCert(ctx context.Context, in CertInput) ([]byte, error) 
 		return nil, err
 	}
 	return out.Bytes(), nil
+}
+
+// Canonicalize converts a flat or fragmented MP4 into a canonical MUXL fMP4
+// (ftyp+moov + canonical moof/mdat fragments). Unlike the streaming
+// [WASMEngine.SegmentEvents], it accepts a faststart (flat) MP4: canonical-form
+// derivation needs random access, so the bytes are staged through a temp file
+// mounted read-write into the sandbox rather than piped on stdin. This turns an
+// arbitrary transcoder output into MUXL that SegmentEvents/SignTranscode accept.
+func (e *WASMEngine) Canonicalize(ctx context.Context, mp4 []byte) ([]byte, error) {
+	dir, err := os.MkdirTemp("", "muxl-canon-")
+	if err != nil {
+		return nil, fmt.Errorf("muxl: temp dir: %w", err)
+	}
+	defer os.RemoveAll(dir)
+
+	if err := os.WriteFile(filepath.Join(dir, "in.mp4"), mp4, 0o600); err != nil {
+		return nil, fmt.Errorf("muxl: staging canonicalize input: %w", err)
+	}
+	fsCfg := wazero.NewFSConfig().WithDirMount(dir, "/work")
+	args := []string{"muxl-sign", "fmp4", "/work/in.mp4", "/work/out.fmp4"}
+	if err := e.runWith(ctx, args, fsCfg, false, nil, nil, nil, nil, nil, nil); err != nil {
+		return nil, err
+	}
+	out, err := os.ReadFile(filepath.Join(dir, "out.fmp4"))
+	if err != nil {
+		return nil, fmt.Errorf("muxl: reading canonicalize output: %w", err)
+	}
+	return out, nil
 }
 
 func requireOneSigner(hasKey, hasSign bool) error {

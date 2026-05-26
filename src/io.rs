@@ -60,39 +60,38 @@ pub trait ReadAt {
 
 /// [`ReadAt`] backed by a `std::fs::File`.
 ///
-/// Uses `pread` on Unix for truly stateless reads. On other platforms, falls
-/// back to `Seek + Read` with a mutex (not yet implemented — Unix-only for
-/// now).
+/// Implemented as `Seek + Read` behind a mutex, which works on every target
+/// (including `wasm32-wasip1`, where the positioned-read `FileExt` is still
+/// nightly-only). muxl never issues concurrent reads against one file, so the
+/// mutex is uncontended; the cached size avoids a metadata syscall per query.
 pub struct FileReadAt {
-    file: std::fs::File,
+    file: std::sync::Mutex<std::fs::File>,
+    size: u64,
 }
 
 impl FileReadAt {
     pub fn open(path: &std::path::Path) -> io::Result<Self> {
+        let file = std::fs::File::open(path)?;
+        let size = file.metadata()?.len();
         Ok(Self {
-            file: std::fs::File::open(path)?,
+            file: std::sync::Mutex::new(file),
+            size,
         })
     }
 }
 
 impl ReadAt for FileReadAt {
     fn size(&self) -> io::Result<u64> {
-        self.file.metadata().map(|m| m.len())
+        Ok(self.size)
     }
 
-    #[cfg(unix)]
     fn read_at(&self, offset: u64, buf: &mut [u8]) -> io::Result<usize> {
-        use std::os::unix::fs::FileExt;
-        self.file.read_at(buf, offset)
-    }
-
-    #[cfg(not(unix))]
-    fn read_at(&self, _offset: u64, _buf: &mut [u8]) -> io::Result<usize> {
-        // TODO: Seek+Read with mutex for Windows
-        Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            "ReadAt not yet implemented for non-Unix platforms",
-        ))
+        let mut file = self
+            .file
+            .lock()
+            .map_err(|_| io::Error::new(io::ErrorKind::Other, "FileReadAt mutex poisoned"))?;
+        file.seek(SeekFrom::Start(offset))?;
+        file.read(buf)
     }
 }
 

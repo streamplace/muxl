@@ -144,6 +144,39 @@ func signedM4sStream(t *testing.T, eng *muxl.WASMEngine) []byte {
 	return m4s
 }
 
+func TestCanonicalize(t *testing.T) {
+	eng := newEngine(t)
+	in := readFile(t, fixtureFmp4)
+
+	canon, err := eng.Canonicalize(context.Background(), in)
+	if err != nil {
+		t.Fatalf("Canonicalize: %v", err)
+	}
+	if len(canon) == 0 {
+		t.Fatal("Canonicalize returned no bytes")
+	}
+	if !bytes.Contains(canon[:64], []byte("ftyp")) {
+		t.Errorf("canonical output should start with an ftyp box")
+	}
+
+	// The canonical fMP4 must segment cleanly (proving it's valid fMP4).
+	events, err := collectEvents(func(events chan<- *muxl.Event) error {
+		return eng.SegmentEvents(context.Background(), bytes.NewReader(canon), events)
+	})
+	if err != nil {
+		t.Fatalf("SegmentEvents on canonicalized output: %v", err)
+	}
+	var segs int
+	for _, ev := range events {
+		if ev.Type == "segment" {
+			segs++
+		}
+	}
+	if segs == 0 {
+		t.Error("canonicalized output produced no segments")
+	}
+}
+
 func TestSegmentEventsUnsigned(t *testing.T) {
 	eng := newEngine(t)
 	frag := readFile(t, fixtureFmp4)

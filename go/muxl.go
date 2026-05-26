@@ -33,6 +33,11 @@ type Engine interface {
 	// events — one init event then one segment event per GoP — unsigned.
 	SegmentEvents(ctx context.Context, input io.Reader, events chan<- *Event) error
 
+	// Canonicalize converts a flat or fragmented MP4 into a canonical MUXL
+	// fMP4. Unlike SegmentEvents it accepts a faststart (flat) MP4 — handy for
+	// turning an arbitrary transcoder output into MUXL before segmenting/signing.
+	Canonicalize(ctx context.Context, mp4 []byte) ([]byte, error)
+
 	// UnwrapEvents re-derives the per-track event stream from a stored MUXL
 	// wrapper (bare .m4s, fMP4, or flat MP4). The per-track segment bytes —
 	// and any C2PA/S2PA signature over them — are preserved verbatim.

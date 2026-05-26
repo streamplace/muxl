@@ -16,7 +16,8 @@ use clap::{ArgGroup, Parser, Subcommand, ValueEnum};
 use muxl::cli as muxl_cli;
 
 use crate::{
-    Result, SignerKey, SigningAlg, cert, sign_segment_stream, verify_segments,
+    Result, SignerKey, SigningAlg, cert, sign_segment_stream, sign_transcode_segment,
+    verify_segments,
 };
 
 #[derive(Parser)]
@@ -37,6 +38,14 @@ enum Command {
     /// MUXL segmenter, produce one signed flat MP4 (per-track + wrapper)
     /// as a CBOR `signed-segment` event on stdout.
     SignSegment(SignSegmentArgs),
+    /// Sign a transcoded canonical MUXL segment read from stdin, declaring
+    /// the segment it was transcoded from (`--source`) as a `parentOf`
+    /// ingredient. The output's C2PA manifest (`--manifest`) should carry a
+    /// `c2pa.transcoded` action referencing the source (see
+    /// `muxl_sign::TRANSCODE_INGREDIENT_LABEL`). Writes the signed segment to
+    /// stdout. This is the provenance step a Livepeer orchestrator runs after
+    /// transcoding a signed MUXL segment.
+    SignTranscode(SignTranscodeArgs),
     /// Verify the C2PA/S2PA signatures on a signed MUXL wrapper read from
     /// stdin (bare .m4s stream, fMP4, or flat MP4). Each canonical segment
     /// is validated standalone as an `m4s` asset. Emits a JSON document
@@ -159,6 +168,41 @@ struct SignSegmentArgs {
 }
 
 #[derive(clap::Args)]
+#[command(group(
+    ArgGroup::new("transcode-signing-key")
+        .required(true)
+        .args(["key", "host_sign"])
+))]
+struct SignTranscodeArgs {
+    /// PEM-encoded signing cert chain (leaf first).
+    #[arg(long, value_name = "PATH")]
+    cert: PathBuf,
+    /// PEM-encoded private key matching `--cert`. Mutually exclusive with
+    /// `--host-sign`.
+    #[arg(long, value_name = "PATH")]
+    key: Option<PathBuf>,
+    /// Delegate signing to the wasm host via the `muxl.host_sign` import; the
+    /// private key never enters the wasm sandbox. Mutually exclusive with
+    /// `--key`.
+    #[arg(long)]
+    host_sign: bool,
+    /// Signing algorithm. Defaults to ES256K (Streamplace's default).
+    #[arg(long, value_enum, default_value_t = Alg::Es256K)]
+    alg: Alg,
+    /// The canonical MUXL `.m4s` segment that was transcoded — added to the
+    /// output's manifest as a `parentOf` ingredient.
+    #[arg(long, value_name = "PATH")]
+    source: PathBuf,
+    /// JSON C2PA manifest for the signed output; should carry a
+    /// `c2pa.transcoded` action referencing the source ingredient.
+    #[arg(long, value_name = "PATH")]
+    manifest: PathBuf,
+    /// Optional RFC 3161 timestamp authority URL.
+    #[arg(long, value_name = "URL")]
+    tsa_url: Option<String>,
+}
+
+#[derive(clap::Args)]
 struct GenKeyArgs {
     /// Path to write the PKCS#8 PEM private key. Use `-` for stdout.
     #[arg(long, value_name = "PATH")]
@@ -239,6 +283,7 @@ pub fn cli_main() {
     let cli = Cli::parse();
     let result = match cli.command {
         Command::SignSegment(args) => cmd_sign_segment(args),
+        Command::SignTranscode(args) => cmd_sign_transcode(args),
         Command::Verify => cmd_verify(),
         Command::BenchSha256(args) => cmd_bench_sha256(args),
         Command::GenKey(args) => cmd_gen_key(args),
@@ -274,6 +319,40 @@ fn cmd_sign_segment(args: SignSegmentArgs) -> Result<()> {
         &track_manifest,
         &wrapper_manifest,
     )
+}
+
+fn cmd_sign_transcode(args: SignTranscodeArgs) -> Result<()> {
+    let SignTranscodeArgs {
+        cert,
+        key,
+        host_sign,
+        alg,
+        source,
+        manifest,
+        tsa_url,
+    } = args;
+
+    let mut signer = if host_sign {
+        SignerKey::host_from_pem_file(&cert, alg.into())?
+    } else {
+        // ArgGroup guarantees one of {key, host_sign} is set.
+        let key = key.expect("clap ArgGroup guarantees --key when --host-sign is absent");
+        SignerKey::from_pem_files(&cert, &key, alg.into())?
+    };
+    if let Some(url) = tsa_url {
+        signer = signer.with_tsa_url(url);
+    }
+
+    let source_segment = fs::read(&source)?;
+    let manifest_json = fs::read_to_string(&manifest)?;
+
+    // The transcoded output to sign arrives on stdin.
+    let mut output_segment = Vec::new();
+    io::stdin().lock().read_to_end(&mut output_segment)?;
+
+    let signed = sign_transcode_segment(&output_segment, &source_segment, &signer, &manifest_json)?;
+    io::stdout().lock().write_all(&signed)?;
+    Ok(())
 }
 
 fn cmd_verify() -> Result<()> {

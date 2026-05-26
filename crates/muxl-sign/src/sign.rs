@@ -255,7 +255,7 @@ pub(crate) unsafe fn host_sha256(_: u32, _: u32, _: u32) {}
 /// ES256/ES256K/ES384/ES512 fits comfortably under this.
 const HOST_SIG_BUF_LEN: usize = 1024;
 
-fn host_sign_callback(data: &[u8], _alg: SigningAlg) -> std::result::Result<Vec<u8>, String> {
+pub(crate) fn host_sign_callback(data: &[u8], _alg: SigningAlg) -> std::result::Result<Vec<u8>, String> {
     let mut buf = vec![0u8; HOST_SIG_BUF_LEN];
     let n = unsafe {
         host_sign(

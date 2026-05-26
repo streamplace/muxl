@@ -91,11 +91,58 @@ pub fn generate_cert(
     organization: Option<&str>,
 ) -> Result<Vec<u8>> {
     let public_key = private_key.public_key();
+    let tbs = build_tbs(&public_key, did, organization)?;
+
+    // Sign the TBSCertificate with the secp256k1 private key (ECDSA-SHA256).
+    // k256's `Signer` impl hashes internally with SHA-256 and produces a
+    // fixed-length (r || s) signature; X.509 wants the ASN.1 DER form.
+    let tbs_der = tbs.to_der().map_err(cert_err)?;
+    let signing_key = SigningKey::from(private_key);
+    let signature: k256::ecdsa::Signature = signing_key.sign(&tbs_der);
+    assemble_cert(tbs, signature.to_der().as_bytes())
+}
+
+/// Generate an S2PA leaf certificate for `public_key_uncompressed` (65-byte
+/// SEC1 `0x04 || X || Y`), signing the TBSCertificate via `sign_tbs` rather
+/// than an in-process private key.
+///
+/// `sign_tbs` receives the TBSCertificate DER and must return the
+/// ECDSA-SHA256 signature as raw 64-byte `r || s` (it is re-encoded to DER
+/// here). This is the host-callback path: the private key lives outside this
+/// code — e.g. a Livepeer orchestrator's Ethereum keystore reached via
+/// `host_sign` — so the issued cert binds to that same secp256k1 identity and
+/// DID without the key ever entering the process. `did`/`organization` behave
+/// as in [`generate_cert`].
+pub fn generate_cert_with_signer<F>(
+    public_key_uncompressed: &[u8],
+    did: Option<&str>,
+    organization: Option<&str>,
+    sign_tbs: F,
+) -> Result<Vec<u8>>
+where
+    F: FnOnce(&[u8]) -> Result<Vec<u8>>,
+{
+    let public_key = k256::PublicKey::from_sec1_bytes(public_key_uncompressed)
+        .map_err(|e| cert_err_msg(format!("bad secp256k1 public key: {e}")))?;
+    let tbs = build_tbs(&public_key, did, organization)?;
+    let tbs_der = tbs.to_der().map_err(cert_err)?;
+    let signature_der = raw_rs_to_der(&sign_tbs(&tbs_der)?)?;
+    assemble_cert(tbs, &signature_der)
+}
+
+/// Build the TBSCertificate for an S2PA leaf cert over `public_key`. Shared by
+/// the in-process [`generate_cert`] and the host-signed
+/// [`generate_cert_with_signer`].
+fn build_tbs(
+    public_key: &k256::PublicKey,
+    did: Option<&str>,
+    organization: Option<&str>,
+) -> Result<TbsCertificate> {
     let did_owned: String;
     let did_str: &str = match did {
         Some(s) => s,
         None => {
-            did_owned = did_key_for(&public_key);
+            did_owned = did_key_for(public_key);
             &did_owned
         }
     };
@@ -180,8 +227,7 @@ pub fn generate_cert(
     if serial_bytes[0] == 0 {
         serial_bytes[0] = 1;
     }
-    let serial =
-        SerialNumber::new(&serial_bytes).map_err(cert_err)?;
+    let serial = SerialNumber::new(&serial_bytes).map_err(cert_err)?;
 
     // 100-year validity starting at issuance — matches Streamplace's
     // Go generator. S2PA verifiers don't enforce validity.
@@ -194,15 +240,13 @@ pub fn generate_cert(
         not_after: Time::try_from(not_after).map_err(cert_err)?,
     };
 
-    let signature_algorithm = AlgorithmIdentifier {
-        oid: OID_ECDSA_WITH_SHA256,
-        parameters: None,
-    };
-
-    let tbs = TbsCertificate {
+    Ok(TbsCertificate {
         version: Version::V3,
         serial_number: serial,
-        signature: signature_algorithm.clone(),
+        signature: AlgorithmIdentifier {
+            oid: OID_ECDSA_WITH_SHA256,
+            parameters: None,
+        },
         issuer,
         validity,
         subject,
@@ -210,25 +254,29 @@ pub fn generate_cert(
         issuer_unique_id: None,
         subject_unique_id: None,
         extensions: Some(extensions),
-    };
+    })
+}
 
-    // Sign the TBSCertificate with the secp256k1 private key
-    // (ECDSA-SHA256). k256's `Signer` impl hashes internally with SHA-256
-    // and produces a fixed-length (r || s) signature; we re-encode to the
-    // ASN.1 DER form X.509 expects.
-    let tbs_der = tbs.to_der().map_err(cert_err)?;
-    let signing_key = SigningKey::from(private_key);
-    let signature: k256::ecdsa::Signature = signing_key.sign(&tbs_der);
-    let signature_der = signature.to_der();
-    let signature_bits = BitString::from_bytes(signature_der.as_bytes())
-        .map_err(cert_err)?;
-
+/// Assemble a [`Certificate`] from a built TBS and its DER-encoded ECDSA
+/// signature; returns the DER cert bytes.
+fn assemble_cert(tbs: TbsCertificate, signature_der: &[u8]) -> Result<Vec<u8>> {
     let cert = Certificate {
         tbs_certificate: tbs,
-        signature_algorithm,
-        signature: signature_bits,
+        signature_algorithm: AlgorithmIdentifier {
+            oid: OID_ECDSA_WITH_SHA256,
+            parameters: None,
+        },
+        signature: BitString::from_bytes(signature_der).map_err(cert_err)?,
     };
     cert.to_der().map_err(cert_err)
+}
+
+/// Re-encode a raw 64-byte `r || s` (P1363) ECDSA signature as ASN.1 DER
+/// (`SEQUENCE { INTEGER r, INTEGER s }`), the form X.509 signatureValue wants.
+fn raw_rs_to_der(raw: &[u8]) -> Result<Vec<u8>> {
+    let sig = k256::ecdsa::Signature::from_slice(raw)
+        .map_err(|e| cert_err_msg(format!("expected a 64-byte r||s signature: {e}")))?;
+    Ok(sig.to_der().as_bytes().to_vec())
 }
 
 /// Wrap DER cert bytes in a single PEM `CERTIFICATE` block (RFC 7468).
@@ -435,5 +483,57 @@ mod tests {
             (45..=50).contains(&encoded_len),
             "did:key body should be ~48 chars, got {encoded_len}: {did}"
         );
+    }
+
+    // The host-signed path must produce a cert that embeds the given public
+    // key and whose signature verifies against it — i.e. the raw r||s the host
+    // returns is correctly DER-wrapped as the X.509 signatureValue. Here the
+    // "host" is a local k256 key standing in for the orchestrator's keystore.
+    #[test]
+    fn host_signed_cert_embeds_pubkey_and_verifies() {
+        use k256::ecdsa::signature::Verifier;
+
+        let key = generate_key();
+        let pubkey = key.public_key();
+        let uncompressed = pubkey.to_encoded_point(false).as_bytes().to_vec();
+        let did = format!("did:pkh:eip155:1:0x{}", hex_lower(&uncompressed[1..21]));
+
+        let signing_key = SigningKey::from(&key);
+        let der = generate_cert_with_signer(&uncompressed, Some(&did), Some("Livepeer"), |tbs_der| {
+            // Stand-in for host_sign: ECDSA-SHA256, returned as raw 64-byte r||s.
+            let sig: k256::ecdsa::Signature = signing_key.sign(tbs_der);
+            Ok(sig.to_bytes().to_vec())
+        })
+        .unwrap();
+
+        let parsed = Certificate::from_der(&der).unwrap();
+        assert_eq!(
+            parsed
+                .tbs_certificate
+                .subject_public_key_info
+                .subject_public_key
+                .raw_bytes(),
+            uncompressed.as_slice(),
+            "cert SPKI must carry the supplied uncompressed pubkey"
+        );
+        assert!(
+            parsed.tbs_certificate.subject.to_string().contains(&did),
+            "cert DN must embed the supplied did:pkh"
+        );
+
+        // The signatureValue must verify against the embedded key over the TBS.
+        let tbs_der = parsed.tbs_certificate.to_der().unwrap();
+        let sig = k256::ecdsa::Signature::from_der(parsed.signature.raw_bytes()).unwrap();
+        let vk = k256::ecdsa::VerifyingKey::from(&signing_key);
+        vk.verify(&tbs_der, &sig)
+            .expect("cert self-signature must verify against its public key");
+    }
+
+    fn hex_lower(b: &[u8]) -> String {
+        let mut s = String::with_capacity(b.len() * 2);
+        for byte in b {
+            s.push_str(&format!("{byte:02x}"));
+        }
+        s
     }
 }

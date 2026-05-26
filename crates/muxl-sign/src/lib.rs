@@ -23,7 +23,9 @@ mod verify;
 
 pub use c2pa::SigningAlg;
 pub use cbor::SignedEvent;
-pub use cert::{cert_to_pem, did_key_for, generate_cert, generate_key, key_to_pem};
+pub use cert::{
+    cert_to_pem, did_key_for, generate_cert, generate_cert_with_signer, generate_key, key_to_pem,
+};
 pub use cli::cli_main;
 pub use error::{Error, Result};
 pub use sign::{

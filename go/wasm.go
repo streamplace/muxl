@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	_ "embed"
+	"encoding/hex"
 	"fmt"
 	"io"
 	"log/slog"
@@ -210,6 +211,35 @@ func (e *WASMEngine) SignTranscode(ctx context.Context, in TranscodeInput) ([]by
 	fsCfg := wazero.NewFSConfig().WithFSMount(keysFS, "/keys")
 	var out bytes.Buffer
 	if err := e.runWith(ctx, args, fsCfg, true, bytes.NewReader(in.Output), &out, in.Sign, nil, nil, nil); err != nil {
+		return nil, err
+	}
+	return out.Bytes(), nil
+}
+
+// GenCert implements [Engine]. The pubkey is passed as a hex arg; the
+// TBSCertificate is signed via the host callback (in.Sign); the PEM cert comes
+// back on stdout. Runs against the real clock (the cert carries a notBefore).
+func (e *WASMEngine) GenCert(ctx context.Context, in CertInput) ([]byte, error) {
+	if in.Sign == nil {
+		return nil, fmt.Errorf("muxl: GenCert requires a Sign callback")
+	}
+	if len(in.PubKey) != 65 || in.PubKey[0] != 0x04 {
+		return nil, fmt.Errorf("muxl: GenCert requires a 65-byte uncompressed secp256k1 public key (0x04||X||Y), got %d bytes", len(in.PubKey))
+	}
+	args := []string{
+		"muxl-sign", "gen-cert",
+		"--pubkey", hex.EncodeToString(in.PubKey),
+		"--host-sign",
+		"--out", "-",
+	}
+	if in.DID != "" {
+		args = append(args, "--did", in.DID)
+	}
+	if in.Org != "" {
+		args = append(args, "--organization", in.Org)
+	}
+	var out bytes.Buffer
+	if err := e.runWith(ctx, args, nil, true, nil, &out, in.Sign, nil, nil, nil); err != nil {
 		return nil, err
 	}
 	return out.Bytes(), nil

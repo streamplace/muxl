@@ -57,6 +57,14 @@ type Engine interface {
 	// segment. Exactly one of in.KeyPEM or in.Sign must be set.
 	SignTranscode(ctx context.Context, in TranscodeInput) ([]byte, error)
 
+	// GenCert issues an S2PA leaf certificate for the secp256k1 identity in
+	// in.PubKey, signing the certificate via in.Sign — the private key stays
+	// with the caller. Returns a PEM cert chain for use as the CertPEM of
+	// SignerInput / TranscodeInput. This lets a Livepeer orchestrator mint a
+	// did:pkh cert bound to its on-chain key without the key leaving its
+	// keystore.
+	GenCert(ctx context.Context, in CertInput) ([]byte, error)
+
 	// Verify validates the C2PA/S2PA signatures on a signed MUXL wrapper and
 	// returns the per-segment manifest+cert+validation JSON document
 	// ({"segments":[{track_id,manifest,cert,validation_results,validation_state}]}).
@@ -113,6 +121,24 @@ type TranscodeInput struct {
 	Sign     func(data []byte) ([]byte, error)
 	Manifest []byte
 	Alg      string
+}
+
+// CertInput is the input bundle for [Engine.GenCert]: issue an S2PA leaf cert
+// for the secp256k1 identity behind PubKey, signing the certificate's
+// TBSCertificate via Sign. The private key never enters the engine.
+type CertInput struct {
+	// PubKey is the 65-byte uncompressed SEC1 public key (0x04 || X || Y).
+	PubKey []byte
+	// DID is the cert's commonName. Empty defaults to the did:key of PubKey;
+	// a Livepeer orchestrator passes did:pkh:eip155:<chainId>:<address>.
+	DID string
+	// Org is an optional organizationName attribute (some C2PA libraries
+	// expect a DN attribute beyond commonName).
+	Org string
+	// Sign signs the certificate: it receives the (unhashed) TBSCertificate
+	// DER and must return the ECDSA-SHA256 signature as raw r‖s (or the
+	// 65-byte r‖s‖v Ethereum form). Wrap a keystore with RawSignerToCallback.
+	Sign func(data []byte) ([]byte, error)
 }
 
 // TranscodeIngredientLabel is the C2PA ingredient label that

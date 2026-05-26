@@ -210,12 +210,27 @@ struct GenKeyArgs {
 }
 
 #[derive(clap::Args)]
+#[command(group(
+    ArgGroup::new("cert-key")
+        .required(true)
+        .args(["key", "pubkey"])
+))]
 struct GenCertArgs {
-    /// PKCS#8 PEM secp256k1 private key. Use `-` for stdin.
+    /// PKCS#8 PEM secp256k1 private key to self-sign with. Use `-` for stdin.
+    /// Mutually exclusive with `--pubkey`.
     #[arg(long, value_name = "PATH")]
-    key: PathBuf,
+    key: Option<PathBuf>,
+    /// Hex-encoded 65-byte uncompressed secp256k1 public key (0x04 || X || Y)
+    /// to issue the cert for, signing the TBSCertificate via `--host-sign`
+    /// rather than an in-process key. Mutually exclusive with `--key`.
+    #[arg(long, value_name = "HEX")]
+    pubkey: Option<String>,
+    /// Sign the TBSCertificate via the wasm host (`muxl.host_sign`) so the
+    /// private key never enters the sandbox. Required with `--pubkey`.
+    #[arg(long)]
+    host_sign: bool,
     /// DID for the cert's `commonName`. Defaults to the `did:key`
-    /// identifier of the key's public key.
+    /// identifier of the public key.
     #[arg(long, value_name = "DID")]
     did: Option<String>,
     /// Optional `organizationName` attribute alongside `commonName` in
@@ -468,35 +483,63 @@ fn cmd_gen_key(args: GenKeyArgs) -> Result<()> {
 }
 
 fn cmd_gen_cert(args: GenCertArgs) -> Result<()> {
-    use k256::pkcs8::DecodePrivateKey;
-    let key_pem = read_in(&args.key)?;
-    let key_str = std::str::from_utf8(&key_pem).map_err(|_| {
-        crate::Error::from(muxl::Error::Io(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "key file is not UTF-8 PEM",
-        )))
-    })?;
-    let key = k256::SecretKey::from_pkcs8_pem(key_str).map_err(|e| {
-        crate::Error::from(muxl::Error::Io(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("parsing PKCS#8 PEM key: {e}"),
-        )))
-    })?;
-    let der = cert::generate_cert(
-        &key,
-        args.did.as_deref(),
-        args.organization.as_deref(),
-    )?;
+    let der = if let Some(pubkey_hex) = args.pubkey.as_deref() {
+        // Host-signed path: issue a cert for an external secp256k1 key,
+        // signing the TBSCertificate via the wasm host (e.g. a Livepeer
+        // orchestrator's Ethereum keystore). The private key never enters
+        // this process — only its public key (for the SPKI/DID) does.
+        if !args.host_sign {
+            return Err(invalid_data("--pubkey requires --host-sign"));
+        }
+        let pubkey = decode_hex(pubkey_hex)?;
+        cert::generate_cert_with_signer(
+            &pubkey,
+            args.did.as_deref(),
+            args.organization.as_deref(),
+            |tbs_der| crate::sign::host_sign_callback(tbs_der, SigningAlg::Es256K).map_err(invalid_data),
+        )?
+    } else {
+        // In-process path: self-sign with a PEM private key.
+        use k256::pkcs8::DecodePrivateKey;
+        let key_path = args
+            .key
+            .expect("clap ArgGroup guarantees --key when --pubkey is absent");
+        let key_pem = read_in(&key_path)?;
+        let key_str = std::str::from_utf8(&key_pem)
+            .map_err(|_| invalid_data("key file is not UTF-8 PEM"))?;
+        let key = k256::SecretKey::from_pkcs8_pem(key_str)
+            .map_err(|e| invalid_data(format!("parsing PKCS#8 PEM key: {e}")))?;
+        cert::generate_cert(&key, args.did.as_deref(), args.organization.as_deref())?
+    };
+
     let pem = cert::cert_to_pem(&der);
     write_out(&args.out, pem.as_bytes())?;
     if args.out.as_os_str() != "-" {
-        let did = args
-            .did
-            .clone()
-            .unwrap_or_else(|| cert::did_key_for(&key.public_key()));
-        eprintln!("wrote {} (CN={})", args.out.display(), did);
+        eprintln!("wrote {}", args.out.display());
     }
     Ok(())
+}
+
+/// Build an InvalidData error from a message.
+fn invalid_data(msg: impl Into<String>) -> crate::Error {
+    crate::Error::from(muxl::Error::Io(io::Error::new(
+        io::ErrorKind::InvalidData,
+        msg.into(),
+    )))
+}
+
+/// Decode a hex string (optional `0x` prefix) into bytes.
+fn decode_hex(s: &str) -> Result<Vec<u8>> {
+    let s = s.strip_prefix("0x").unwrap_or(s);
+    if s.len() % 2 != 0 {
+        return Err(invalid_data("hex string has an odd length"));
+    }
+    (0..s.len())
+        .step_by(2)
+        .map(|i| {
+            u8::from_str_radix(&s[i..i + 2], 16).map_err(|e| invalid_data(format!("bad hex: {e}")))
+        })
+        .collect()
 }
 
 fn read_in(path: &PathBuf) -> Result<Vec<u8>> {

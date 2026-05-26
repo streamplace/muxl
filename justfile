@@ -174,6 +174,18 @@ build-wasm:
 # Build all WASM targets
 build-wasm-all: build-wasi build-wasm
 
+# Build the Go library's embedded wasm: compile muxl-sign to wasm32-wasip1 and
+# copy it to go/muxl.wasm — the committed artifact `github.com/streamplace/muxl/go`
+# embeds. Run this whenever the Rust changes, then commit go/muxl.wasm so Go
+# consumers need no Rust toolchain (or cargo) to build the library. Requires
+# clang on PATH (ring, pulled in transitively by c2pa-rs, needs it to assemble
+# its WASI primitives); use `just build-wasi-sign` for the containerized build
+# if you don't have clang.
+build-go-wasm:
+    CC=clang cargo build --release --target wasm32-wasip1 -p muxl-sign
+    cp target/wasm32-wasip1/release/muxl-sign.wasm go/muxl.wasm
+    @echo "Updated go/muxl.wasm — commit it."
+
 # Clean build artifacts
 clean:
     cargo clean

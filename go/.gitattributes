@@ -1,0 +1,3 @@
+# The embedded wasm is a committed build artifact (see build-go-wasm); treat it
+# as binary so git never line-ending-munges or attempts a text diff on it.
+muxl.wasm binary

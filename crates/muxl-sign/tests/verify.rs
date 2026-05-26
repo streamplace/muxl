@@ -138,6 +138,16 @@ fn verify_validates_unwrapped_segments() {
             cert.contains("BEGIN CERTIFICATE"),
             "segment {i} carries a PEM cert chain, got {cert:?}"
         );
+        let pubkey = seg["signer_pubkey"].as_str().unwrap_or("");
+        assert_eq!(
+            pubkey.len(),
+            130,
+            "segment {i} signer_pubkey is 65-byte uncompressed SEC1 hex, got {pubkey:?}"
+        );
+        assert!(
+            pubkey.starts_with("04"),
+            "segment {i} signer_pubkey is uncompressed (0x04 prefix), got {pubkey:?}"
+        );
         assert_ne!(
             seg["validation_state"].as_str(),
             Some("Invalid"),

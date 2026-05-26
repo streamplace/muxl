@@ -16,6 +16,7 @@ use std::io::Cursor;
 
 use c2pa::Reader;
 use serde_json::json;
+use x509_cert::Certificate;
 
 use crate::error::{Error, Result};
 use crate::sign::init_default_settings;
@@ -77,10 +78,37 @@ pub fn verify_segments(bytes: &[u8]) -> Result<String> {
             "track_id": seg.track_id,
             "manifest": manifest,
             "cert": cert_chain,
+            "signer_pubkey": leaf_pubkey_hex(&cert_chain),
             "validation_results": reader.validation_results(),
             "validation_state": reader.validation_state(),
         }));
     }
 
     Ok(json!({ "segments": out }).to_string())
+}
+
+/// Extract the leaf cert's public key (uncompressed SEC1, lowercase hex) from a
+/// PEM cert chain. This lets a host bind the S2PA signer to an external
+/// identity — e.g. recover a Livepeer orchestrator's Ethereum address from the
+/// secp256k1 key, confirming the signer is the orchestrator it selected.
+/// Returns `None` if the chain doesn't parse.
+fn leaf_pubkey_hex(cert_chain_pem: &str) -> Option<String> {
+    // load_pem_chain tolerates one-or-many concatenated PEM certs (and
+    // trailing whitespace), unlike the strict single-doc from_pem.
+    let chain = Certificate::load_pem_chain(cert_chain_pem.as_bytes()).ok()?;
+    let leaf = chain.first()?;
+    let bytes = leaf
+        .tbs_certificate
+        .subject_public_key_info
+        .subject_public_key
+        .raw_bytes();
+    Some(hex_lower(bytes))
+}
+
+fn hex_lower(b: &[u8]) -> String {
+    let mut s = String::with_capacity(b.len() * 2);
+    for byte in b {
+        s.push_str(&format!("{byte:02x}"));
+    }
+    s
 }

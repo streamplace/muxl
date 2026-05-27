@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"sort"
 	"sync"
 	"sync/atomic"
 	"testing/fstest"
@@ -253,7 +254,12 @@ func (e *WASMEngine) GenCert(ctx context.Context, in CertInput) ([]byte, error) 
 // derivation needs random access, so the bytes are staged through a temp file
 // mounted read-write into the sandbox rather than piped on stdin. This turns an
 // arbitrary transcoder output into MUXL that SegmentEvents/SignTranscode accept.
-func (e *WASMEngine) Canonicalize(ctx context.Context, mp4 []byte) ([]byte, error) {
+func (e *WASMEngine) Canonicalize(ctx context.Context, mp4 []byte, opts ...CanonicalizeOption) ([]byte, error) {
+	var cfg canonicalizeConfig
+	for _, opt := range opts {
+		opt(&cfg)
+	}
+
 	dir, err := os.MkdirTemp("", "muxl-canon-")
 	if err != nil {
 		return nil, fmt.Errorf("muxl: temp dir: %w", err)
@@ -265,6 +271,11 @@ func (e *WASMEngine) Canonicalize(ctx context.Context, mp4 []byte) ([]byte, erro
 	}
 	fsCfg := wazero.NewFSConfig().WithDirMount(dir, "/work")
 	args := []string{"muxl-sign", "fmp4", "/work/in.mp4", "/work/out.fmp4"}
+	// Track remaps are deterministic given the map; sort by source id so the
+	// CLI args (and any logging) are stable.
+	for _, src := range sortedU32Keys(cfg.trackRemap) {
+		args = append(args, "--remap-track", fmt.Sprintf("%d:%d", src, cfg.trackRemap[src]))
+	}
 	if err := e.runWith(ctx, args, fsCfg, false, nil, nil, nil, nil, nil, nil); err != nil {
 		return nil, err
 	}
@@ -280,4 +291,15 @@ func requireOneSigner(hasKey, hasSign bool) error {
 		return fmt.Errorf("muxl: exactly one of KeyPEM or Sign must be set")
 	}
 	return nil
+}
+
+// sortedU32Keys returns m's keys in ascending order (nil map → nil slice), so
+// derived command-line args are deterministic.
+func sortedU32Keys(m map[uint32]uint32) []uint32 {
+	keys := make([]uint32, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Slice(keys, func(i, j int) bool { return keys[i] < keys[j] })
+	return keys
 }

@@ -36,7 +36,8 @@ type Engine interface {
 	// Canonicalize converts a flat or fragmented MP4 into a canonical MUXL
 	// fMP4. Unlike SegmentEvents it accepts a faststart (flat) MP4 — handy for
 	// turning an arbitrary transcoder output into MUXL before segmenting/signing.
-	Canonicalize(ctx context.Context, mp4 []byte) ([]byte, error)
+	// Options (e.g. [WithTrackRemap]) tune the output.
+	Canonicalize(ctx context.Context, mp4 []byte, opts ...CanonicalizeOption) ([]byte, error)
 
 	// UnwrapEvents re-derives the per-track event stream from a stored MUXL
 	// wrapper (bare .m4s, fMP4, or flat MP4). The per-track segment bytes —
@@ -86,6 +87,24 @@ type Engine interface {
 	// WrapInit synthesizes only the per-stream init segment (ftyp+moov) — the
 	// HLS EXT-X-MAP target — from a MUXL wrapper's embedded catalogs.
 	WrapInit(ctx context.Context, input io.Reader, out io.Writer) error
+}
+
+// CanonicalizeOption configures [Engine.Canonicalize].
+type CanonicalizeOption func(*canonicalizeConfig)
+
+type canonicalizeConfig struct {
+	trackRemap map[uint32]uint32
+}
+
+// WithTrackRemap reassigns track IDs in the canonical output: each source
+// track id (key) is rewritten to a new id (value) in both the moov and every
+// minted moof. Use it to mint a freshly canonicalized single-track segment —
+// e.g. a transcoded audio rendition — at a chosen free id, so it can be
+// concatenated alongside the tracks it derives from in one multi-track
+// segment without a track-id collision. Source ids absent from the map are
+// left as-is.
+func WithTrackRemap(remap map[uint32]uint32) CanonicalizeOption {
+	return func(c *canonicalizeConfig) { c.trackRemap = remap }
 }
 
 // SignerInput is the signing bundle for [Engine.SignSegment]. Exactly one of

@@ -177,6 +177,68 @@ func TestCanonicalize(t *testing.T) {
 	}
 }
 
+func TestCanonicalizeWithTrackRemap(t *testing.T) {
+	eng := newEngine(t)
+	in := readFile(t, fixtureFmp4)
+
+	// Baseline catalog: the fixture has one video + one audio track.
+	audio0, video0 := canonicalTrackIDs(t, eng, in, nil)
+	if len(audio0) != 1 || len(video0) != 1 {
+		t.Fatalf("fixture should have one audio + one video track, got audio=%v video=%v", audio0, video0)
+	}
+	srcAudio := audio0[0]
+
+	// Remap the audio track to a free high id (the Streamplace transcode flow:
+	// give a freshly canonicalized rendition a free id before transcode-signing).
+	const newAudio uint32 = 99
+	audio1, video1 := canonicalTrackIDs(t, eng, in, map[uint32]uint32{srcAudio: newAudio})
+	if len(audio1) != 1 || audio1[0] != newAudio {
+		t.Errorf("audio should be remapped to %d, got %v", newAudio, audio1)
+	}
+	if len(video1) != 1 || video1[0] != video0[0] {
+		t.Errorf("video id should be unchanged: before=%v after=%v", video0, video1)
+	}
+	if video1[0] == newAudio {
+		t.Errorf("video id %d collides with the remapped audio id", video1[0])
+	}
+}
+
+// canonicalTrackIDs canonicalizes mp4 (optionally remapping track ids) and
+// returns the audio and video track ids read from the resulting init catalog.
+func canonicalTrackIDs(t *testing.T, eng *muxl.WASMEngine, mp4 []byte, remap map[uint32]uint32) (audio, video []uint32) {
+	t.Helper()
+	var opts []muxl.CanonicalizeOption
+	if remap != nil {
+		opts = append(opts, muxl.WithTrackRemap(remap))
+	}
+	canon, err := eng.Canonicalize(context.Background(), mp4, opts...)
+	if err != nil {
+		t.Fatalf("Canonicalize: %v", err)
+	}
+	events, err := collectEvents(func(events chan<- *muxl.Event) error {
+		return eng.SegmentEvents(context.Background(), bytes.NewReader(canon), events)
+	})
+	if err != nil {
+		t.Fatalf("SegmentEvents: %v", err)
+	}
+	for _, ev := range events {
+		if ev.Type != "init" || ev.Catalog == nil {
+			continue
+		}
+		if ev.Catalog.Audio != nil {
+			for _, c := range ev.Catalog.Audio.Renditions {
+				audio = append(audio, c.TrackID())
+			}
+		}
+		if ev.Catalog.Video != nil {
+			for _, c := range ev.Catalog.Video.Renditions {
+				video = append(video, c.TrackID())
+			}
+		}
+	}
+	return audio, video
+}
+
 func TestSegmentEventsUnsigned(t *testing.T) {
 	eng := newEngine(t)
 	frag := readFile(t, fixtureFmp4)

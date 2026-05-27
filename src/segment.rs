@@ -468,6 +468,53 @@ mod tests {
     }
 
     #[test]
+    fn remap_track_ids_roundtrips_through_canonicalize() {
+        // Read a multi-track fixture, remap the audio track to a fresh free
+        // id, canonicalize, and confirm the re-read catalog reflects the new
+        // id with no collision — proving the rewrite reaches both the moov
+        // and the minted moofs. This is the primitive Streamplace uses to
+        // give a transcoded rendition a free id before transcode-signing.
+        let flat = read_fixture("h264-aac.mp4");
+        let mut source = crate::read(&flat).unwrap();
+
+        let audio_tid = source.catalog.audio_configs().next().unwrap().track_id();
+        let new_tid = 99u32;
+        let map: BTreeMap<u32, u32> = [(audio_tid, new_tid)].into_iter().collect();
+        source.remap_track_ids(&map);
+
+        let mut fmp4 = Vec::new();
+        crate::fmp4::write(&source, &flat, &mut fmp4).unwrap();
+
+        let cat = crate::init::catalog_from_mp4(Cursor::new(&fmp4)).unwrap();
+        let audio_ids: Vec<u32> = cat.audio_configs().map(|a| a.track_id()).collect();
+        assert!(audio_ids.contains(&new_tid), "audio remapped to {new_tid}, got {audio_ids:?}");
+        assert!(!audio_ids.contains(&audio_tid), "old audio id {audio_tid} must be gone");
+        for v in cat.video_configs() {
+            assert_ne!(v.track_id(), new_tid, "video must not collide with remapped audio");
+        }
+
+        // The minted moofs must carry the new track id too (not just the moov).
+        use mp4_atom::{Atom, Header, Moof, ReadAtom, ReadFrom};
+        let mut cursor = Cursor::new(&fmp4);
+        let mut saw_remapped_moof = false;
+        while cursor.position() < fmp4.len() as u64 {
+            let Ok(Some(h)) = <Option<Header> as ReadFrom>::read_from(&mut cursor) else { break };
+            if h.kind == Moof::KIND {
+                let moof = Moof::read_atom(&h, &mut cursor).unwrap();
+                for traf in &moof.traf {
+                    assert_ne!(traf.tfhd.track_id, audio_tid, "no moof should keep the old audio id");
+                    if traf.tfhd.track_id == new_tid {
+                        saw_remapped_moof = true;
+                    }
+                }
+            } else {
+                cursor.set_position(cursor.position() + h.size.unwrap_or(0) as u64);
+            }
+        }
+        assert!(saw_remapped_moof, "expected at least one moof at the remapped audio id {new_tid}");
+    }
+
+    #[test]
     fn test_video_segments_start_with_keyframe() {
         let data = read_fixture("h264-opus-frag.mp4");
 

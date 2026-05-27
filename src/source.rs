@@ -45,6 +45,23 @@ impl Source {
             plan: Plan::new(vec![track]),
         })
     }
+
+    /// Remap track IDs across the catalog and the per-track sample plan in
+    /// place. Both the canonical moov (`tkhd`/`trex`) and every minted
+    /// `moof` (`tfhd`) take their track id from these, so the rewrite
+    /// propagates to all emitted bytes when the source is written via
+    /// [`crate::fmp4::write`]. Sample byte offsets are unaffected (they're
+    /// file positions, independent of track id), so the streamed sample data
+    /// is unchanged. See [`crate::catalog::Catalog::remap_track_ids`].
+    pub fn remap_track_ids(&mut self, map: &std::collections::BTreeMap<u32, u32>) {
+        self.catalog.remap_track_ids(map);
+        for plan in &mut self.plan.tracks {
+            if let Some(&new) = map.get(&plan.track_id) {
+                plan.track_id = new;
+            }
+        }
+        self.plan.tracks.sort_by_key(|t| t.track_id);
+    }
 }
 
 /// Per-track sample plans in track-id order.

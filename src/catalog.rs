@@ -160,6 +160,15 @@ impl Container {
             track_id,
         }
     }
+
+    /// Return this container with its CMAF `track_id` replaced. Legacy
+    /// containers (which carry no track id) are returned unchanged.
+    pub fn with_track_id(self, track_id: u32) -> Self {
+        match self {
+            Container::Cmaf { timescale, .. } => Container::Cmaf { timescale, track_id },
+            Container::Legacy => Container::Legacy,
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -238,6 +247,47 @@ impl Catalog {
             renditions: BTreeMap::new(),
         });
         audio.renditions.insert(name.into(), config);
+    }
+
+    /// Remap CMAF track IDs in place. Every rendition whose container
+    /// `track_id` is a key in `map` is reassigned to the mapped value, and
+    /// its rendition-map key is renamed to `video{N}` / `audio{N}` so the
+    /// `{type}{track_id}` naming invariant — relied on by
+    /// [`crate::reader::aggregate_catalog`] (which keys by rendition name)
+    /// and per-track init naming — is preserved. Renditions whose track_id
+    /// is absent from `map` are left untouched.
+    ///
+    /// Used when minting a fresh canonical segment at a chosen track id: e.g.
+    /// giving a transcoded audio rendition a free id so it can be
+    /// concatenated alongside the source tracks it was derived from in one
+    /// multi-track segment without colliding.
+    pub fn remap_track_ids(&mut self, map: &BTreeMap<u32, u32>) {
+        if let Some(video) = self.video.as_mut() {
+            let old = std::mem::take(&mut video.renditions);
+            video.renditions = old
+                .into_iter()
+                .map(|(name, mut cfg)| match map.get(&cfg.track_id()) {
+                    Some(&new) => {
+                        cfg.container = cfg.container.with_track_id(new);
+                        (format!("video{new}"), cfg)
+                    }
+                    None => (name, cfg),
+                })
+                .collect();
+        }
+        if let Some(audio) = self.audio.as_mut() {
+            let old = std::mem::take(&mut audio.renditions);
+            audio.renditions = old
+                .into_iter()
+                .map(|(name, mut cfg)| match map.get(&cfg.track_id()) {
+                    Some(&new) => {
+                        cfg.container = cfg.container.with_track_id(new);
+                        (format!("audio{new}"), cfg)
+                    }
+                    None => (name, cfg),
+                })
+                .collect();
+        }
     }
 
     /// Return a new catalog containing only the rendition whose `track_id`
@@ -466,6 +516,36 @@ mod tests {
         let bytes = to_drisl(&original).unwrap();
         let decoded = from_drisl(&bytes).unwrap();
         assert_eq!(original, decoded);
+    }
+
+    #[test]
+    fn remap_track_ids_reassigns_and_renames() {
+        let mut c = sample_catalog();
+        let map: BTreeMap<u32, u32> = [(2u32, 5u32)].into_iter().collect();
+        c.remap_track_ids(&map);
+
+        // Audio track 2 → 5: renamed audio1 → audio5, codec/timescale intact.
+        let audio = c.audio.as_ref().unwrap();
+        assert!(audio.renditions.contains_key("audio5"), "renamed to audio5");
+        assert!(!audio.renditions.contains_key("audio1"), "old name dropped");
+        let a = &audio.renditions["audio5"];
+        assert_eq!(a.track_id(), 5);
+        assert_eq!(a.timescale(), 48000, "timescale preserved");
+        assert_eq!(a.codec, "mp4a.40.2");
+
+        // Video (track 1, not in the map) untouched.
+        let video = c.video.as_ref().unwrap();
+        assert!(video.renditions.contains_key("video1"));
+        assert_eq!(video.renditions["video1"].track_id(), 1);
+    }
+
+    #[test]
+    fn remap_track_ids_ignores_unmapped() {
+        let mut c = sample_catalog();
+        let before = c.clone();
+        let map: BTreeMap<u32, u32> = [(99u32, 7u32)].into_iter().collect();
+        c.remap_track_ids(&map);
+        assert_eq!(c, before, "no rendition has track 99 → catalog unchanged");
     }
 
     #[test]

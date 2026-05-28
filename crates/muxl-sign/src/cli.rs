@@ -53,6 +53,11 @@ enum Command {
     /// on stdout — the per-track equivalent of the manifest+cert blob the
     /// host used to get from the iroh-streamplace c2pa binding.
     Verify,
+    /// Human-readable inspection of a MUXL segment file: per-track codec
+    /// info plus signing info (signer DID, validation state, actions,
+    /// ingredients) when a C2PA/S2PA manifest is attached. Colorized when
+    /// stdout is a TTY.
+    Inspect(InspectArgs),
     /// Microbenchmark: hash N×size bytes via either in-wasm sha2 or the
     /// `streamplace.host_sha256` import. Used to size the upper bound on
     /// what a host-SHA256 path could save before committing to a
@@ -201,6 +206,12 @@ impl SigningArgs {
 }
 
 #[derive(clap::Args)]
+struct InspectArgs {
+    /// MUXL segment file to inspect (bare .m4s, fMP4, or flat MP4).
+    input: PathBuf,
+}
+
+#[derive(clap::Args)]
 struct SignSegmentArgs {
     #[command(flatten)]
     signing: SigningArgs,
@@ -339,6 +350,7 @@ pub fn cli_main() {
         Command::SignSegment(args) => cmd_sign_segment(args),
         Command::SignTranscode(args) => cmd_sign_transcode(args),
         Command::Verify => cmd_verify(),
+        Command::Inspect(args) => cmd_inspect(args),
         Command::BenchSha256(args) => cmd_bench_sha256(args),
         Command::GenKey(args) => cmd_gen_key(args),
         Command::GenCert(args) => cmd_gen_cert(args),
@@ -406,6 +418,10 @@ fn cmd_sign_transcode(args: SignTranscodeArgs) -> Result<()> {
     let signed = sign_transcode_segment(&output_segment, &source_segment, &signer, &manifest_json)?;
     io::stdout().lock().write_all(&signed)?;
     Ok(())
+}
+
+fn cmd_inspect(args: InspectArgs) -> Result<()> {
+    crate::inspect::inspect_file(&args.input)
 }
 
 fn cmd_verify() -> Result<()> {

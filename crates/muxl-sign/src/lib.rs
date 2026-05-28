@@ -18,6 +18,7 @@ pub mod cbor;
 pub mod cert;
 mod cli;
 mod error;
+pub mod inspect;
 mod sign;
 mod verify;
 

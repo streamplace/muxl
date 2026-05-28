@@ -121,13 +121,24 @@ func WithTrackRemap(remap map[uint32]uint32) CanonicalizeOption {
 //
 // CertPEM is the cert chain (PEM, leaf first). TrackManifest/WrapperManifest
 // are C2PA manifest JSON bodies. Alg defaults to "es256k" when empty.
+//
+// Dynamic manifests: SignSegment is a long-lived streaming call (one wasm
+// invocation per RTMP session), so if the manifest depends on state that can
+// change mid-stream (e.g. a livestream record's published flag), the static
+// TrackManifest/WrapperManifest bytes freeze that state at connection time.
+// Set TrackManifestFn / WrapperManifestFn instead: each is invoked from the
+// wasm host once per GoP, so every segment is signed against a freshly built
+// manifest. When either Fn is set, the static field of the same name is used
+// only as a fallback if the other Fn is nil.
 type SignerInput struct {
-	CertPEM         []byte
-	KeyPEM          []byte
-	Sign            func(data []byte) ([]byte, error)
-	TrackManifest   []byte
-	WrapperManifest []byte
-	Alg             string
+	CertPEM           []byte
+	KeyPEM            []byte
+	Sign              func(data []byte) ([]byte, error)
+	TrackManifest     []byte
+	TrackManifestFn   func() ([]byte, error)
+	WrapperManifest   []byte
+	WrapperManifestFn func() ([]byte, error)
+	Alg               string
 }
 
 // TranscodeInput is the signing bundle for [Engine.SignTranscode]. Exactly one

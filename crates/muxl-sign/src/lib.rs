@@ -29,6 +29,7 @@ pub use cert::{
 pub use cli::cli_main;
 pub use error::{Error, Result};
 pub use sign::{
-    SignerKey, TRANSCODE_INGREDIENT_LABEL, sign_segment_stream, sign_transcode_segment,
+    SignerKey, TRANSCODE_INGREDIENT_LABEL, sign_segment_stream, sign_segment_stream_host,
+    sign_transcode_segment,
 };
 pub use verify::verify_segments;

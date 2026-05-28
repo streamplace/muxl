@@ -240,6 +240,19 @@ unsafe extern "C" {
     /// crate-level sha2 patch. Always available host-side (PEM-mode
     /// invocations may still call into it).
     pub(crate) fn host_sha256(data_ptr: u32, data_len: u32, out_ptr: u32);
+    /// Fetch a fresh C2PA manifest JSON from the host. `kind` is 0 for the
+    /// per-track segment manifest, 1 for the wrapper manifest. The host
+    /// writes the manifest bytes (UTF-8 JSON, NOT null-terminated) into
+    /// `[out_ptr, out_max)` and returns the byte length. If the manifest
+    /// doesn't fit, the host returns the required length WITHOUT writing —
+    /// the caller resizes and retries (the host re-fetches on retry, so
+    /// the second call sees a fresh manifest as well, which is fine for
+    /// our "always latest" semantics). Returns `u32::MAX` on any error.
+    ///
+    /// Called once per GoP by [`sign_segment_stream_host`] so a long-lived
+    /// streaming signer reflects mid-stream manifest updates (e.g. a
+    /// livestream-record transition from pre-live to live).
+    fn host_get_manifest(kind: u32, out_ptr: u32, out_max: u32) -> u32;
 }
 
 #[cfg(not(target_family = "wasm"))]
@@ -249,6 +262,11 @@ unsafe fn host_sign(_: u32, _: u32, _: u32, _: u32) -> u32 {
 
 #[cfg(not(target_family = "wasm"))]
 pub(crate) unsafe fn host_sha256(_: u32, _: u32, _: u32) {}
+
+#[cfg(not(target_family = "wasm"))]
+unsafe fn host_get_manifest(_: u32, _: u32, _: u32) -> u32 {
+    u32::MAX
+}
 
 /// Pre-allocated buffer for the host's signature. Sized for the largest
 /// algorithm we expect (PS512 over RSA-4096 ≈ 512 bytes); ECDSA r||s for
@@ -276,6 +294,49 @@ pub(crate) fn host_sign_callback(data: &[u8], _alg: SigningAlg) -> std::result::
     Ok(buf)
 }
 
+/// Initial buffer the host fills with a manifest JSON. Streamplace's manifests
+/// run a few KB; 64 KiB leaves headroom for metadata-rich variants without
+/// needing the host to round-trip a size probe in the common case.
+const HOST_MANIFEST_INITIAL_LEN: usize = 64 * 1024;
+
+/// Hard ceiling on a single manifest. Anything past this is treated as a host
+/// bug rather than a real manifest — we'd rather error out than allocate
+/// unbounded memory inside the wasm sandbox.
+const HOST_MANIFEST_MAX_LEN: usize = 16 * 1024 * 1024;
+
+/// Fetch the current manifest for `kind` (0 = track, 1 = wrapper) from the
+/// host. The two-call resize protocol lets us pre-allocate a small buffer for
+/// the common (small-manifest) case and grow once if a manifest happens to be
+/// larger — see the [`host_get_manifest`] doc for the wire contract.
+pub(crate) fn host_get_manifest_callback(kind: u32) -> std::result::Result<String, String> {
+    let mut buf = vec![0u8; HOST_MANIFEST_INITIAL_LEN];
+    let n = unsafe { host_get_manifest(kind, buf.as_mut_ptr() as u32, buf.len() as u32) };
+    if n == u32::MAX {
+        return Err(format!("host_get_manifest({kind}) rejected the request"));
+    }
+    let n = n as usize;
+    if n > buf.len() {
+        if n > HOST_MANIFEST_MAX_LEN {
+            return Err(format!("host_get_manifest({kind}) returned implausible length {n}"));
+        }
+        buf.resize(n, 0);
+        let n2 = unsafe { host_get_manifest(kind, buf.as_mut_ptr() as u32, buf.len() as u32) };
+        if n2 == u32::MAX {
+            return Err(format!("host_get_manifest({kind}) rejected the retry"));
+        }
+        let n2 = n2 as usize;
+        if n2 > buf.len() {
+            return Err(format!(
+                "host_get_manifest({kind}) grew between calls: probe={n} retry={n2}"
+            ));
+        }
+        buf.truncate(n2);
+    } else {
+        buf.truncate(n);
+    }
+    String::from_utf8(buf).map_err(|e| format!("host_get_manifest({kind}) returned non-UTF-8: {e}"))
+}
+
 /// Stream-sign an fMP4 source: consume `input` (an fMP4 byte stream from
 /// e.g. `muxl segment`'s emitter) and emit one CBOR-framed
 /// `signed-segment` event per GoP on `output`.
@@ -292,15 +353,56 @@ pub fn sign_segment_stream<R: Read, W: Write>(
     segment_manifest: &str,
     wrapper_manifest: &str,
 ) -> Result<()> {
-    init_default_settings();
-    let c2pa_signer = signer.build()?;
-    // Parse the base segment manifest once. Each GoP is signed with a clone
-    // that carries this segment's signing time in cawg.metadata/`dc:date`
-    // (see stamp_segment_manifest), so every canonical .m4s holds its own
-    // provenance date — the value Streamplace reads back as the segment's
-    // StartTime.
+    // Static path: pre-parse the manifest once and reuse the same base for every
+    // GoP. Each per-segment clone still gets its own signing-time stamp.
     let segment_base: serde_json::Value = serde_json::from_str(segment_manifest)
         .map_err(|e| Error::C2pa(c2pa::Error::BadParam(format!("segment manifest JSON: {e}"))))?;
+    let mut fetch_track = move || -> Result<serde_json::Value> { Ok(segment_base.clone()) };
+    let wrapper = wrapper_manifest.to_owned();
+    let mut fetch_wrapper = move || -> Result<String> { Ok(wrapper.clone()) };
+    sign_segment_stream_with(input, output, signer, &mut fetch_track, &mut fetch_wrapper)
+}
+
+/// Stream-sign an fMP4 source like [`sign_segment_stream`], but fetch a fresh
+/// manifest from the wasm host once per GoP via the `muxl.host_get_manifest`
+/// import. Use this when the manifest may change over the life of the stream
+/// (e.g. a livestream record transitioning from pre-live to live mid-RTMP).
+///
+/// Only callable from wasm — native builds have a stub `host_get_manifest`
+/// that always fails, so the first segment errors out.
+pub fn sign_segment_stream_host<R: Read, W: Write>(
+    input: &mut R,
+    output: &mut W,
+    signer: &SignerKey,
+) -> Result<()> {
+    let mut fetch_track = || -> Result<serde_json::Value> {
+        let json = host_get_manifest_callback(0).map_err(|e| {
+            Error::C2pa(c2pa::Error::BadParam(format!("host track manifest: {e}")))
+        })?;
+        serde_json::from_str(&json).map_err(|e| {
+            Error::C2pa(c2pa::Error::BadParam(format!("host track manifest JSON: {e}")))
+        })
+    };
+    let mut fetch_wrapper = || -> Result<String> {
+        host_get_manifest_callback(1).map_err(|e| {
+            Error::C2pa(c2pa::Error::BadParam(format!("host wrapper manifest: {e}")))
+        })
+    };
+    sign_segment_stream_with(input, output, signer, &mut fetch_track, &mut fetch_wrapper)
+}
+
+/// Shared streaming-sign loop. `next_track` and `next_wrapper` are invoked
+/// per GoP (and the wrapper is currently unused inside `handle_event`, kept
+/// for symmetric provenance and forward compatibility).
+fn sign_segment_stream_with<R: Read, W: Write>(
+    input: &mut R,
+    output: &mut W,
+    signer: &SignerKey,
+    next_track: &mut dyn FnMut() -> Result<serde_json::Value>,
+    next_wrapper: &mut dyn FnMut() -> Result<String>,
+) -> Result<()> {
+    init_default_settings();
+    let c2pa_signer = signer.build()?;
     let mut segmenter = Segmenter::new();
     let mut init_seen = false;
     let mut buf = [0u8; 64 * 1024];
@@ -315,8 +417,8 @@ pub fn sign_segment_stream<R: Read, W: Write>(
                 event,
                 &mut init_seen,
                 signer,
-                &segment_base,
-                wrapper_manifest,
+                next_track,
+                next_wrapper,
                 output,
                 &*c2pa_signer,
             )?;
@@ -327,8 +429,8 @@ pub fn sign_segment_stream<R: Read, W: Write>(
             event,
             &mut init_seen,
             signer,
-            &segment_base,
-            wrapper_manifest,
+            next_track,
+            next_wrapper,
             output,
             &*c2pa_signer,
         )?;
@@ -416,8 +518,8 @@ fn handle_event<W: Write>(
     event: SegmenterEvent,
     init_seen: &mut bool,
     _signer: &SignerKey,
-    segment_base: &serde_json::Value,
-    _wrapper_manifest: &str,
+    next_track: &mut dyn FnMut() -> Result<serde_json::Value>,
+    _next_wrapper: &mut dyn FnMut() -> Result<String>,
     output: &mut W,
     c2pa_signer: &dyn C2paSigner,
 ) -> Result<()> {
@@ -456,13 +558,17 @@ fn handle_event<W: Write>(
                     "segment received before init segment".into(),
                 )));
             }
-            // Stamp this segment's signing time into cawg.metadata/`dc:date`
-            // so the canonical .m4s carries its own provenance date (read back
-            // as the segment StartTime), then sign each canonical segment (per
-            // track) as a bare .m4s asset. Signing replaces the gop's per-track
-            // buffers with the signed bytes and shifts per-sample offsets past
-            // the leading c2pa-uuid prefix.
-            let segment_manifest = stamp_segment_manifest(segment_base, &now_rfc3339_utc());
+            // Fetch the current segment manifest (static caller returns a clone
+            // of the parsed base; host caller round-trips through the wasm host
+            // for an always-fresh manifest), then stamp this segment's signing
+            // time into cawg.metadata/`dc:date` so the canonical .m4s carries
+            // its own provenance date (read back as the segment StartTime), then
+            // sign each canonical segment (per track) as a bare .m4s asset.
+            // Signing replaces the gop's per-track buffers with the signed
+            // bytes and shifts per-sample offsets past the leading c2pa-uuid
+            // prefix.
+            let segment_base = next_track()?;
+            let segment_manifest = stamp_segment_manifest(&segment_base, &now_rfc3339_utc());
             let prefix_size = sign_gop_canonical_segments_in_place(
                 &mut gop,
                 &segment_manifest,

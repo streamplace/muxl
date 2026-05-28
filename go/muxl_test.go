@@ -398,6 +398,133 @@ func TestSignTranscode(t *testing.T) {
 	}
 }
 
+// TestSignSegmentDynamicManifest proves the per-segment manifest host
+// callback fires for every GoP and that what it returns lands in that GoP's
+// signed manifest — the property Streamplace relies on to flip pre-live to
+// live mid-stream without restarting the wasm signer.
+func TestSignSegmentDynamicManifest(t *testing.T) {
+	eng := newEngine(t)
+	frag := readFile(t, fixtureFmp4)
+
+	// The first GoP gets an "unpublished" manifest (only c2pa.created); from
+	// the second GoP onward we flip to "live" and add c2pa.published. Both
+	// situations need to be reflected in the signed output for the actual fix
+	// to work in Streamplace's pre-live → live path.
+	unpublished := []byte(`{
+		"title": "muxl-go test",
+		"assertions": [{"label": "c2pa.actions", "data": {"actions": [
+			{"action": "c2pa.created"}
+		]}}]
+	}`)
+	published := []byte(`{
+		"title": "muxl-go test live",
+		"assertions": [{"label": "c2pa.actions", "data": {"actions": [
+			{"action": "c2pa.created"},
+			{"action": "c2pa.published"}
+		]}}]
+	}`)
+
+	var trackCalls, wrapperCalls int
+	fetcher := func(seg int) func() ([]byte, error) {
+		return func() ([]byte, error) {
+			if seg == 0 {
+				return unpublished, nil
+			}
+			return published, nil
+		}
+	}
+	trackSeg, wrapperSeg := 0, 0
+
+	in := signerInput(t)
+	in.TrackManifest = nil
+	in.WrapperManifest = nil
+	in.TrackManifestFn = func() ([]byte, error) {
+		bs, err := fetcher(trackSeg)()
+		trackCalls++
+		trackSeg++
+		return bs, err
+	}
+	in.WrapperManifestFn = func() ([]byte, error) {
+		bs, err := fetcher(wrapperSeg)()
+		wrapperCalls++
+		wrapperSeg++
+		return bs, err
+	}
+
+	events, err := collectEvents(func(events chan<- *muxl.Event) error {
+		return eng.SignSegment(context.Background(), bytes.NewReader(frag), in, nil, nil, events)
+	})
+	if err != nil {
+		t.Fatalf("SignSegment: %v", err)
+	}
+
+	// Group track bytes per signed-segment event so we can verify each one
+	// independently and check what manifest it carries.
+	type gop struct {
+		tracks [][]byte
+	}
+	var gops []gop
+	for _, ev := range events {
+		if ev.Type != "signed-segment" {
+			continue
+		}
+		tids := make([]string, 0, len(ev.Tracks))
+		for tid := range ev.Tracks {
+			tids = append(tids, tid)
+		}
+		sort.Strings(tids)
+		var g gop
+		for _, tid := range tids {
+			g.tracks = append(g.tracks, ev.Tracks[tid])
+		}
+		gops = append(gops, g)
+	}
+	if len(gops) < 2 {
+		t.Fatalf("need >= 2 signed GoPs to test the per-segment flip, got %d", len(gops))
+	}
+
+	// The track fetcher must have fired once per GoP (one per segment, not per
+	// track — the manifest is shared across all tracks in a GoP).
+	if trackCalls != len(gops) {
+		t.Errorf("TrackManifestFn invocations: want %d (one per GoP), got %d", len(gops), trackCalls)
+	}
+	// WrapperManifestFn is wired through (the host import accepts kind=1 and
+	// the SignerInput exposes the field for symmetry) but the wasm signer
+	// doesn't yet embed a wrapper-level c2pa claim, so the wasm path never
+	// asks the host for kind=1. Just confirm the field doesn't crash when set.
+	_ = wrapperCalls
+
+	// The signed bytes for each GoP must verify, and the action set must match
+	// whatever the fetcher returned for THAT GoP.
+	for i, g := range gops {
+		var bare []byte
+		for _, tr := range g.tracks {
+			bare = append(bare, tr...)
+		}
+		out, err := eng.Verify(context.Background(), bytes.NewReader(bare))
+		if err != nil {
+			t.Fatalf("Verify GoP %d: %v", i, err)
+		}
+		var doc verifyDoc
+		if err := json.Unmarshal([]byte(out), &doc); err != nil {
+			t.Fatalf("verify GoP %d output is not JSON: %v\n%s", i, err, out)
+		}
+		if len(doc.Segments) == 0 {
+			t.Fatalf("GoP %d produced no verified segments\n%s", i, out)
+		}
+		wantPublished := i > 0
+		for j, seg := range doc.Segments {
+			if seg.ValidationState == "Invalid" {
+				t.Errorf("GoP %d segment %d did not validate: %s", i, j, out)
+			}
+			if hasAction(seg.Manifest, "c2pa.published") != wantPublished {
+				t.Errorf("GoP %d segment %d: published=%t expected %t — per-segment manifest did not change",
+					i, j, hasAction(seg.Manifest, "c2pa.published"), wantPublished)
+			}
+		}
+	}
+}
+
 func TestSignerAdapters(t *testing.T) {
 	// SignerToCallback: a stdlib ECDSA P-256 signer returns DER; the adapter
 	// must convert to a fixed 64-byte r‖s.

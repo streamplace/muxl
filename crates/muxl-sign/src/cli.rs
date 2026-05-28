@@ -16,8 +16,8 @@ use clap::{ArgGroup, Parser, Subcommand, ValueEnum};
 use muxl::cli as muxl_cli;
 
 use crate::{
-    Result, SignerKey, SigningAlg, cert, sign_segment_stream, sign_transcode_segment,
-    verify_segments,
+    Result, SignerKey, SigningAlg, cert, sign_segment_stream, sign_segment_stream_host,
+    sign_transcode_segment, verify_segments,
 };
 
 #[derive(Parser)]
@@ -103,6 +103,15 @@ enum Command {
         .required(true)
         .args(["key", "host_sign"])
 ))]
+#[command(group(
+    // Manifests come from either static paths (CLI/file path) or per-segment
+    // host fetches. `--host-manifest` excludes the static paths; without it the
+    // two PATH args are required.
+    ArgGroup::new("manifest-source")
+        .required(true)
+        .multiple(true)
+        .args(["track_manifest", "host_manifest"])
+))]
 struct SigningArgs {
     /// PEM-encoded signing cert chain (leaf first).
     #[arg(long, value_name = "PATH")]
@@ -121,19 +130,38 @@ struct SigningArgs {
     /// Signing algorithm. Defaults to ES256K (Streamplace's default).
     #[arg(long, value_enum, default_value_t = Alg::Es256K)]
     alg: Alg,
-    /// JSON manifest applied to each per-track signed asset.
-    #[arg(long, value_name = "PATH")]
-    track_manifest: PathBuf,
-    /// JSON manifest applied to the multi-track wrapper.
-    #[arg(long, value_name = "PATH")]
-    wrapper_manifest: PathBuf,
+    /// JSON manifest applied to each per-track signed asset. Required unless
+    /// `--host-manifest` is set.
+    #[arg(long, value_name = "PATH", conflicts_with = "host_manifest")]
+    track_manifest: Option<PathBuf>,
+    /// JSON manifest applied to the multi-track wrapper. Required unless
+    /// `--host-manifest` is set.
+    #[arg(long, value_name = "PATH", requires = "track_manifest")]
+    wrapper_manifest: Option<PathBuf>,
+    /// Fetch a fresh track + wrapper manifest from the wasm host (via the
+    /// `muxl.host_get_manifest` import) before signing each GoP, instead of
+    /// reading them from disk. Lets a long-lived streaming signer reflect
+    /// mid-stream manifest updates — e.g. Streamplace's livestream record
+    /// transitioning from pre-live to live. Only useful inside a wasm runtime
+    /// that wires the import up; native runs error on the first segment.
+    /// Mutually exclusive with `--track-manifest`/`--wrapper-manifest`.
+    #[arg(long)]
+    host_manifest: bool,
     /// Optional RFC 3161 timestamp authority URL.
     #[arg(long, value_name = "URL")]
     tsa_url: Option<String>,
 }
 
+/// What [`cmd_sign_segment`] gets from a parsed [`SigningArgs`]: a signer plus
+/// the manifest source — either static strings or a directive to fetch from
+/// the wasm host once per GoP.
+enum ManifestSource {
+    Static { track: String, wrapper: String },
+    Host,
+}
+
 impl SigningArgs {
-    fn into_signer_and_manifests(self) -> Result<(SignerKey, String, String)> {
+    fn into_signer_and_manifests(self) -> Result<(SignerKey, ManifestSource)> {
         let SigningArgs {
             cert,
             key,
@@ -141,6 +169,7 @@ impl SigningArgs {
             alg,
             track_manifest,
             wrapper_manifest,
+            host_manifest,
             tsa_url,
         } = self;
         let mut signer = if host_sign {
@@ -153,11 +182,21 @@ impl SigningArgs {
         if let Some(url) = tsa_url {
             signer = signer.with_tsa_url(url);
         }
-        Ok((
-            signer,
-            fs::read_to_string(&track_manifest)?,
-            fs::read_to_string(&wrapper_manifest)?,
-        ))
+        let manifests = if host_manifest {
+            ManifestSource::Host
+        } else {
+            // ArgGroup guarantees --track-manifest is set when --host-manifest is not;
+            // `requires` chains --wrapper-manifest to --track-manifest.
+            let track = track_manifest
+                .expect("clap ArgGroup guarantees --track-manifest when --host-manifest is absent");
+            let wrapper = wrapper_manifest
+                .expect("clap `requires` guarantees --wrapper-manifest with --track-manifest");
+            ManifestSource::Static {
+                track: fs::read_to_string(&track)?,
+                wrapper: fs::read_to_string(&wrapper)?,
+            }
+        };
+        Ok((signer, manifests))
     }
 }
 
@@ -324,16 +363,15 @@ pub fn cli_main() {
 }
 
 fn cmd_sign_segment(args: SignSegmentArgs) -> Result<()> {
-    let (signer, track_manifest, wrapper_manifest) = args.signing.into_signer_and_manifests()?;
+    let (signer, manifests) = args.signing.into_signer_and_manifests()?;
     let mut stdin = io::stdin().lock();
     let mut stdout = io::stdout().lock();
-    sign_segment_stream(
-        &mut stdin,
-        &mut stdout,
-        &signer,
-        &track_manifest,
-        &wrapper_manifest,
-    )
+    match manifests {
+        ManifestSource::Static { track, wrapper } => {
+            sign_segment_stream(&mut stdin, &mut stdout, &signer, &track, &wrapper)
+        }
+        ManifestSource::Host => sign_segment_stream_host(&mut stdin, &mut stdout, &signer),
+    }
 }
 
 fn cmd_sign_transcode(args: SignTranscodeArgs) -> Result<()> {

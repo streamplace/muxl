@@ -41,13 +41,14 @@ const (
 // with [NewWASM] and reuse it for the life of the process — module compilation
 // happens once; each call instantiates a fresh, isolated module.
 type WASMEngine struct {
-	runtime    wazero.Runtime
-	compiled   wazero.CompiledModule
-	counter    atomic.Uint64
-	signers    sync.Map // instance name -> func([]byte) ([]byte, error)
-	logger     *slog.Logger
-	memInitial uint64
-	memMax     uint64
+	runtime          wazero.Runtime
+	compiled         wazero.CompiledModule
+	counter          atomic.Uint64
+	signers          sync.Map // instance name -> func([]byte) ([]byte, error)
+	manifestFetchers sync.Map // instance name -> func(kind uint32) ([]byte, error)
+	logger           *slog.Logger
+	memInitial       uint64
+	memMax           uint64
 }
 
 var _ Engine = (*WASMEngine)(nil)
@@ -91,6 +92,7 @@ func NewWASM(ctx context.Context, opts ...Option) (*WASMEngine, error) {
 	if _, err := e.runtime.NewHostModuleBuilder("muxl").
 		NewFunctionBuilder().WithFunc(e.hostSign).Export("host_sign").
 		NewFunctionBuilder().WithFunc(e.hostSha256).Export("host_sha256").
+		NewFunctionBuilder().WithFunc(e.hostGetManifest).Export("host_get_manifest").
 		Instantiate(ctx); err != nil {
 		_ = e.runtime.Close(ctx)
 		return nil, fmt.Errorf("muxl: registering host module: %w", err)
@@ -112,17 +114,17 @@ func (e *WASMEngine) Close(ctx context.Context) error {
 
 // SegmentEvents implements [Engine].
 func (e *WASMEngine) SegmentEvents(ctx context.Context, input io.Reader, events chan<- *Event) error {
-	return e.runWith(ctx, []string{"muxl-sign", "segment", "-", "--stdout"}, nil, false, input, nil, nil, nil, nil, events)
+	return e.runWith(ctx, []string{"muxl-sign", "segment", "-", "--stdout"}, nil, false, input, nil, nil, nil, nil, nil, events)
 }
 
 // UnwrapEvents implements [Engine].
 func (e *WASMEngine) UnwrapEvents(ctx context.Context, input io.Reader, events chan<- *Event) error {
-	return e.runWith(ctx, []string{"muxl-sign", "unwrap", "--events", "-"}, nil, false, input, nil, nil, nil, nil, events)
+	return e.runWith(ctx, []string{"muxl-sign", "unwrap", "--events", "-"}, nil, false, input, nil, nil, nil, nil, nil, events)
 }
 
 // ConcatEvents implements [Engine].
 func (e *WASMEngine) ConcatEvents(ctx context.Context, input io.Reader, init, seg chan<- []byte, events chan<- *Event) error {
-	return e.runWith(ctx, []string{"muxl-sign", "concat"}, nil, false, input, nil, nil, init, seg, events)
+	return e.runWith(ctx, []string{"muxl-sign", "concat"}, nil, false, input, nil, nil, nil, init, seg, events)
 }
 
 // Verify implements [Engine].
@@ -130,7 +132,7 @@ func (e *WASMEngine) Verify(ctx context.Context, input io.Reader) (string, error
 	var out bytes.Buffer
 	// Verification runs against the real clock so cert-validity-window checks
 	// observe wall time.
-	if err := e.runWith(ctx, []string{"muxl-sign", "verify"}, nil, true, input, &out, nil, nil, nil, nil); err != nil {
+	if err := e.runWith(ctx, []string{"muxl-sign", "verify"}, nil, true, input, &out, nil, nil, nil, nil, nil); err != nil {
 		return "", err
 	}
 	return out.String(), nil
@@ -141,17 +143,24 @@ func (e *WASMEngine) Wrap(ctx context.Context, input io.Reader, format string, o
 	if format == "" {
 		format = "fmp4"
 	}
-	return e.runWith(ctx, []string{"muxl-sign", "wrap", "-", "-", "--format", format}, nil, false, input, out, nil, nil, nil, nil)
+	return e.runWith(ctx, []string{"muxl-sign", "wrap", "-", "-", "--format", format}, nil, false, input, out, nil, nil, nil, nil, nil)
 }
 
 // WrapInit implements [Engine].
 func (e *WASMEngine) WrapInit(ctx context.Context, input io.Reader, out io.Writer) error {
-	return e.runWith(ctx, []string{"muxl-sign", "wrap", "-", "-", "--format", "fmp4", "--init-only"}, nil, false, input, out, nil, nil, nil, nil)
+	return e.runWith(ctx, []string{"muxl-sign", "wrap", "-", "-", "--format", "fmp4", "--init-only"}, nil, false, input, out, nil, nil, nil, nil, nil)
 }
 
 // SignSegment implements [Engine]. Signing needs the real wall clock (c2pa-rs
 // checks cert validity and draws COSE nonces from real randomness), so it runs
 // with realClock=true and is not byte-stable across runs.
+//
+// Manifest source: static (TrackManifest/WrapperManifest, mounted at /keys)
+// when neither callback is set; host-fetched per GoP (via the
+// muxl.host_get_manifest import) when either of TrackManifestFn/WrapperManifestFn
+// is set. The dynamic path is what lets a long-running streamer pick up
+// mid-stream manifest changes (e.g. a livestream record going from pre-live
+// to live) without restarting the wasm call.
 func (e *WASMEngine) SignSegment(ctx context.Context, input io.Reader, in SignerInput, init, seg chan<- []byte, events chan<- *Event) error {
 	if err := requireOneSigner(len(in.KeyPEM) > 0, in.Sign != nil); err != nil {
 		return err
@@ -160,17 +169,24 @@ func (e *WASMEngine) SignSegment(ctx context.Context, input io.Reader, in Signer
 	if alg == "" {
 		alg = "es256k"
 	}
+	dynamicManifest := in.TrackManifestFn != nil || in.WrapperManifestFn != nil
 	keysFS := fstest.MapFS{
-		"cert.pem":     {Data: in.CertPEM},
-		"track.json":   {Data: in.TrackManifest},
-		"wrapper.json": {Data: in.WrapperManifest},
+		"cert.pem": {Data: in.CertPEM},
 	}
 	args := []string{
 		"muxl-sign", "sign-segment",
 		"--cert", "/keys/cert.pem",
 		"--alg", alg,
-		"--track-manifest", "/keys/track.json",
-		"--wrapper-manifest", "/keys/wrapper.json",
+	}
+	if dynamicManifest {
+		args = append(args, "--host-manifest")
+	} else {
+		keysFS["track.json"] = &fstest.MapFile{Data: in.TrackManifest}
+		keysFS["wrapper.json"] = &fstest.MapFile{Data: in.WrapperManifest}
+		args = append(args,
+			"--track-manifest", "/keys/track.json",
+			"--wrapper-manifest", "/keys/wrapper.json",
+		)
 	}
 	if len(in.KeyPEM) > 0 {
 		keysFS["key.pem"] = &fstest.MapFile{Data: in.KeyPEM}
@@ -179,7 +195,36 @@ func (e *WASMEngine) SignSegment(ctx context.Context, input io.Reader, in Signer
 		args = append(args, "--host-sign")
 	}
 	fsCfg := wazero.NewFSConfig().WithFSMount(keysFS, "/keys")
-	return e.runWith(ctx, args, fsCfg, true, input, nil, in.Sign, init, seg, events)
+	manifestFn := manifestFetcher(in)
+	return e.runWith(ctx, args, fsCfg, true, input, nil, in.Sign, manifestFn, init, seg, events)
+}
+
+// manifestFetcher returns the per-instance fetcher we register for the
+// muxl.host_get_manifest import. nil means "no dynamic manifests for this
+// call" — the static keys-FS mount is used instead. A missing callback for one
+// kind silently falls back to the matching static field, so callers can supply
+// just TrackManifestFn (the common case in Streamplace) without rewriting the
+// wrapper too.
+func manifestFetcher(in SignerInput) func(kind uint32) ([]byte, error) {
+	if in.TrackManifestFn == nil && in.WrapperManifestFn == nil {
+		return nil
+	}
+	return func(kind uint32) ([]byte, error) {
+		switch kind {
+		case 0:
+			if in.TrackManifestFn != nil {
+				return in.TrackManifestFn()
+			}
+			return in.TrackManifest, nil
+		case 1:
+			if in.WrapperManifestFn != nil {
+				return in.WrapperManifestFn()
+			}
+			return in.WrapperManifest, nil
+		default:
+			return nil, fmt.Errorf("muxl: unknown manifest kind %d", kind)
+		}
+	}
 }
 
 // SignTranscode implements [Engine]. The output to sign is piped via stdin;
@@ -213,7 +258,7 @@ func (e *WASMEngine) SignTranscode(ctx context.Context, in TranscodeInput) ([]by
 	}
 	fsCfg := wazero.NewFSConfig().WithFSMount(keysFS, "/keys")
 	var out bytes.Buffer
-	if err := e.runWith(ctx, args, fsCfg, true, bytes.NewReader(in.Output), &out, in.Sign, nil, nil, nil); err != nil {
+	if err := e.runWith(ctx, args, fsCfg, true, bytes.NewReader(in.Output), &out, in.Sign, nil, nil, nil, nil); err != nil {
 		return nil, err
 	}
 	return out.Bytes(), nil
@@ -242,7 +287,7 @@ func (e *WASMEngine) GenCert(ctx context.Context, in CertInput) ([]byte, error) 
 		args = append(args, "--organization", in.Org)
 	}
 	var out bytes.Buffer
-	if err := e.runWith(ctx, args, nil, true, nil, &out, in.Sign, nil, nil, nil); err != nil {
+	if err := e.runWith(ctx, args, nil, true, nil, &out, in.Sign, nil, nil, nil, nil); err != nil {
 		return nil, err
 	}
 	return out.Bytes(), nil
@@ -276,7 +321,7 @@ func (e *WASMEngine) Canonicalize(ctx context.Context, mp4 []byte, opts ...Canon
 	for _, src := range sortedU32Keys(cfg.trackRemap) {
 		args = append(args, "--remap-track", fmt.Sprintf("%d:%d", src, cfg.trackRemap[src]))
 	}
-	if err := e.runWith(ctx, args, fsCfg, false, nil, nil, nil, nil, nil, nil); err != nil {
+	if err := e.runWith(ctx, args, fsCfg, false, nil, nil, nil, nil, nil, nil, nil); err != nil {
 		return nil, err
 	}
 	out, err := os.ReadFile(filepath.Join(dir, "out.fmp4"))

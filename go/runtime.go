@@ -22,6 +22,12 @@ import (
 // failure — anything other than a real signature length.
 const hostSignErr = ^uint32(0)
 
+// hostGetManifestErr is the sentinel u32 the wasm's host_get_manifest import
+// returns on failure. Same value as hostSignErr (the wasm uses u32::MAX in
+// both cases); kept separate for code clarity since the two callbacks return
+// different shapes (size vs. signature length).
+const hostGetManifestErr = ^uint32(0)
+
 // hostSha256 backs the wasm's muxl.host_sha256 import: read input from wasm
 // memory, hash with native (hardware-accelerated) SHA-256, write the digest
 // back. Available to every instance; only exercised by the bench path today.
@@ -68,6 +74,39 @@ func (e *WASMEngine) hostSign(ctx context.Context, mod api.Module, dataPtr, data
 		return hostSignErr
 	}
 	return uint32(len(sig))
+}
+
+// hostGetManifest backs the wasm's muxl.host_get_manifest import: look up the
+// per-instance fetcher (keyed by the unique instance name), invoke it for
+// `kind` (0 = track, 1 = wrapper), write the manifest bytes into wasm memory
+// if they fit, and return the byte length. If the wasm's out buffer is too
+// small the manifest length is returned WITHOUT a write — the wasm then
+// allocates a bigger buffer and retries; the host re-runs the fetcher on
+// each call, so "fresh on every retry" is the intended semantics.
+// Returns hostGetManifestErr on any failure.
+func (e *WASMEngine) hostGetManifest(ctx context.Context, mod api.Module, kind, outPtr, outMax uint32) uint32 {
+	v, ok := e.manifestFetchers.Load(mod.Name())
+	if !ok {
+		e.logger.ErrorContext(ctx, "muxl host_get_manifest: no fetcher registered", "instance", mod.Name(), "kind", kind)
+		return hostGetManifestErr
+	}
+	fetchFn := v.(func(uint32) ([]byte, error))
+	bs, err := fetchFn(kind)
+	if err != nil {
+		e.logger.ErrorContext(ctx, "muxl host_get_manifest: fetcher returned error", "instance", mod.Name(), "kind", kind, "error", err)
+		return hostGetManifestErr
+	}
+	n := uint32(len(bs))
+	if n > outMax {
+		// Tell the wasm how big a buffer it needs to allocate; the next call
+		// will write the bytes (or the wasm may give up if the size is wild).
+		return n
+	}
+	if !mod.Memory().Write(outPtr, bs) {
+		e.logger.ErrorContext(ctx, "muxl host_get_manifest: bad output pointer", "instance", mod.Name(), "kind", kind)
+		return hostGetManifestErr
+	}
+	return n
 }
 
 // muxlAllocator pre-allocates the wasm linear-memory backing buffer and grows
@@ -136,7 +175,8 @@ func (m *muxlLinearMemory) Free() { m.buf = nil }
 // parsed as a DRISL event stream and routed to them; otherwise stdout (if
 // non-nil) receives the module's raw stdout. input (if non-nil) is piped to
 // stdin. signFn (if non-nil) is registered for the call's duration so wasm
-// calls into muxl.host_sign route to it. realClock=true exposes the host wall
+// calls into muxl.host_sign route to it; manifestFn (if non-nil) is registered
+// likewise for muxl.host_get_manifest. realClock=true exposes the host wall
 // clock + real randomness, which c2pa-rs needs for signing/verification.
 func (e *WASMEngine) runWith(
 	ctx context.Context,
@@ -146,6 +186,7 @@ func (e *WASMEngine) runWith(
 	input io.Reader,
 	stdout io.Writer,
 	signFn func([]byte) ([]byte, error),
+	manifestFn func(kind uint32) ([]byte, error),
 	initCh, segCh chan<- []byte,
 	eventCh chan<- *Event,
 ) error {
@@ -155,6 +196,10 @@ func (e *WASMEngine) runWith(
 	if signFn != nil {
 		e.signers.Store(instanceName, signFn)
 		defer e.signers.Delete(instanceName)
+	}
+	if manifestFn != nil {
+		e.manifestFetchers.Store(instanceName, manifestFn)
+		defer e.manifestFetchers.Delete(instanceName)
 	}
 
 	cfg := wazero.NewModuleConfig().

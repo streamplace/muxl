@@ -1,6 +1,11 @@
 [workspace]
 resolver = "3"
 members = ["crates/muxl-sign"]
+# Operate on both crates by default: a bare `cargo test` covers the root
+# library *and* muxl-sign, while a bare `cargo run` still resolves to the one
+# binary in the workspace — `muxl`, which lives in the muxl-sign crate (it
+# depends on muxl + c2pa, so it can't live in the library crate).
+default-members = [".", "crates/muxl-sign"]
 
 
 [package]

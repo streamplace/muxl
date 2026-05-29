@@ -1,10 +1,14 @@
-//! CLI entry point for the `muxl-sign` binary.
+//! CLI entry point for the `muxl` binary — the single MUXL command-line tool.
 //!
-//! Consolidated CLI: every `muxl` subcommand is reachable here under the
-//! same name (catalog, fmp4, mp4, segment, concat, hls), plus the
-//! sign-specific subcommands `sign-per-track` and `sign-segment`. This
-//! lets Streamplace ship a single `muxl-sign.wasm` that covers both the
-//! unsigned-muxing path and the per-track signing path.
+//! It bundles every muxing subcommand (catalog, fmp4, mp4, segment, wrap,
+//! unwrap, cid, concat, hls), reusing the building blocks from [`muxl::cli`],
+//! alongside the sign-specific subcommands (sign-segment, sign-transcode,
+//! verify, inspect, gen-key, gen-cert, …). The binary lives in this crate
+//! rather than the core `muxl` crate because signing pulls in c2pa; keeping it
+//! here leaves the `muxl` library (and its wasm builds) free of that
+//! dependency. Streamplace embeds the same artifact compiled to wasm
+//! (`muxl.wasm`), covering both the unsigned-muxing and per-track signing
+//! paths.
 
 use std::fs;
 use std::io::{self, Read, Write};
@@ -22,7 +26,7 @@ use crate::{
 
 #[derive(Parser)]
 #[command(
-    name = "muxl-sign",
+    name = "muxl",
     about = "MUXL canonicalization + per-track C2PA signing",
     version
 )]
@@ -65,7 +69,7 @@ enum Command {
     BenchSha256(BenchSha256Args),
 
     /// Generate a fresh secp256k1 (ES256K) private key as PKCS#8 PEM.
-    /// Pair with `gen-cert` to produce a signer for muxl-sign.
+    /// Pair with `gen-cert` to produce a signer for muxl.
     GenKey(GenKeyArgs),
     /// Generate an S2PA self-signed leaf certificate (X.509 v3) for an
     /// existing secp256k1 PKCS#8 PEM private key. The cert's
@@ -433,7 +437,7 @@ fn cmd_verify() -> Result<()> {
     Ok(())
 }
 
-/// Wire shape for `muxl-sign synth-flat`'s stdin: a single CBOR document
+/// Wire shape for `muxl synth-flat`'s stdin: a single CBOR document
 /// carrying the catalog and a sequence of per-segment metadata. The
 /// fields mirror [`muxl::SegmentMetadata`] one-to-one.
 #[derive(serde::Deserialize)]

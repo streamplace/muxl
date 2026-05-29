@@ -6,7 +6,7 @@
 //! transmitted unit, verification moves here: [`unwrap`] the wrapper into
 //! its per-track signed segments and run c2pa-rs's [`Reader`] over each one
 //! as an `m4s` asset — the exact format it was signed as
-//! (`sign::sign_buf_as(.., "m4s")`). A single `muxl-sign.wasm` now covers
+//! (`sign::sign_buf_as(.., "m4s")`). A single `muxl.wasm` now covers
 //! segment / sign / wrap / verify, so the c2pa dependency leaves the host.
 //!
 //! [`unwrap`]: muxl::reader::unwrap

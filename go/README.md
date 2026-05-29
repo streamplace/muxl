@@ -8,7 +8,7 @@ verification.
 import muxl "github.com/streamplace/muxl/go"
 ```
 
-The default engine runs the `muxl-sign` toolchain compiled to WebAssembly under
+The default engine runs the `muxl` toolchain compiled to WebAssembly under
 the pure-Go [wazero](https://wazero.io) runtime. **No Rust toolchain, no cgo —
 just `go get`.** The `muxl.wasm` artifact is embedded in the package and
 committed to the repo.
@@ -56,7 +56,7 @@ signer with [`RawSignerToCallback`](sign.go) and pass it as `Sign`.
 Only needed when the Rust changes — consumers never do this:
 
 ```sh
-just build-go-wasm   # builds muxl-sign -> wasm32-wasip1, copies to go/muxl.wasm
+just build-go-wasm   # builds muxl -> wasm32-wasip1, copies to go/muxl.wasm
 ```
 
 then commit `go/muxl.wasm`. Requires `clang` on PATH (see the recipe for the

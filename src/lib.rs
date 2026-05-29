@@ -42,7 +42,6 @@ pub use flat::{
 };
 
 pub mod cli;
-pub use cli::cli_main;
 
 // ---------------------------------------------------------------------------
 // Top-level convenience API

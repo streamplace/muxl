@@ -19,7 +19,7 @@ import (
 	"github.com/tetratelabs/wazero/imports/wasi_snapshot_preview1"
 )
 
-// muxl.wasm bundles the full muxl-sign CLI compiled to wasm32-wasip1 — every
+// muxl.wasm bundles the full muxl CLI compiled to wasm32-wasip1 — every
 // subcommand (segment, concat, unwrap, wrap, verify, sign-segment,
 // sign-transcode, …). It is built by `just build-go-wasm` and committed to the
 // repo so consumers need no Rust toolchain. See the package doc.
@@ -37,7 +37,7 @@ const (
 )
 
 // WASMEngine is the default zero-config [Engine]: it runs the embedded
-// muxl-sign WebAssembly module under the pure-Go wazero runtime. Construct one
+// muxl WebAssembly module under the pure-Go wazero runtime. Construct one
 // with [NewWASM] and reuse it for the life of the process — module compilation
 // happens once; each call instantiates a fresh, isolated module.
 type WASMEngine struct {
@@ -70,7 +70,7 @@ func WithLogger(l *slog.Logger) Option {
 	return func(e *WASMEngine) { e.logger = l }
 }
 
-// NewWASM compiles the embedded muxl-sign wasm module and returns an Engine
+// NewWASM compiles the embedded muxl wasm module and returns an Engine
 // backed by wazero. Compilation is the expensive step, so create one engine
 // and share it. Call [WASMEngine.Close] to release runtime resources.
 func NewWASM(ctx context.Context, opts ...Option) (*WASMEngine, error) {
@@ -114,17 +114,17 @@ func (e *WASMEngine) Close(ctx context.Context) error {
 
 // SegmentEvents implements [Engine].
 func (e *WASMEngine) SegmentEvents(ctx context.Context, input io.Reader, events chan<- *Event) error {
-	return e.runWith(ctx, []string{"muxl-sign", "segment", "-", "--stdout"}, nil, false, input, nil, nil, nil, nil, nil, events)
+	return e.runWith(ctx, []string{"muxl", "segment", "-", "--stdout"}, nil, false, input, nil, nil, nil, nil, nil, events)
 }
 
 // UnwrapEvents implements [Engine].
 func (e *WASMEngine) UnwrapEvents(ctx context.Context, input io.Reader, events chan<- *Event) error {
-	return e.runWith(ctx, []string{"muxl-sign", "unwrap", "--events", "-"}, nil, false, input, nil, nil, nil, nil, nil, events)
+	return e.runWith(ctx, []string{"muxl", "unwrap", "--events", "-"}, nil, false, input, nil, nil, nil, nil, nil, events)
 }
 
 // ConcatEvents implements [Engine].
 func (e *WASMEngine) ConcatEvents(ctx context.Context, input io.Reader, init, seg chan<- []byte, events chan<- *Event) error {
-	return e.runWith(ctx, []string{"muxl-sign", "concat"}, nil, false, input, nil, nil, nil, init, seg, events)
+	return e.runWith(ctx, []string{"muxl", "concat"}, nil, false, input, nil, nil, nil, init, seg, events)
 }
 
 // Verify implements [Engine].
@@ -132,7 +132,7 @@ func (e *WASMEngine) Verify(ctx context.Context, input io.Reader) (string, error
 	var out bytes.Buffer
 	// Verification runs against the real clock so cert-validity-window checks
 	// observe wall time.
-	if err := e.runWith(ctx, []string{"muxl-sign", "verify"}, nil, true, input, &out, nil, nil, nil, nil, nil); err != nil {
+	if err := e.runWith(ctx, []string{"muxl", "verify"}, nil, true, input, &out, nil, nil, nil, nil, nil); err != nil {
 		return "", err
 	}
 	return out.String(), nil
@@ -143,12 +143,12 @@ func (e *WASMEngine) Wrap(ctx context.Context, input io.Reader, format string, o
 	if format == "" {
 		format = "fmp4"
 	}
-	return e.runWith(ctx, []string{"muxl-sign", "wrap", "-", "-", "--format", format}, nil, false, input, out, nil, nil, nil, nil, nil)
+	return e.runWith(ctx, []string{"muxl", "wrap", "-", "-", "--format", format}, nil, false, input, out, nil, nil, nil, nil, nil)
 }
 
 // WrapInit implements [Engine].
 func (e *WASMEngine) WrapInit(ctx context.Context, input io.Reader, out io.Writer) error {
-	return e.runWith(ctx, []string{"muxl-sign", "wrap", "-", "-", "--format", "fmp4", "--init-only"}, nil, false, input, out, nil, nil, nil, nil, nil)
+	return e.runWith(ctx, []string{"muxl", "wrap", "-", "-", "--format", "fmp4", "--init-only"}, nil, false, input, out, nil, nil, nil, nil, nil)
 }
 
 // SignSegment implements [Engine]. Signing needs the real wall clock (c2pa-rs
@@ -174,7 +174,7 @@ func (e *WASMEngine) SignSegment(ctx context.Context, input io.Reader, in Signer
 		"cert.pem": {Data: in.CertPEM},
 	}
 	args := []string{
-		"muxl-sign", "sign-segment",
+		"muxl", "sign-segment",
 		"--cert", "/keys/cert.pem",
 		"--alg", alg,
 	}
@@ -244,7 +244,7 @@ func (e *WASMEngine) SignTranscode(ctx context.Context, in TranscodeInput) ([]by
 		"manifest.json": {Data: in.Manifest},
 	}
 	args := []string{
-		"muxl-sign", "sign-transcode",
+		"muxl", "sign-transcode",
 		"--cert", "/keys/cert.pem",
 		"--alg", alg,
 		"--source", "/keys/source.m4s",
@@ -275,7 +275,7 @@ func (e *WASMEngine) GenCert(ctx context.Context, in CertInput) ([]byte, error) 
 		return nil, fmt.Errorf("muxl: GenCert requires a 65-byte uncompressed secp256k1 public key (0x04||X||Y), got %d bytes", len(in.PubKey))
 	}
 	args := []string{
-		"muxl-sign", "gen-cert",
+		"muxl", "gen-cert",
 		"--pubkey", hex.EncodeToString(in.PubKey),
 		"--host-sign",
 		"--out", "-",
@@ -315,7 +315,7 @@ func (e *WASMEngine) Canonicalize(ctx context.Context, mp4 []byte, opts ...Canon
 		return nil, fmt.Errorf("muxl: staging canonicalize input: %w", err)
 	}
 	fsCfg := wazero.NewFSConfig().WithDirMount(dir, "/work")
-	args := []string{"muxl-sign", "fmp4", "/work/in.mp4", "/work/out.fmp4"}
+	args := []string{"muxl", "fmp4", "/work/in.mp4", "/work/out.fmp4"}
 	// Track remaps are deterministic given the map; sort by source id so the
 	// CLI args (and any logging) are stable.
 	for _, src := range sortedU32Keys(cfg.trackRemap) {

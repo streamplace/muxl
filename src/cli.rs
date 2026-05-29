@@ -1,22 +1,19 @@
-//! `muxl` CLI surface.
+//! `muxl` CLI building blocks.
 //!
-//! Public so that downstream binaries (notably `muxl-sign`) can include
-//! these subcommands in a single consolidated CLI without duplicating
-//! arg-parsing code. The shape:
+//! Not a CLI of its own: the single `muxl` binary lives in the `muxl-sign`
+//! crate, which composes these pieces alongside its signing subcommands. This
+//! module exports the reusable parts so that consolidated CLI needn't duplicate
+//! any arg-parsing code:
 //!
-//! - [`Command`] — the top-level subcommand enum.
 //! - One named `*Args` struct per subcommand (e.g. [`CatalogArgs`],
 //!   [`Fmp4Args`]).
-//! - One `cmd_*` handler per subcommand, plus [`dispatch`] which
-//!   pattern-matches a [`Command`] to its handler.
-//! - [`cli_main`] — the binary entry point: `Cli::parse() ; dispatch(...)`.
+//! - One public `cmd_*` handler per subcommand.
 
 use std::fs;
 use std::io::{self, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
-use std::process;
 
-use clap::{ArgGroup, Args, Parser, Subcommand, ValueEnum};
+use clap::{ArgGroup, Args, ValueEnum};
 
 /// Output encoding for `muxl catalog --format`.
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -26,36 +23,6 @@ pub enum CatalogFormat {
     Drisl,
     /// Hang-shaped JSON (pretty-printed, camelCase, hex description).
     Json,
-}
-
-#[derive(Parser)]
-#[command(name = "muxl", about = "Deterministic MP4 canonicalization tool", version)]
-struct Cli {
-    #[command(subcommand)]
-    command: Command,
-}
-
-/// All `muxl` subcommands. Reused as variants in `muxl-sign`'s consolidated CLI.
-#[derive(Subcommand)]
-pub enum Command {
-    /// Extract catalog (track config) from an MP4.
-    Catalog(CatalogArgs),
-    /// Write a canonical MUXL fMP4 (or just its init segment with --init-only).
-    Fmp4(Fmp4Args),
-    /// Write a canonical MUXL flat MP4 (faststart) from an input MP4.
-    Mp4(Mp4Args),
-    /// Segment an fMP4 into per-GoP MUXL segments.
-    Segment(SegmentArgs),
-    /// Wrap one or more MUXL wrappers into a presentation MP4 (fMP4 or flat).
-    Wrap(WrapArgs),
-    /// Unwrap any MUXL wrapper (fMP4/flat/m4s) into its canonical segments.
-    Unwrap(UnwrapArgs),
-    /// Concatenate MUXL fMP4 files from stdin, emit CBOR events to stdout.
-    Concat,
-    /// Generate HLS playback artifacts (CID-addressed blobs + optional playlists).
-    Hls(HlsArgs),
-    /// Print the BDASL CID of a file, or of each canonical segment.
-    Cid(CidArgs),
 }
 
 /// Output container for `muxl wrap`.
@@ -199,31 +166,6 @@ pub struct CidArgs {
     /// content-addressed unit) instead of one CID for the whole file.
     #[arg(long)]
     pub segments: bool,
-}
-
-/// Run the parsed `muxl` CLI: parse argv into a [`Command`] and [`dispatch`] it.
-pub fn cli_main() {
-    let cli = Cli::parse();
-    if let Err(e) = dispatch(cli.command) {
-        eprintln!("Error: {e}");
-        process::exit(1);
-    }
-}
-
-/// Run a parsed [`Command`]. Used by both `cli_main` and downstream
-/// binaries that flatten muxl's subcommands into a wider CLI.
-pub fn dispatch(cmd: Command) -> crate::Result<()> {
-    match cmd {
-        Command::Catalog(args) => cmd_catalog(args),
-        Command::Fmp4(args) => cmd_fmp4(args),
-        Command::Mp4(args) => cmd_mp4(args),
-        Command::Segment(args) => cmd_segment(args),
-        Command::Wrap(args) => cmd_wrap(args),
-        Command::Unwrap(args) => cmd_unwrap(args),
-        Command::Concat => cmd_concat(),
-        Command::Hls(args) => cmd_hls(args),
-        Command::Cid(args) => cmd_cid(args),
-    }
 }
 
 pub fn cmd_catalog(args: CatalogArgs) -> crate::Result<()> {

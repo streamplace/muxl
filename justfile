@@ -146,10 +146,10 @@ show-changes file: build
 build-wasi:
     cargo build --target wasm32-wasip1 --release
 
-# Build the muxl-sign WASI binary inside a container.
+# Build the muxl WASI binary (from the muxl-sign crate) inside a container.
 # c2pa-rs pulls in `ring` which needs clang at compile time; running the
 # build in a container lets you ship the .wasm without installing clang
-# on the host. Output: target/wasm32-wasip1/release/muxl-sign.wasm
+# on the host. Output: target/wasm32-wasip1/release/muxl.wasm
 #
 # Mounts the sibling ../c2pa-rs because of the temporary [patch] override
 # in the workspace Cargo.toml (drop that mount once the patch goes away).
@@ -165,7 +165,7 @@ build-wasi-sign:
         -e CARGO_HOME=/work/target/.docker-cargo \
         muxl-wasi-build \
         cargo build --release --target wasm32-wasip1 -p muxl-sign
-    @echo "Built target/wasm32-wasip1/release/muxl-sign.wasm"
+    @echo "Built target/wasm32-wasip1/release/muxl.wasm"
 
 # Build browser WASM library (with wasm-bindgen)
 build-wasm:
@@ -183,7 +183,7 @@ build-wasm-all: build-wasi build-wasm
 # if you don't have clang.
 build-go-wasm:
     CC=clang cargo build --release --target wasm32-wasip1 -p muxl-sign
-    cp target/wasm32-wasip1/release/muxl-sign.wasm go/muxl.wasm
+    cp target/wasm32-wasip1/release/muxl.wasm go/muxl.wasm
     @echo "Updated go/muxl.wasm — commit it."
 
 # Clean build artifacts

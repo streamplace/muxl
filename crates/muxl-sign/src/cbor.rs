@@ -1,4 +1,4 @@
-//! Wire format for the `muxl-sign segment` streaming protocol.
+//! Wire format for the `muxl segment` streaming protocol.
 //!
 //! Two event kinds, each one DRISL/CBOR value on stdout:
 //!

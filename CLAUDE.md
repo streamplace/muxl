@@ -11,14 +11,15 @@ This is a companion to **S2PA** (Simple Standard for Provenance and Authenticity
 ## Build Commands
 
 ```bash
-cargo build          # build
-cargo run -- <file>  # run against an MP4 file (e.g. cargo run -- samples/file.mp4)
-cargo check          # type-check without building
+cargo build                       # build the workspace (muxl lib + the muxl binary)
+cargo run -- <subcommand> [args]  # run the unified muxl CLI (e.g. cargo run -- catalog samples/file.mp4)
+cargo check                       # type-check without building
 ```
 
 ## Repo Structure
 
-- `src/main.rs` — Rust binary (reading + canonicalization)
+- `src/` — core `muxl` library crate (muxing + canonicalization; no signing/c2pa)
+- `crates/muxl-sign/` — signing crate; also builds the single `muxl` CLI binary (muxing + C2PA/S2PA signing)
 - `spec/` — canonical form specification (one section per box type)
 - `scripts/remux.sh` — remuxes an MP4 through ffmpeg, ffmpeg+faststart, gstreamer, MP4Box
 - `scripts/mp4dump.py` — machine-readable MP4 box tree dump (supports `--flat` for diffing)
@@ -28,7 +29,7 @@ cargo check          # type-check without building
 
 ## Architecture
 
-Library (`src/lib.rs`) + CLI (`src/main.rs`). Uses a vendored fork of `mp4-rust` at `crates/mp4` (git subtree). Targets Rust/WASM.
+Core library (`src/lib.rs`, the `muxl` crate) + a signing crate (`crates/muxl-sign`). There is one CLI binary, `muxl`, built from the muxl-sign crate — it depends on `muxl` + c2pa, so it can't live in the library crate; keeping the binary in muxl-sign leaves the `muxl` library (and its wasm builds) c2pa-free. `muxl::cli` exports the muxing subcommand building blocks (`*Args` + `cmd_*`) that muxl-sign's CLI composes. Targets Rust/WASM.
 
 **MUXL segment** (canonical byte sequence): one track's moof+mdat pairs for one GoP. Per-track, independently hashable, blindly concatenatable. Track init metadata is out-of-band (MUXL fMP4 file header or external source).
 

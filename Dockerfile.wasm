@@ -1,9 +1,9 @@
-# Build container for the muxl-sign wasm32-wasip1 binary.
+# Build container for the muxl wasm32-wasip1 binary.
 #
 # c2pa-rs pulls in `ring` transitively via `x509-certificate`; ring's build
 # script needs `clang` to assemble its WASI primitives, which most local dev
 # boxes don't have. This image is the minimum needed to produce
-# `target/wasm32-wasip1/release/muxl-sign.wasm` reproducibly.
+# `target/wasm32-wasip1/release/muxl.wasm` reproducibly.
 #
 # Used by `just build-wasi-sign`. Everything muxl-sign needs is pure Rust
 # beyond the C dep that ring drags in.

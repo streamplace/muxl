@@ -2,10 +2,10 @@
 // subset of ISO-BMFF (MP4) — and its S2PA (C2PA-over-DID) signing and
 // verification, exposed through a single [Engine] interface.
 //
-// The default engine, [NewWASM], runs the muxl-sign toolchain compiled to
+// The default engine, [NewWASM], runs the muxl toolchain compiled to
 // WebAssembly under the pure-Go wazero runtime. Consumers get the full
 // MUXL/S2PA feature set with zero native build steps — no Rust toolchain, no
-// cgo, just `go get`. The muxl-sign.wasm artifact is embedded in the package
+// cgo, just `go get`. The muxl.wasm artifact is embedded in the package
 // and committed to the repo, so building this library never shells out to
 // cargo.
 //
@@ -187,7 +187,7 @@ type CertInput struct {
 //	  {"action":"c2pa.transcoded","parameters":{"org.cai.ingredientIds":["muxl.source"]}}
 //	]}}
 //
-// It must match muxl-sign's TRANSCODE_INGREDIENT_LABEL.
+// It must match muxl's TRANSCODE_INGREDIENT_LABEL.
 const TranscodeIngredientLabel = "muxl.source"
 
 // Event is one event from the muxl wasm's DRISL output stream. The wire format

@@ -82,9 +82,10 @@ enum Command {
     Mp4(muxl_cli::Mp4Args),
     /// Segment an fMP4 into per-GoP MUXL segments.
     Segment(muxl_cli::SegmentArgs),
-    /// Wrap MUXL segments into a presentation MP4 (fMP4 or flat); "-" reads
-    /// stdin / writes stdout. With --init-only, emit just the synthesized
-    /// init segment (the inbound header-synthesis the host runs per segment).
+    /// Wrap one or more MUXL wrappers into a presentation MP4 (fMP4 or flat),
+    /// `tar`-style (output first, then inputs); "-" reads stdin / writes
+    /// stdout. With --init-only, emit just the synthesized init segment (the
+    /// inbound header-synthesis the host runs per segment).
     Wrap(muxl_cli::WrapArgs),
     /// Unwrap any MUXL wrapper (fMP4/flat/bare m4s) into its canonical segments.
     Unwrap(muxl_cli::UnwrapArgs),

@@ -46,7 +46,7 @@ pub enum Command {
     Mp4(Mp4Args),
     /// Segment an fMP4 into per-GoP MUXL segments.
     Segment(SegmentArgs),
-    /// Wrap MUXL segments into a presentation MP4 (fMP4 or flat).
+    /// Wrap one or more MUXL wrappers into a presentation MP4 (fMP4 or flat).
     Wrap(WrapArgs),
     /// Unwrap any MUXL wrapper (fMP4/flat/m4s) into its canonical segments.
     Unwrap(UnwrapArgs),
@@ -141,11 +141,15 @@ pub struct SegmentArgs {
 
 #[derive(Args)]
 pub struct WrapArgs {
-    /// Input MUXL wrapper: fMP4, flat MP4, or a bare m4s segment stream.
-    /// "-" reads stdin.
-    pub input: PathBuf,
     /// Output MP4 path. "-" writes stdout.
     pub output: PathBuf,
+    /// Input MUXL wrappers — fMP4, flat MP4, or bare m4s segment streams.
+    /// Given `tar`-style (output first, then inputs): each input is unwrapped
+    /// to its canonical segments, and the segments are concatenated in
+    /// argument order into one presentation MP4. "-" reads stdin — use it as
+    /// the sole input.
+    #[arg(required = true, num_args = 1..)]
+    pub inputs: Vec<PathBuf>,
     /// Presentation container to synthesize.
     #[arg(long, value_enum, default_value = "fmp4")]
     pub format: WrapFormat,
@@ -491,24 +495,37 @@ pub fn cmd_hls(args: HlsArgs) -> crate::Result<()> {
 /// presentation MP4. fMP4 is the verbatim fast-forward path; flat is the
 /// interim Source-based flatten.
 pub fn cmd_wrap(args: WrapArgs) -> crate::Result<()> {
-    let WrapArgs { input, output, format, init_only } = args;
+    let WrapArgs { output, inputs, format, init_only } = args;
 
-    // "-" reads stdin / writes stdout, so a wasm host can pipe the hot bytes
-    // without touching the filesystem (matching `mp4` and `sign-per-track`).
-    let bytes: Vec<u8> = if input.as_os_str() == "-" {
-        let mut buf = Vec::new();
-        io::stdin().lock().read_to_end(&mut buf)?;
-        buf
-    } else {
-        fs::read(&input)?
-    };
+    // Read every input wrapper up front. The segments recovered by `unwrap`
+    // borrow these buffers, so all of them must outlive the combined segment
+    // list. "-" reads stdin, so a wasm host can pipe the hot bytes without
+    // touching the filesystem (matching `mp4` and `sign-per-track`).
+    let buffers: Vec<Vec<u8>> = inputs
+        .iter()
+        .map(|input| -> crate::Result<Vec<u8>> {
+            if input.as_os_str() == "-" {
+                let mut buf = Vec::new();
+                io::stdin().lock().read_to_end(&mut buf)?;
+                Ok(buf)
+            } else {
+                Ok(fs::read(input)?)
+            }
+        })
+        .collect::<crate::Result<Vec<_>>>()?;
+
     let mut out: Box<dyn Write> = if output.as_os_str() == "-" {
         Box::new(BufWriter::new(io::stdout().lock()))
     } else {
         Box::new(BufWriter::new(fs::File::create(&output)?))
     };
 
-    let segments = crate::reader::unwrap(&bytes)?;
+    // Unwrap each input and splice its canonical segments together in argument
+    // order — like `tar`, the inputs are concatenated in the sequence given.
+    let mut segments = Vec::new();
+    for buf in &buffers {
+        segments.extend(crate::reader::unwrap(buf)?);
+    }
     let catalog = crate::reader::aggregate_catalog(&segments);
 
     if init_only {
@@ -523,9 +540,10 @@ pub fn cmd_wrap(args: WrapArgs) -> crate::Result<()> {
         out.write_all(&init)?;
         out.flush()?;
         eprintln!(
-            "init segment: {} bytes (from {} segments)",
+            "init segment: {} bytes (from {} segments across {} input(s))",
             init.len(),
-            segments.len()
+            segments.len(),
+            buffers.len()
         );
         return Ok(());
     }
@@ -534,7 +552,11 @@ pub fn cmd_wrap(args: WrapArgs) -> crate::Result<()> {
         WrapFormat::Fmp4 => {
             crate::present::write_fmp4(&catalog, segments.iter().map(|s| s.data), &mut out)?;
             out.flush()?;
-            eprintln!("fMP4: wrapped {} segments", segments.len());
+            eprintln!(
+                "fMP4: wrapped {} segments from {} input(s)",
+                segments.len(),
+                buffers.len()
+            );
         }
         WrapFormat::Flat => {
             // Fast-forward + m4s-native: unwrap to verbatim segments, then
@@ -542,7 +564,11 @@ pub fn cmd_wrap(args: WrapArgs) -> crate::Result<()> {
             let slices: Vec<&[u8]> = segments.iter().map(|s| s.data).collect();
             crate::present::write_flat_from_m4s(&catalog, &slices, &mut out)?;
             out.flush()?;
-            eprintln!("flat MP4: wrapped {} segments", segments.len());
+            eprintln!(
+                "flat MP4: wrapped {} segments from {} input(s)",
+                segments.len(),
+                buffers.len()
+            );
         }
     }
     Ok(())

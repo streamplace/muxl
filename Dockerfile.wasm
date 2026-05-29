@@ -5,7 +5,7 @@
 # boxes don't have. This image is the minimum needed to produce
 # `target/wasm32-wasip1/release/muxl.wasm` reproducibly.
 #
-# Used by `just build-wasi-sign`. Everything muxl-sign needs is pure Rust
+# Used by `just build-wasi-sign`. Everything muxl needs is pure Rust
 # beyond the C dep that ring drags in.
 FROM rust:1.95-slim-bookworm
 RUN apt-get update \

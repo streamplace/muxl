@@ -1,4 +1,5 @@
-//! muxl-sign — C2PA/S2PA signing + verification for MUXL canonical segments.
+//! The `muxl` crate: C2PA/S2PA signing + verification for MUXL canonical
+//! segments, plus the consolidated `muxl` command-line tool built on top.
 //!
 //! Each canonical segment (one track's fragments for one GoP, prefixed by the
 //! muxl uuid + DRISL catalog) is signed independently with c2pa-rs as a

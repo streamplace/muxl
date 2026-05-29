@@ -1,15 +1,23 @@
 [package]
-name = "muxl-sign"
+# Renamed muxl-sign -> muxl so the install command and the binary match:
+# `cargo install --git <url> muxl` yields the `muxl` binary. The lib target
+# keeps the name `muxl_sign` (see [lib]) so this crate's own `muxl_sign::…`
+# references and the dependency on the `muxl` library (muxl-core's lib target,
+# imported as `muxl`) don't collide.
+name = "muxl"
 version = "0.1.0"
 edition = "2024"
 license = "Apache-2.0"
+
+[lib]
+name = "muxl_sign"
 
 [[bin]]
 name = "muxl"
 path = "src/main.rs"
 
 [dependencies]
-muxl = { path = "../.." }
+muxl-core = { path = "../.." }
 c2pa = { git = "https://github.com/streamplace/c2pa-rs.git", rev = "81d737bd", default-features = false, features = ["rust_native_crypto", "file_io"] }
 mp4-atom = { git = "https://github.com/streamplace/mp4-atom.git", branch = "streamplace" }
 clap = { version = "4", features = ["derive"] }

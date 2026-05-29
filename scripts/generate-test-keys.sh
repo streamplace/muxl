@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Generate ES256K (secp256k1) test cert chain + private key for muxl-sign
+# Generate ES256K (secp256k1) test cert chain + private key for muxl
 # integration tests. Outputs samples/test-keys/es256k-cert.pem (leaf + CA
 # chain) and samples/test-keys/es256k-key.pem (PKCS#8 leaf private key).
 #

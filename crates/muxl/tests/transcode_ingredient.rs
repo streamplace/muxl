@@ -189,7 +189,7 @@ fn transcode_output_declares_source_as_parent_ingredient() {
     );
 
     // 4) The whole thing still validates (signature + hashes intact). Trust is
-    //    intentionally disabled in muxl-sign, so Valid (not Trusted) is expected.
+    //    intentionally disabled in muxl, so Valid (not Trusted) is expected.
     assert_ne!(
         reader.validation_state(),
         ValidationState::Invalid,

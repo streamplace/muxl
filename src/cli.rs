@@ -1,7 +1,7 @@
 //! `muxl` CLI building blocks.
 //!
-//! Not a CLI of its own: the single `muxl` binary lives in the `muxl-sign`
-//! crate, which composes these pieces alongside its signing subcommands. This
+//! Not a CLI of its own: the single `muxl` binary is built by the `muxl` crate
+//! (crates/muxl), which composes these pieces with its signing subcommands. This
 //! module exports the reusable parts so that consolidated CLI needn't duplicate
 //! any arg-parsing code:
 //!

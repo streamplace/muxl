@@ -146,7 +146,7 @@ show-changes file: build
 build-wasi:
     cargo build --target wasm32-wasip1 --release
 
-# Build the muxl WASI binary (from the muxl-sign crate) inside a container.
+# Build the muxl WASI binary (from the muxl crate) inside a container.
 # c2pa-rs pulls in `ring` which needs clang at compile time; running the
 # build in a container lets you ship the .wasm without installing clang
 # on the host. Output: target/wasm32-wasip1/release/muxl.wasm
@@ -164,7 +164,7 @@ build-wasi-sign:
         -v "$(pwd)/../c2pa-rs":/c2pa-rs \
         -e CARGO_HOME=/work/target/.docker-cargo \
         muxl-wasi-build \
-        cargo build --release --target wasm32-wasip1 -p muxl-sign
+        cargo build --release --target wasm32-wasip1 -p muxl
     @echo "Built target/wasm32-wasip1/release/muxl.wasm"
 
 # Build browser WASM library (with wasm-bindgen)
@@ -174,7 +174,7 @@ build-wasm:
 # Build all WASM targets
 build-wasm-all: build-wasi build-wasm
 
-# Build the Go library's embedded wasm: compile muxl-sign to wasm32-wasip1 and
+# Build the Go library's embedded wasm: compile muxl to wasm32-wasip1 and
 # copy it to go/muxl.wasm — the committed artifact `github.com/streamplace/muxl/go`
 # embeds. Run this whenever the Rust changes, then commit go/muxl.wasm so Go
 # consumers need no Rust toolchain (or cargo) to build the library. Requires
@@ -182,7 +182,7 @@ build-wasm-all: build-wasi build-wasm
 # its WASI primitives); use `just build-wasi-sign` for the containerized build
 # if you don't have clang.
 build-go-wasm:
-    CC=clang cargo build --release --target wasm32-wasip1 -p muxl-sign
+    CC=clang cargo build --release --target wasm32-wasip1 -p muxl
     cp target/wasm32-wasip1/release/muxl.wasm go/muxl.wasm
     @echo "Updated go/muxl.wasm — commit it."
 

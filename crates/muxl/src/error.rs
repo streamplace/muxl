@@ -1,4 +1,4 @@
-//! Errors returned by `muxl-sign`. Bridges `muxl::Error` and `c2pa::Error`.
+//! Errors returned by this crate. Bridges `muxl::Error` and `c2pa::Error`.
 
 use std::io;
 

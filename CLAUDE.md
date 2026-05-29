@@ -18,8 +18,8 @@ cargo check                       # type-check without building
 
 ## Repo Structure
 
-- `src/` — core `muxl` library crate (muxing + canonicalization; no signing/c2pa)
-- `crates/muxl-sign/` — signing crate; also builds the single `muxl` CLI binary (muxing + C2PA/S2PA signing)
+- `src/` — the `muxl-core` library crate (lib target named `muxl`, so consumers `use muxl::…`); muxing + canonicalization, no signing/c2pa
+- `crates/muxl/` — the `muxl` CLI crate (package `muxl`, lib `muxl_sign`); builds the single `muxl` binary: muxing subcommands + C2PA/S2PA signing
 - `spec/` — canonical form specification (one section per box type)
 - `scripts/remux.sh` — remuxes an MP4 through ffmpeg, ffmpeg+faststart, gstreamer, MP4Box
 - `scripts/mp4dump.py` — machine-readable MP4 box tree dump (supports `--flat` for diffing)
@@ -29,7 +29,7 @@ cargo check                       # type-check without building
 
 ## Architecture
 
-Core library (`src/lib.rs`, the `muxl` crate) + a signing crate (`crates/muxl-sign`). There is one CLI binary, `muxl`, built from the muxl-sign crate — it depends on `muxl` + c2pa, so it can't live in the library crate; keeping the binary in muxl-sign leaves the `muxl` library (and its wasm builds) c2pa-free. `muxl::cli` exports the muxing subcommand building blocks (`*Args` + `cmd_*`) that muxl-sign's CLI composes. Targets Rust/WASM.
+Two crates. `muxl-core` (the root `src/lib.rs`; its lib target is named `muxl`, so downstream still writes `use muxl::…`) does muxing + canonicalization with no c2pa. `muxl` (`crates/muxl`, lib name `muxl_sign`) adds C2PA/S2PA signing and builds the single `muxl` CLI binary. The binary lives in the `muxl` crate because it needs c2pa; keeping it out of `muxl-core` leaves the library (and its wasm builds) c2pa-free. The library's `cli` module (`muxl::cli`) exports the muxing subcommand building blocks (`*Args` + `cmd_*`) that the `muxl` CLI composes. Targets Rust/WASM.
 
 **MUXL segment** (canonical byte sequence): one track's moof+mdat pairs for one GoP. Per-track, independently hashable, blindly concatenatable. Track init metadata is out-of-band (MUXL fMP4 file header or external source).
 

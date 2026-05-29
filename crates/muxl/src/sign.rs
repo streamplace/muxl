@@ -35,12 +35,12 @@ use crate::error::{Error, Result};
 
 /// Process-global c2pa-rs settings applied once before any sign call.
 ///
-/// muxl-sign doesn't yet have a use case for X.509 trust verification —
+/// muxl doesn't yet have a use case for X.509 trust verification —
 /// our certs are issued via DID-based identity flows (Streamplace's
 /// ES256K + did:key path), not chained to public CAs. So we disable
 /// trust/OCSP/timestamp checks unconditionally. Callers that want
 /// stricter settings can call `c2pa::settings::Settings::from_toml`
-/// themselves before invoking any muxl-sign API — Once::call_once
+/// themselves before invoking any muxl API — Once::call_once
 /// ensures we won't stomp them.
 const MUXL_SIGN_DEFAULTS_TOML: &str = r#"
 version_major = 1
@@ -65,7 +65,7 @@ static SETTINGS_INIT: Once = Once::new();
 pub(crate) fn init_default_settings() {
     SETTINGS_INIT.call_once(|| {
         c2pa::settings::Settings::from_toml(MUXL_SIGN_DEFAULTS_TOML)
-            .expect("muxl-sign default settings TOML should always parse");
+            .expect("muxl default settings TOML should always parse");
     });
 }
 

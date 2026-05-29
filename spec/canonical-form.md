@@ -12,7 +12,7 @@ MUXL is a three-layer stack:
 - **MUXL canonical segment** — a `uuid` box carrying the per-track catalog as a DRISL payload, followed by one track's fragments for one GoP. The unit of content addressing.
 - **Synthesized storage format** — fMP4 (appendable) or flat MP4 (finalized faststart) wrapping N canonical segments together with a derived ISOBMFF header. The header is synthesized from the segments' embedded catalogs. Canonical segments are recoverable byte-for-byte from any storage format.
 
-Signing and provenance — c2pa manifests, S2PA assertions, signed claim chains — are layered on top of MUXL by a separate signing format (see `muxl-sign`). MUXL defines what bytes are canonical; the signing layer defines how those bytes are attested. No c2pa structure appears in MUXL's canonical form.
+Signing and provenance — c2pa manifests, S2PA assertions, signed claim chains — are layered on top of MUXL by a separate signing layer, implemented by the `muxl` CLI's signing commands. MUXL defines what bytes are canonical; the signing layer defines how those bytes are attested. No c2pa structure appears in MUXL's canonical form.
 
 ## MUXL Fragment
 

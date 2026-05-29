@@ -1791,6 +1791,28 @@ dependencies = [
 name = "muxl"
 version = "0.1.0"
 dependencies = [
+ "c2pa",
+ "clap",
+ "const-oid",
+ "dasl",
+ "der",
+ "k256",
+ "mp4-atom",
+ "muxl-core",
+ "serde",
+ "serde_bytes",
+ "serde_cbor",
+ "serde_json",
+ "sha1",
+ "sha2",
+ "spki",
+ "x509-cert",
+]
+
+[[package]]
+name = "muxl-core"
+version = "0.1.0"
+dependencies = [
  "blake3",
  "clap",
  "dasl",
@@ -1802,28 +1824,6 @@ dependencies = [
  "serde_json",
  "tempfile",
  "wasm-bindgen",
-]
-
-[[package]]
-name = "muxl-sign"
-version = "0.1.0"
-dependencies = [
- "c2pa",
- "clap",
- "const-oid",
- "dasl",
- "der",
- "k256",
- "mp4-atom",
- "muxl",
- "serde",
- "serde_bytes",
- "serde_cbor",
- "serde_json",
- "sha1",
- "sha2",
- "spki",
- "x509-cert",
 ]
 
 [[package]]

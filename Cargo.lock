@@ -1789,7 +1789,7 @@ dependencies = [
 
 [[package]]
 name = "muxl"
-version = "0.1.0"
+version = "0.2.1"
 dependencies = [
  "c2pa",
  "clap",
@@ -1811,7 +1811,7 @@ dependencies = [
 
 [[package]]
 name = "muxl-core"
-version = "0.1.0"
+version = "0.2.1"
 dependencies = [
  "blake3",
  "clap",

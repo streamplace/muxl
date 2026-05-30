@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
-	"crypto/sha256"
 	"errors"
 	"fmt"
 	"io"
@@ -27,21 +26,6 @@ const hostSignErr = ^uint32(0)
 // both cases); kept separate for code clarity since the two callbacks return
 // different shapes (size vs. signature length).
 const hostGetManifestErr = ^uint32(0)
-
-// hostSha256 backs the wasm's muxl.host_sha256 import: read input from wasm
-// memory, hash with native (hardware-accelerated) SHA-256, write the digest
-// back. Available to every instance; only exercised by the bench path today.
-func (e *WASMEngine) hostSha256(ctx context.Context, mod api.Module, dataPtr, dataLen, outPtr uint32) {
-	data, ok := mod.Memory().Read(dataPtr, dataLen)
-	if !ok {
-		e.logger.ErrorContext(ctx, "muxl host_sha256: bad data pointer", "instance", mod.Name())
-		return
-	}
-	sum := sha256.Sum256(data)
-	if !mod.Memory().Write(outPtr, sum[:]) {
-		e.logger.ErrorContext(ctx, "muxl host_sha256: bad output pointer", "instance", mod.Name())
-	}
-}
 
 // hostSign backs the wasm's muxl.host_sign import: look up the per-instance
 // closure registered by the calling method (keyed by the unique instance

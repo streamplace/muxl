@@ -88,10 +88,9 @@ func NewWASM(ctx context.Context, opts ...Option) (*WASMEngine, error) {
 
 	// Register the "muxl" host module the wasm imports. The imports are
 	// declared unconditionally in the binary, so the module must always exist
-	// even when a given call never calls into host_sign / host_sha256.
+	// even when a given call never calls into host_sign.
 	if _, err := e.runtime.NewHostModuleBuilder("muxl").
 		NewFunctionBuilder().WithFunc(e.hostSign).Export("host_sign").
-		NewFunctionBuilder().WithFunc(e.hostSha256).Export("host_sha256").
 		NewFunctionBuilder().WithFunc(e.hostGetManifest).Export("host_get_manifest").
 		Instantiate(ctx); err != nil {
 		_ = e.runtime.Close(ctx)

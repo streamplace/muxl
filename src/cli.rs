@@ -83,14 +83,6 @@ fn parse_remap_pair(s: &str) -> std::result::Result<(u32, u32), String> {
 }
 
 #[derive(Args)]
-pub struct Mp4Args {
-    /// Input MP4 file (flat or fragmented).
-    pub input: PathBuf,
-    /// Output flat MP4 path.
-    pub output: PathBuf,
-}
-
-#[derive(Args)]
 #[command(group(ArgGroup::new("mode").required(true).args(["dir", "fmp4", "stdout"])))]
 pub struct SegmentArgs {
     /// Input fMP4 file, or "-" for stdin.
@@ -249,52 +241,6 @@ pub fn cmd_fmp4(args: Fmp4Args) -> crate::Result<()> {
     }
     crate::fmp4::write(&source, &input_reader, &mut out)?;
     out.flush()?;
-    Ok(())
-}
-
-pub fn cmd_mp4(args: Mp4Args) -> crate::Result<()> {
-    let Mp4Args { input, output } = args;
-
-    // "-" reads stdin / writes stdout. Required for the wasm32-wasip1
-    // build, where FileReadAt's pread(2) isn't available — slurping the
-    // input into a Vec<u8> uses the in-memory ReadAt impl instead, the
-    // same workaround sign-per-track uses.
-    let stdin_input = input.as_os_str() == "-";
-    let stdout_output = output.as_os_str() == "-";
-
-    let info = if stdin_input || stdout_output {
-        let input_bytes: Vec<u8> = if stdin_input {
-            let mut buf = Vec::new();
-            io::stdin().lock().read_to_end(&mut buf)?;
-            buf
-        } else {
-            fs::read(&input)?
-        };
-        let source = crate::read(&input_bytes)?;
-        let mut out: Box<dyn Write> = if stdout_output {
-            Box::new(BufWriter::new(io::stdout().lock()))
-        } else {
-            Box::new(BufWriter::new(fs::File::create(&output)?))
-        };
-        let info = crate::flat::write(&source, &input_bytes, &mut out)?;
-        out.flush()?;
-        info
-    } else {
-        let input_reader = crate::io::FileReadAt::open(&input)?;
-        let out_file = fs::File::create(&output)?;
-        let mut out = BufWriter::new(out_file);
-        let source = crate::read(&input_reader)?;
-        let info = crate::flat::write(&source, &input_reader, &mut out)?;
-        out.flush()?;
-        info
-    };
-
-    eprintln!(
-        "flat MP4: {} bytes (mdat payload @ {}, {} tracks)",
-        info.total_bytes,
-        info.mdat_payload_offset,
-        info.tracks.len(),
-    );
     Ok(())
 }
 

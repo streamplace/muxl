@@ -234,12 +234,6 @@ impl SignerKey {
 #[link(wasm_import_module = "muxl")]
 unsafe extern "C" {
     fn host_sign(data_ptr: u32, data_len: u32, out_sig_ptr: u32, out_sig_max: u32) -> u32;
-    /// Compute SHA-256 of `data` host-side, write the 32-byte digest at
-    /// `out_ptr`. Used by `bench-sha256` to measure whether moving SHA-256
-    /// out of wasm shrinks p99 sign latency before committing to a
-    /// crate-level sha2 patch. Always available host-side (PEM-mode
-    /// invocations may still call into it).
-    pub(crate) fn host_sha256(data_ptr: u32, data_len: u32, out_ptr: u32);
     /// Fetch a fresh C2PA manifest JSON from the host. `kind` is 0 for the
     /// per-track segment manifest, 1 for the wrapper manifest. The host
     /// writes the manifest bytes (UTF-8 JSON, NOT null-terminated) into
@@ -259,9 +253,6 @@ unsafe extern "C" {
 unsafe fn host_sign(_: u32, _: u32, _: u32, _: u32) -> u32 {
     u32::MAX
 }
-
-#[cfg(not(target_family = "wasm"))]
-pub(crate) unsafe fn host_sha256(_: u32, _: u32, _: u32) {}
 
 #[cfg(not(target_family = "wasm"))]
 unsafe fn host_get_manifest(_: u32, _: u32, _: u32) -> u32 {

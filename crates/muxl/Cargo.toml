@@ -24,9 +24,6 @@ clap = { version = "4", features = ["derive"] }
 # ES256K signing is wired through CallbackSigner — c2pa-rs's
 # rust_native_crypto path validates ES256K but doesn't sign with it.
 k256 = { version = "0.13", features = ["ecdsa", "pkcs8", "pem"] }
-# Used by the `bench-sha256` subcommand (the in-wasm baseline that the
-# host-callback variant compares against).
-sha2 = "0.10"
 # S2PA leaf cert generation. `der`/`spki`/`const-oid` are already in our
 # tree transitively via k256; `x509-cert` is one new pure-rust crate that
 # pins to the same version line and gives us a typed X.509 builder.

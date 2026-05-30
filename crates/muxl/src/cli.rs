@@ -14,7 +14,6 @@ use std::fs;
 use std::io::{self, Read, Write};
 use std::path::PathBuf;
 use std::process;
-use std::time::Instant;
 
 use clap::{ArgGroup, Parser, Subcommand, ValueEnum};
 use muxl::cli as muxl_cli;
@@ -62,11 +61,6 @@ enum Command {
     /// ingredients) when a C2PA/S2PA manifest is attached. Colorized when
     /// stdout is a TTY.
     Inspect(InspectArgs),
-    /// Microbenchmark: hash N×size bytes via either in-wasm sha2 or the
-    /// `streamplace.host_sha256` import. Used to size the upper bound on
-    /// what a host-SHA256 path could save before committing to a
-    /// full-crate sha2 patch in c2pa-rs's hot path.
-    BenchSha256(BenchSha256Args),
 
     /// Generate a fresh secp256k1 (ES256K) private key as PKCS#8 PEM.
     /// Pair with `gen-cert` to produce a signer for muxl.
@@ -82,8 +76,6 @@ enum Command {
     Catalog(muxl_cli::CatalogArgs),
     /// Write a canonical MUXL fMP4 (or just its init segment with --init-only).
     Fmp4(muxl_cli::Fmp4Args),
-    /// Write a canonical MUXL flat MP4 (faststart) from an input MP4.
-    Mp4(muxl_cli::Mp4Args),
     /// Segment an fMP4 into per-GoP MUXL segments.
     Segment(muxl_cli::SegmentArgs),
     /// Wrap one or more MUXL wrappers into a presentation MP4 (fMP4 or flat),
@@ -97,12 +89,6 @@ enum Command {
     Cid(muxl_cli::CidArgs),
     /// Concatenate MUXL fMP4 files from stdin, emit CBOR events to stdout.
     Concat,
-    /// Synthesize a multi-segment flat MP4 header from per-segment metadata.
-    /// Reads a single CBOR document on stdin: `{catalog, segments: [...]}`.
-    /// Emits the header bytes (ftyp + moov + mdat-envelope-header) on
-    /// stdout. Streamplace's VOD-finalize pipeline pipes this in front of
-    /// each segment's body bytes (typically via S3 multipart upload).
-    SynthFlat,
     /// Generate HLS playback artifacts (CID-addressed blobs + optional playlists).
     Hls(muxl_cli::HlsArgs),
 }
@@ -299,28 +285,6 @@ struct GenCertArgs {
     out: PathBuf,
 }
 
-#[derive(clap::Args)]
-struct BenchSha256Args {
-    /// Bytes of pseudo-random input per iteration.
-    #[arg(long, default_value_t = 1_048_576)]
-    size: usize,
-    /// Number of iterations.
-    #[arg(long, default_value_t = 100)]
-    iterations: usize,
-    /// Hashing backend.
-    #[arg(long, value_enum, default_value_t = Sha256Mode::Wasm)]
-    mode: Sha256Mode,
-}
-
-#[derive(Clone, Copy, Debug, ValueEnum)]
-enum Sha256Mode {
-    /// Hash inside wasm using the bundled `sha2` crate. Same code path
-    /// c2pa-rs follows today.
-    Wasm,
-    /// Hash on the host via the `streamplace.host_sha256` import.
-    Host,
-}
-
 #[derive(Clone, Copy, Debug, ValueEnum)]
 enum Alg {
     Es256,
@@ -356,7 +320,6 @@ pub fn cli_main() {
         Command::SignTranscode(args) => cmd_sign_transcode(args),
         Command::Verify => cmd_verify(),
         Command::Inspect(args) => cmd_inspect(args),
-        Command::BenchSha256(args) => cmd_bench_sha256(args),
         Command::GenKey(args) => cmd_gen_key(args),
         Command::GenCert(args) => cmd_gen_cert(args),
         // muxl subcommands delegate to muxl::cli::dispatch via its
@@ -364,13 +327,11 @@ pub fn cli_main() {
         // our payload and hand it off.
         Command::Catalog(args) => muxl_cli::cmd_catalog(args).map_err(Into::into),
         Command::Fmp4(args) => muxl_cli::cmd_fmp4(args).map_err(Into::into),
-        Command::Mp4(args) => muxl_cli::cmd_mp4(args).map_err(Into::into),
         Command::Segment(args) => muxl_cli::cmd_segment(args).map_err(Into::into),
         Command::Wrap(args) => muxl_cli::cmd_wrap(args).map_err(Into::into),
         Command::Unwrap(args) => muxl_cli::cmd_unwrap(args).map_err(Into::into),
         Command::Cid(args) => muxl_cli::cmd_cid(args).map_err(Into::into),
         Command::Concat => muxl_cli::cmd_concat().map_err(Into::into),
-        Command::SynthFlat => cmd_synth_flat(),
         Command::Hls(args) => muxl_cli::cmd_hls(args).map_err(Into::into),
     };
     if let Err(e) = result {
@@ -435,99 +396,6 @@ fn cmd_verify() -> Result<()> {
     let json = verify_segments(&buf)?;
     io::stdout().lock().write_all(json.as_bytes())?;
     Ok(())
-}
-
-/// Wire shape for `muxl synth-flat`'s stdin: a single CBOR document
-/// carrying the catalog and a sequence of per-segment metadata. The
-/// fields mirror [`muxl::SegmentMetadata`] one-to-one.
-#[derive(serde::Deserialize)]
-struct SynthFlatInput {
-    catalog: muxl::catalog::Catalog,
-    segments: Vec<SynthFlatSegment>,
-}
-
-#[derive(serde::Deserialize)]
-struct SynthFlatSegment {
-    track_byte_sizes: std::collections::BTreeMap<String, u64>,
-    samples: std::collections::BTreeMap<String, SynthFlatTrackSamples>,
-    #[serde(default)]
-    first_decode_times: std::collections::BTreeMap<String, u64>,
-}
-
-#[derive(serde::Deserialize)]
-struct SynthFlatTrackSamples {
-    durations: Vec<u32>,
-    sizes: Vec<u32>,
-    #[serde(default)]
-    cts_offsets: Vec<i32>,
-    #[serde(default)]
-    sync_indices: Vec<u32>,
-    offsets: Vec<u64>,
-}
-
-fn cmd_synth_flat() -> Result<()> {
-    let mut buf = Vec::new();
-    io::stdin().lock().read_to_end(&mut buf)?;
-    let input: SynthFlatInput = dasl::drisl::from_slice(&buf).map_err(|e| {
-        crate::Error::from(muxl::Error::Io(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("decoding synth-flat input: {e}"),
-        )))
-    })?;
-
-    let mut segments: Vec<muxl::SegmentMetadata> = Vec::with_capacity(input.segments.len());
-    for s in input.segments {
-        let track_byte_sizes = parse_track_keyed_map(s.track_byte_sizes)?;
-        let first_decode_times = parse_track_keyed_map(s.first_decode_times)?;
-        let mut samples = std::collections::BTreeMap::new();
-        for (k, v) in s.samples {
-            let tid = parse_track_id(&k)?;
-            let n = v.durations.len();
-            let cts_offsets = if v.cts_offsets.is_empty() {
-                vec![0; n]
-            } else {
-                v.cts_offsets
-            };
-            samples.insert(
-                tid,
-                muxl::segment::TrackSamples {
-                    durations: v.durations,
-                    sizes: v.sizes,
-                    cts_offsets,
-                    sync_indices: v.sync_indices,
-                    offsets_in_track: v.offsets,
-                },
-            );
-        }
-        segments.push(muxl::SegmentMetadata {
-            track_byte_sizes,
-            samples,
-            first_decode_times,
-        });
-    }
-
-    let header = muxl::build_synth_flat_header(&input.catalog, &segments)?;
-    io::stdout().lock().write_all(&header)?;
-    Ok(())
-}
-
-fn parse_track_id(k: &str) -> Result<u32> {
-    k.parse().map_err(|_| {
-        crate::Error::from(muxl::Error::Io(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("non-numeric track id {k:?}"),
-        )))
-    })
-}
-
-fn parse_track_keyed_map<V>(
-    m: std::collections::BTreeMap<String, V>,
-) -> Result<std::collections::BTreeMap<u32, V>> {
-    let mut out = std::collections::BTreeMap::new();
-    for (k, v) in m {
-        out.insert(parse_track_id(&k)?, v);
-    }
-    Ok(out)
 }
 
 fn cmd_gen_key(args: GenKeyArgs) -> Result<()> {
@@ -618,66 +486,4 @@ fn write_out(path: &PathBuf, bytes: &[u8]) -> Result<()> {
         fs::write(path, bytes)?;
     }
     Ok(())
-}
-
-fn cmd_bench_sha256(args: BenchSha256Args) -> Result<()> {
-    let BenchSha256Args { size, iterations, mode } = args;
-
-    // Deterministic-but-non-trivial input so the optimizer can't fold
-    // the hash to a constant. xorshift64 over a known seed.
-    let mut buf = vec![0u8; size];
-    let mut s: u64 = 0xdeadbeef_cafebabe;
-    for chunk in buf.chunks_mut(8) {
-        s ^= s << 13;
-        s ^= s >> 7;
-        s ^= s << 17;
-        let bytes = s.to_le_bytes();
-        chunk.copy_from_slice(&bytes[..chunk.len()]);
-    }
-
-    // One untimed warmup hash so wasm AOT / page-fault costs don't land
-    // in the first iteration of the timed loop.
-    let _ = sha256_once(&buf, mode);
-
-    let start = Instant::now();
-    let mut acc: u8 = 0;
-    for _ in 0..iterations {
-        let digest = sha256_once(&buf, mode);
-        // Touch the digest so the compiler can't elide the call.
-        acc ^= digest[0];
-    }
-    let elapsed = start.elapsed();
-
-    let total_bytes = (size as u64) * (iterations as u64);
-    let throughput_mb_s =
-        (total_bytes as f64) / 1_048_576.0 / elapsed.as_secs_f64();
-    let per_iter_us = elapsed.as_secs_f64() * 1e6 / (iterations as f64);
-
-    println!(
-        "mode={:?} size={} iterations={} elapsed={:?} per_iter={:.1}us throughput={:.1}MB/s sentinel={}",
-        mode, size, iterations, elapsed, per_iter_us, throughput_mb_s, acc
-    );
-    Ok(())
-}
-
-fn sha256_once(data: &[u8], mode: Sha256Mode) -> [u8; 32] {
-    match mode {
-        Sha256Mode::Wasm => {
-            use sha2::{Digest, Sha256};
-            let mut hasher = Sha256::new();
-            hasher.update(data);
-            hasher.finalize().into()
-        }
-        Sha256Mode::Host => {
-            let mut out = [0u8; 32];
-            unsafe {
-                crate::sign::host_sha256(
-                    data.as_ptr() as u32,
-                    data.len() as u32,
-                    out.as_mut_ptr() as u32,
-                );
-            }
-            out
-        }
-    }
 }

@@ -1804,7 +1804,6 @@ dependencies = [
  "serde_cbor",
  "serde_json",
  "sha1",
- "sha2",
  "spki",
  "x509-cert",
 ]

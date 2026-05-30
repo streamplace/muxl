@@ -1,0 +1,44 @@
+#!/usr/bin/env bash
+# pre-commit: keep go/muxl.wasm in sync with the Rust sources it is built from.
+#
+# go/muxl.wasm is a committed build artifact (the muxl CLI compiled to
+# wasm32-wasip1) that the Go bindings embed. When a commit stages changes to the
+# Rust crates or their manifests, that blob is stale. This hook rebuilds it via
+# `just build-go-wasm` and stages the result, so the committed wasm always
+# matches the committed source.
+#
+# Notes:
+#   - It builds from the working tree, not the staged subset. For an ordinary
+#     whole-file commit those are identical; partially staging Rust edits is the
+#     one case where the rebuilt wasm reflects unstaged changes too.
+#   - Skip it with `MUXL_SKIP_WASM_HOOK=1 git commit …` (the `just release`
+#     recipe sets this, since it rebuilds the wasm itself), or bypass all hooks
+#     with `git commit --no-verify`.
+#   - Needs clang + the wasm32-wasip1 target. If you don't have clang, use the
+#     containerized build (`just build-wasi-sign`) then commit with the skip var.
+set -euo pipefail
+
+[ -n "${MUXL_SKIP_WASM_HOOK:-}" ] && exit 0
+
+cd "$(git rev-parse --show-toplevel)"
+
+# Paths whose changes can alter the wasm output: the library crate (root src/ +
+# its manifest), the CLI crate (crates/muxl/), and the lockfile.
+if ! git diff --cached --name-only \
+     | grep -qE '^(src/|crates/muxl/src/|crates/muxl/Cargo\.toml$|Cargo\.toml$|Cargo\.lock$)'; then
+    exit 0
+fi
+
+echo "pre-commit: Rust sources changed — rebuilding go/muxl.wasm…"
+if ! just build-go-wasm; then
+    cat >&2 <<'MSG'
+✗ pre-commit: failed to rebuild go/muxl.wasm.
+  Needs clang + the wasm32-wasip1 target. Options:
+    - install them and re-commit, or
+    - build in the container: just build-wasi-sign  (then re-stage go/muxl.wasm)
+  To commit without rebuilding: MUXL_SKIP_WASM_HOOK=1 git commit …
+MSG
+    exit 1
+fi
+git add go/muxl.wasm
+echo "pre-commit: go/muxl.wasm rebuilt and staged."

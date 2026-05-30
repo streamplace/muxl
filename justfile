@@ -190,3 +190,42 @@ build-go-wasm:
 clean:
     cargo clean
     rm -rf samples/fixtures/
+
+# Install the repo's git hooks (run once per clone): pre-commit keeps go/muxl.wasm in sync.
+install-hooks:
+    git config core.hooksPath .githooks
+    @echo "Installed .githooks — pre-commit rebuilds go/muxl.wasm when Rust/Cargo files change."
+
+# Cut a release: bump versions, rebuild+commit go/muxl.wasm, tag Rust + Go in lockstep, push. e.g. `just release patch`
+release level:
+    #!/usr/bin/env bash
+    # Bumps muxl-core + muxl together (shared-version in release.toml). crates.io
+    # publishing is off (git deps) — this is bump + tag + push only. LEVEL is a
+    # cargo-release bump (patch|minor|major|rc|…) or an exact version like 0.2.0.
+    set -euo pipefail
+    if [ -n "$(git status --porcelain)" ]; then
+        echo "✗ working tree not clean — commit or stash first." >&2
+        exit 1
+    fi
+    branch="$(git rev-parse --abbrev-ref HEAD)"
+    # Bump both crates' versions (no commit/tag yet — we drive those below).
+    cargo release version "{{level}}" --execute --no-confirm
+    new="$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name=="muxl") | .version')"
+    echo
+    read -r -p "Release v$new from '$branch' and push to origin? [y/N] " ans
+    if [ "$ans" != "y" ] && [ "$ans" != "Y" ]; then
+        git checkout -- .
+        echo "aborted; version bump reverted."
+        exit 1
+    fi
+    # Rebuild the embedded wasm against the bumped version so the release commit
+    # ships a matching go/muxl.wasm. (Skip the pre-commit hook below — we just
+    # built it, no need to build twice.)
+    just build-go-wasm
+    git add -A
+    MUXL_SKIP_WASM_HOOK=1 git commit -m "release: v$new"
+    # Tag the Rust workspace and the Go submodule in lockstep at this commit.
+    git tag -a "v$new" -m "v$new"
+    git tag -a "go/v$new" -m "go/v$new"
+    git push origin "$branch" "v$new" "go/v$new"
+    echo "✓ released v$new — Rust tag v$new, Go tag go/v$new (pushed to origin/$branch)."

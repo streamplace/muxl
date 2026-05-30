@@ -1,0 +1,16 @@
+# cargo-release configuration.
+#
+# crates.io publishing is intentionally OFF: both crates depend on git-only
+# crates (mp4-atom, c2pa-rs), which `cargo publish` rejects. A release here is
+# a version bump + commit + tag. The Go module
+# (github.com/streamplace/muxl/go) is tagged in lockstep as `go/vX.Y.Z` —
+# see the `release` recipe in the justfile, which drives this.
+publish = false
+
+# muxl-core (library) and muxl (CLI) move together: one shared version, one tag.
+shared-version = true
+tag-name = "v{{version}}"
+
+# The justfile recipe handles commit/tag/push explicitly (so it can fold in the
+# freshly-built go/muxl.wasm and the go/ tag); cargo-release is used only for
+# the workspace-aware version bump via `cargo release version`.

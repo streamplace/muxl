@@ -112,8 +112,18 @@ func (e *WASMEngine) Close(ctx context.Context) error {
 }
 
 // SegmentEvents implements [Engine].
-func (e *WASMEngine) SegmentEvents(ctx context.Context, input io.Reader, events chan<- *Event) error {
-	return e.runWith(ctx, []string{"muxl", "segment", "-", "--stdout"}, nil, false, input, nil, nil, nil, nil, nil, events)
+func (e *WASMEngine) SegmentEvents(ctx context.Context, input io.Reader, events chan<- *Event, opts ...SegmentEventsOption) error {
+	var cfg segmentEventsConfig
+	for _, opt := range opts {
+		opt(&cfg)
+	}
+	args := []string{"muxl", "segment", "-", "--stdout"}
+	// Track remaps are deterministic given the map; sort by source id so the
+	// CLI args (and any logging) are stable.
+	for _, src := range sortedU32Keys(cfg.trackRemap) {
+		args = append(args, "--remap-track", fmt.Sprintf("%d:%d", src, cfg.trackRemap[src]))
+	}
+	return e.runWith(ctx, args, nil, false, input, nil, nil, nil, nil, nil, events)
 }
 
 // UnwrapEvents implements [Engine].

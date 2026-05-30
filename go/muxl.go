@@ -31,7 +31,8 @@ import (
 type Engine interface {
 	// SegmentEvents segments an fMP4 stream into per-GoP canonical MUXL
 	// events — one init event then one segment event per GoP — unsigned.
-	SegmentEvents(ctx context.Context, input io.Reader, events chan<- *Event) error
+	// Options (e.g. [WithSegmentTrackRemap]) tune the output.
+	SegmentEvents(ctx context.Context, input io.Reader, events chan<- *Event, opts ...SegmentEventsOption) error
 
 	// Canonicalize converts a flat or fragmented MP4 into a canonical MUXL
 	// fMP4. Unlike SegmentEvents it accepts a faststart (flat) MP4 — handy for
@@ -99,6 +100,22 @@ type canonicalizeConfig struct {
 // left as-is.
 func WithTrackRemap(remap map[uint32]uint32) CanonicalizeOption {
 	return func(c *canonicalizeConfig) { c.trackRemap = remap }
+}
+
+// SegmentEventsOption configures [Engine.SegmentEvents].
+type SegmentEventsOption func(*segmentEventsConfig)
+
+type segmentEventsConfig struct {
+	trackRemap map[uint32]uint32
+}
+
+// WithSegmentTrackRemap relabels track IDs while segmenting: each source id
+// (key) is minted at a new id (value) in the emitted catalog and every moof.
+// Same semantics as [WithTrackRemap], applied in the streaming segmenter — so
+// a transcoded rendition lands at a collision-free id without a second
+// canonicalize pass. Source ids absent from the map are left as-is.
+func WithSegmentTrackRemap(remap map[uint32]uint32) SegmentEventsOption {
+	return func(c *segmentEventsConfig) { c.trackRemap = remap }
 }
 
 // SignerInput is the signing bundle for [Engine.SignSegment]. Exactly one of

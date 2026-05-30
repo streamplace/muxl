@@ -283,6 +283,9 @@ pub struct FMP4Reader<R> {
     reader: R,
     moov: Moov,
     catalog: Catalog,
+    /// Track-id remap (input id → output id) applied to the catalog and the
+    /// minted fragments. Empty = identity.
+    remap: std::collections::BTreeMap<u32, u32>,
     track_state: std::collections::HashMap<u32, TrackProgress>,
     /// Buffered frames from the current moof+mdat pair (may contain
     /// multiple frames from multiple tracks).
@@ -291,13 +294,26 @@ pub struct FMP4Reader<R> {
 
 impl<R: Read> FMP4Reader<R> {
     /// Create a new FMP4Reader, reading the init segment (ftyp+moov).
-    pub fn new(mut reader: R) -> Result<Self> {
+    pub fn new(reader: R) -> Result<Self> {
+        Self::with_remap(reader, std::collections::BTreeMap::new())
+    }
+
+    /// Like [`FMP4Reader::new`], but relabels track ids: the catalog and every
+    /// minted fragment are rewritten per `remap` (input id → output id).
+    pub fn with_remap(
+        mut reader: R,
+        remap: std::collections::BTreeMap<u32, u32>,
+    ) -> Result<Self> {
         let moov = read_moov_streaming(&mut reader)?;
-        let catalog = catalog_from_moov(&moov)?;
+        let mut catalog = catalog_from_moov(&moov)?;
+        if !remap.is_empty() {
+            catalog.remap_track_ids(&remap);
+        }
         Ok(FMP4Reader {
             reader,
             moov,
             catalog,
+            remap,
             track_state: std::collections::HashMap::new(),
             pending: Vec::new(),
         })
@@ -350,6 +366,7 @@ impl<R: Read> FMP4Reader<R> {
                     &moof,
                     moof_box_size,
                     &mdat_data,
+                    &self.remap,
                     &mut self.track_state,
                     &mut |frame| {
                         self.pending.push(frame);
@@ -424,6 +441,10 @@ pub(crate) fn process_moof_mdat(
     moof: &Moof,
     moof_box_size: usize,
     mdat_data: &[u8],
+    // Optional track-id remap applied to the minted fragments: the input
+    // `tfhd.track_id` (used for trex lookup + per-track state) is kept, but the
+    // minted moof and the emitted `Frame` carry the remapped id. Empty = identity.
+    remap: &std::collections::BTreeMap<u32, u32>,
     track_state: &mut std::collections::HashMap<u32, TrackProgress>,
     on_frame: &mut impl FnMut(Frame) -> Result<()>,
 ) -> Result<()> {
@@ -434,6 +455,9 @@ pub(crate) fn process_moof_mdat(
 
     for traf in &moof.traf {
         let track_id = traf.tfhd.track_id;
+        // Output id: remapped if requested, else unchanged. trex defaults and
+        // per-track progress stay keyed by the original (input) id.
+        let out_tid = remap.get(&track_id).copied().unwrap_or(track_id);
         let trex = trex_defaults(moov, track_id);
 
         let progress = track_state.entry(track_id).or_default();
@@ -479,7 +503,7 @@ pub(crate) fn process_moof_mdat(
                 let mut frag_buf = Vec::new();
                 write_frame_fragment(
                     &mut frag_buf,
-                    track_id,
+                    out_tid,
                     progress,
                     &frame,
                     sample_data,
@@ -491,7 +515,7 @@ pub(crate) fn process_moof_mdat(
                     .saturating_sub(frame.size);
 
                 on_frame(Frame {
-                    track_id,
+                    track_id: out_tid,
                     is_sync: frame.is_sync,
                     duration: frame.duration,
                     size: frame.size,

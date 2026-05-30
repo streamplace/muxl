@@ -96,6 +96,12 @@ pub struct SegmentArgs {
     /// Stream segments to stdout as framed CBOR events.
     #[arg(long)]
     pub stdout: bool,
+    /// Relabel a track id in the output, given as `OLD:NEW` (repeatable). The
+    /// emitted catalog and every minted fragment are minted at the new id —
+    /// e.g. to give a transcoded rendition a free id so it concatenates
+    /// alongside the tracks it derives from without colliding.
+    #[arg(long = "remap-track", value_name = "OLD:NEW", value_parser = parse_remap_pair)]
+    pub remap_track: Vec<(u32, u32)>,
 }
 
 #[derive(Args)]
@@ -250,23 +256,28 @@ pub fn cmd_segment(args: SegmentArgs) -> crate::Result<()> {
     } else {
         Box::new(fs::File::open(&args.input)?)
     };
+    let remap: std::collections::BTreeMap<u32, u32> = args.remap_track.into_iter().collect();
 
     if let Some(dir) = args.dir {
-        cmd_segment_dir(&mut input, &dir)
+        cmd_segment_dir(&mut input, &dir, remap)
     } else if let Some(file) = args.fmp4 {
-        cmd_segment_fmp4(&mut input, &file)
+        cmd_segment_fmp4(&mut input, &file, remap)
     } else if args.stdout {
-        cmd_segment_stdout(&mut input)
+        cmd_segment_stdout(&mut input, remap)
     } else {
         // clap's ArgGroup guarantees one mode is set; unreachable in practice.
         unreachable!("segment requires --dir, --fmp4, or --stdout")
     }
 }
 
-fn cmd_segment_dir(input: &mut impl Read, output_dir: &Path) -> crate::Result<()> {
+fn cmd_segment_dir(
+    input: &mut impl Read,
+    output_dir: &Path,
+    remap: std::collections::BTreeMap<u32, u32>,
+) -> crate::Result<()> {
     fs::create_dir_all(output_dir)?;
 
-    let catalog = crate::segment_fmp4(input, |gop| {
+    let catalog = crate::segment_fmp4_with_remap(input, remap, |gop| {
         for (&track_id, data) in &gop.tracks {
             let track_dir = output_dir.join(format!("track{}", track_id));
             fs::create_dir_all(&track_dir)?;
@@ -296,10 +307,13 @@ fn cmd_segment_dir(input: &mut impl Read, output_dir: &Path) -> crate::Result<()
 ///   {"type": "segment", "number": <uint>, "data": <bstr>}
 ///
 /// Uses the push-based segmenter so init is emitted first (before segments).
-fn cmd_segment_stdout(input: &mut impl Read) -> crate::Result<()> {
+fn cmd_segment_stdout(
+    input: &mut impl Read,
+    remap: std::collections::BTreeMap<u32, u32>,
+) -> crate::Result<()> {
     let mut stdout = io::stdout().lock();
     let mut buf = [0u8; 64 * 1024];
-    let mut segmenter = crate::Segmenter::new();
+    let mut segmenter = crate::Segmenter::with_remap(remap);
 
     loop {
         let n = input.read(&mut buf)?;
@@ -522,10 +536,14 @@ pub fn cmd_cid(args: CidArgs) -> crate::Result<()> {
 }
 
 
-fn cmd_segment_fmp4(input: &mut impl Read, output_path: &Path) -> crate::Result<()> {
+fn cmd_segment_fmp4(
+    input: &mut impl Read,
+    output_path: &Path,
+    remap: std::collections::BTreeMap<u32, u32>,
+) -> crate::Result<()> {
     let mut gops = Vec::new();
 
-    let catalog = crate::segment_fmp4(input, |gop| {
+    let catalog = crate::segment_fmp4_with_remap(input, remap, |gop| {
         let total: usize = gop.tracks.values().map(|d| d.len()).sum();
         eprintln!(
             "segment {:4}: {} tracks, {} bytes",

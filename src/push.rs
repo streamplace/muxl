@@ -53,6 +53,9 @@ pub enum SegmenterEvent {
 pub struct Segmenter {
     buffer: Vec<u8>,
     state: State,
+    /// Track-id remap (input id → output id) applied to the catalog and the
+    /// minted fragments. Empty = identity.
+    remap: BTreeMap<u32, u32>,
 }
 
 enum State {
@@ -81,6 +84,8 @@ struct StreamingState {
     seen_first_keyframe: bool,
     /// A parsed moof waiting for its following mdat.
     pending_moof: Option<PendingMoof>,
+    /// Track-id remap (input id → output id), copied from the Segmenter.
+    remap: BTreeMap<u32, u32>,
 }
 
 struct PendingMoof {
@@ -92,9 +97,16 @@ struct PendingMoof {
 impl Segmenter {
     /// Create a new segmenter ready to receive fMP4 data.
     pub fn new() -> Self {
+        Self::with_remap(BTreeMap::new())
+    }
+
+    /// Like [`Segmenter::new`], but relabels track ids: the emitted catalog and
+    /// every minted fragment are rewritten per `remap` (input id → output id).
+    pub fn with_remap(remap: BTreeMap<u32, u32>) -> Self {
         Segmenter {
             buffer: Vec::new(),
             state: State::WaitingForInit,
+            remap,
         }
     }
 
@@ -130,7 +142,10 @@ impl Segmenter {
                             .map_err(mp4_err)?
                             .ok_or_else(|| Error::InvalidMp4("empty moov header".into()))?;
                         let moov = Moov::read_atom(&header, &mut cursor).map_err(mp4_err)?;
-                        let catalog = catalog_from_moov(&moov)?;
+                        let mut catalog = catalog_from_moov(&moov)?;
+                        if !self.remap.is_empty() {
+                            catalog.remap_track_ids(&self.remap);
+                        }
                         let init_data = build_init_segment(&catalog)?;
 
                         let video_track_ids: HashSet<u32> =
@@ -163,6 +178,7 @@ impl Segmenter {
                             segment_number: 0,
                             seen_first_keyframe: false,
                             pending_moof: None,
+                            remap: self.remap.clone(),
                         });
                     }
                     // Skip ftyp, free, etc.
@@ -195,6 +211,7 @@ impl Segmenter {
                                 &pending.moof,
                                 pending.box_size,
                                 mdat_payload,
+                                &ss.remap,
                                 &mut ss.track_state,
                                 &mut |frame| {
                                     frames.push(frame);

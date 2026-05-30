@@ -112,9 +112,20 @@ pub struct TrackSamples {
 /// Calls `on_gop` for each completed GOP segment. Returns the catalog.
 pub fn segment_fmp4<R: Read>(
     reader: &mut R,
+    on_gop: impl FnMut(GopSegment) -> Result<()>,
+) -> Result<Catalog> {
+    segment_fmp4_with_remap(reader, BTreeMap::new(), on_gop)
+}
+
+/// Like [`segment_fmp4`], but relabels track ids per `remap` (input id →
+/// output id): the returned catalog and every emitted segment carry the new
+/// ids. An empty map is the identity.
+pub fn segment_fmp4_with_remap<R: Read>(
+    reader: &mut R,
+    remap: BTreeMap<u32, u32>,
     mut on_gop: impl FnMut(GopSegment) -> Result<()>,
 ) -> Result<Catalog> {
-    let mut fmp4 = FMP4Reader::new(reader)?;
+    let mut fmp4 = FMP4Reader::with_remap(reader, remap)?;
     let catalog = fmp4.catalog().clone();
 
     // Determine which track IDs are video (for keyframe detection)
@@ -512,6 +523,61 @@ mod tests {
             }
         }
         assert!(saw_remapped_moof, "expected at least one moof at the remapped audio id {new_tid}");
+    }
+
+    #[test]
+    fn segment_with_remap_relabels_catalog_and_moofs() {
+        // The streaming-segmenter equivalent of the fmp4 remap: segment a
+        // canonical fMP4 with the audio track relabeled to a free id, and
+        // confirm the emitted catalog, the per-segment keying, and the minted
+        // moofs all carry the new id. This is what Streamplace's transcode
+        // Pass 1 uses to land the transcoded audio at a collision-free id.
+        let flat = read_fixture("h264-opus-frag.mp4");
+        let source = crate::read(&flat).unwrap();
+        let mut fmp4 = Vec::new();
+        crate::fmp4::write(&source, &flat, &mut fmp4).unwrap();
+
+        let audio_tid = source.catalog.audio_configs().next().unwrap().track_id();
+        let new_tid = 7u32;
+        let map: BTreeMap<u32, u32> = [(audio_tid, new_tid)].into_iter().collect();
+
+        let mut new_tid_buf: Vec<u8> = Vec::new();
+        let mut seg_track_ids: std::collections::BTreeSet<u32> = Default::default();
+        let cat = crate::segment_fmp4_with_remap(&mut Cursor::new(&fmp4), map, |gop| {
+            for (tid, data) in &gop.tracks {
+                seg_track_ids.insert(*tid);
+                if *tid == new_tid && new_tid_buf.is_empty() {
+                    new_tid_buf = data.clone();
+                }
+            }
+            Ok(())
+        })
+        .unwrap();
+
+        let audio_ids: Vec<u32> = cat.audio_configs().map(|a| a.track_id()).collect();
+        assert!(audio_ids.contains(&new_tid), "audio remapped to {new_tid}, got {audio_ids:?}");
+        assert!(!audio_ids.contains(&audio_tid), "old audio id {audio_tid} must be gone");
+        assert!(seg_track_ids.contains(&new_tid), "segment tracks: {seg_track_ids:?}");
+        assert!(!seg_track_ids.contains(&audio_tid), "old id leaked into segment keys: {seg_track_ids:?}");
+
+        // The minted moofs in the remapped track carry the new id.
+        use mp4_atom::{Atom, Header, Moof, ReadAtom, ReadFrom};
+        assert!(!new_tid_buf.is_empty(), "expected a segment for the remapped track");
+        let mut cursor = Cursor::new(&new_tid_buf);
+        let mut saw_moof = false;
+        while cursor.position() < new_tid_buf.len() as u64 {
+            let Ok(Some(h)) = <Option<Header> as ReadFrom>::read_from(&mut cursor) else { break };
+            if h.kind == Moof::KIND {
+                let moof = Moof::read_atom(&h, &mut cursor).unwrap();
+                for traf in &moof.traf {
+                    assert_eq!(traf.tfhd.track_id, new_tid, "moof must carry the remapped id");
+                }
+                saw_moof = true;
+            } else {
+                cursor.set_position(cursor.position() + h.size.unwrap_or(0) as u64);
+            }
+        }
+        assert!(saw_moof, "expected at least one moof in the remapped track's segment");
     }
 
     #[test]

@@ -1618,27 +1618,25 @@ mod tests {
     /// build_synth_flat_header should produce a moov whose co64 entries
     /// land on real sample bytes when the synth header is concatenated
     /// with the per-segment bodies. This exercises the full pipeline:
-    /// concat → SegmentMetadata → synth header → assembled flat MP4.
+    /// segment → SegmentMetadata → synth header → assembled flat MP4.
     /// We then re-parse the synth flat MP4 and verify the moov's
     /// per-sample sizes match what's at each co64 offset.
     #[test]
     fn synth_flat_header_co64_points_at_sample_bytes() {
-        use crate::concat::Concatenator;
-        use crate::push::SegmenterEvent;
+        use crate::push::{Segmenter, SegmenterEvent};
         use crate::segment::TrackSamples;
         use std::collections::BTreeMap;
 
-        // Build a flat MP4 fixture and feed it through concat to get the
-        // segment events we'd see in production.
+        // Build a canonical fMP4 fixture and segment it to get the segment
+        // events we'd see in production.
         let data = std::fs::read(fixture_path("h264-opus-frag.mp4")).unwrap();
         let source = crate::read(&data[..]).unwrap();
-        let mut flat_mp4 = Vec::new();
-        write_flat_mp4(&source.catalog, &source.plan.tracks, &data[..], &mut flat_mp4)
-            .unwrap();
+        let mut fmp4 = Vec::new();
+        crate::fmp4::write(&source, &data[..], &mut fmp4).unwrap();
 
-        let mut concat = Concatenator::new();
-        let mut events = concat.feed(&flat_mp4).unwrap();
-        events.extend(concat.flush().unwrap());
+        let mut segmenter = Segmenter::new();
+        let mut events = segmenter.feed(&fmp4).unwrap();
+        events.extend(segmenter.flush().unwrap());
 
         // Extract catalog + collect SegmentMetadata + segment bodies.
         let catalog = events

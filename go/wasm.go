@@ -121,11 +121,6 @@ func (e *WASMEngine) UnwrapEvents(ctx context.Context, input io.Reader, events c
 	return e.runWith(ctx, []string{"muxl", "unwrap", "--events", "-"}, nil, false, input, nil, nil, nil, nil, nil, events)
 }
 
-// ConcatEvents implements [Engine].
-func (e *WASMEngine) ConcatEvents(ctx context.Context, input io.Reader, init, seg chan<- []byte, events chan<- *Event) error {
-	return e.runWith(ctx, []string{"muxl", "concat"}, nil, false, input, nil, nil, nil, init, seg, events)
-}
-
 // Verify implements [Engine].
 func (e *WASMEngine) Verify(ctx context.Context, input io.Reader) (string, error) {
 	var out bytes.Buffer

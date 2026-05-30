@@ -6,11 +6,10 @@ import (
 )
 
 // Concatenator is a push-style wrapper over an [Engine]: write whole fMP4
-// archives, receive processed output on channels. It drives either
-// [Engine.ConcatEvents] (dedup/concatenate) or [Engine.SignSegment]
-// (segment + S2PA-sign), depending on the constructor.
+// archives, receive processed output on channels. It drives
+// [Engine.SignSegment] (segment + S2PA-sign each canonical segment).
 //
-//	c := muxl.NewConcatenator(ctx, eng)
+//	c := muxl.NewSigningSegmenter(ctx, eng, in)
 //	go func() { c.Write(archive); c.Close() }()
 //	initSeg := <-c.InitCh
 //	for seg := range c.SegCh { /* append to output */ }
@@ -24,15 +23,6 @@ type Concatenator struct {
 	SegCh   chan []byte
 	EventCh chan *Event
 	done    chan error
-}
-
-// NewConcatenator starts an [Engine.ConcatEvents] pipeline in the background:
-// init segments are emitted only when they change, segment bodies without
-// their init header, suitable for concatenation into one fMP4 stream.
-func NewConcatenator(ctx context.Context, eng Engine) *Concatenator {
-	return newConcatenator(func(c *Concatenator, r io.Reader) error {
-		return eng.ConcatEvents(ctx, r, c.InitCh, c.SegCh, c.EventCh)
-	})
 }
 
 // NewSigningSegmenter starts an [Engine.SignSegment] pipeline in the

@@ -3,7 +3,6 @@
 pub mod catalog;
 pub mod cbor;
 pub mod cid;
-pub mod concat;
 mod error;
 pub mod flat;
 pub mod fmp4;
@@ -23,7 +22,6 @@ mod wasm_io;
 
 pub use error::{Error, Result};
 pub use source::{Plan, Sample, Source, TrackPlan};
-pub use concat::Concatenator;
 pub use push::{Segmenter, SegmenterEvent};
 pub use segment::{GopSegment, Segment, segment_fmp4};
 

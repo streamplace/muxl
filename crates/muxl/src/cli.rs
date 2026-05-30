@@ -1,7 +1,7 @@
 //! CLI entry point for the `muxl` binary — the single MUXL command-line tool.
 //!
 //! It bundles every muxing subcommand (catalog, fmp4, mp4, segment, wrap,
-//! unwrap, cid, concat, hls), reusing the building blocks from [`muxl::cli`],
+//! unwrap, cid, hls), reusing the building blocks from [`muxl::cli`],
 //! alongside the sign-specific subcommands (sign-segment, sign-transcode,
 //! verify, inspect, gen-key, gen-cert, …). The binary lives in this crate
 //! rather than the core `muxl` crate because signing pulls in c2pa; keeping it
@@ -87,8 +87,6 @@ enum Command {
     Unwrap(muxl_cli::UnwrapArgs),
     /// Print the BDASL CID of a whole file, or of each canonical segment.
     Cid(muxl_cli::CidArgs),
-    /// Concatenate MUXL fMP4 files from stdin, emit CBOR events to stdout.
-    Concat,
     /// Generate HLS playback artifacts (CID-addressed blobs + optional playlists).
     Hls(muxl_cli::HlsArgs),
 }
@@ -331,7 +329,6 @@ pub fn cli_main() {
         Command::Wrap(args) => muxl_cli::cmd_wrap(args).map_err(Into::into),
         Command::Unwrap(args) => muxl_cli::cmd_unwrap(args).map_err(Into::into),
         Command::Cid(args) => muxl_cli::cmd_cid(args).map_err(Into::into),
-        Command::Concat => muxl_cli::cmd_concat().map_err(Into::into),
         Command::Hls(args) => muxl_cli::cmd_hls(args).map_err(Into::into),
     };
     if let Err(e) = result {

@@ -338,32 +338,6 @@ fn write_cbor_event(w: &mut impl io::Write, event: &crate::SegmenterEvent) -> cr
     Ok(())
 }
 
-/// Concatenate MUXL fMP4 files from stdin, emit CBOR events to stdout.
-///
-/// Reads concatenated MUXL fMP4s from stdin. Emits init events only
-/// when the catalog changes between fMP4 files. UUID atoms delimit segments
-/// and are passed through in the segment data.
-pub fn cmd_concat() -> crate::Result<()> {
-    let mut stdin = io::stdin().lock();
-    let mut stdout = io::stdout().lock();
-    let mut buf = [0u8; 64 * 1024];
-    let mut concat = crate::Concatenator::new();
-
-    loop {
-        let n = stdin.read(&mut buf)?;
-        if n == 0 {
-            break;
-        }
-        for event in concat.feed(&buf[..n])? {
-            write_cbor_event(&mut stdout, &event)?;
-        }
-    }
-    for event in concat.flush()? {
-        write_cbor_event(&mut stdout, &event)?;
-    }
-    Ok(())
-}
-
 pub fn cmd_hls(args: HlsArgs) -> crate::Result<()> {
     let HlsArgs {
         input,

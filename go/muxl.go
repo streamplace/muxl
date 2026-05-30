@@ -44,12 +44,6 @@ type Engine interface {
 	// and any C2PA/S2PA signature over them — are preserved verbatim.
 	UnwrapEvents(ctx context.Context, input io.Reader, events chan<- *Event) error
 
-	// ConcatEvents concatenates MUXL fMP4 archives (init+segments) into one
-	// deduplicated fMP4 stream: init segments on init (only when they
-	// change), segment bodies on seg, and the full decoded *Event on events.
-	// Any of the three channels may be nil.
-	ConcatEvents(ctx context.Context, input io.Reader, init, seg chan<- []byte, events chan<- *Event) error
-
 	// SignSegment segments an fMP4 stream and S2PA-signs each canonical
 	// segment in place. Bytes routed to seg are the signed
 	// [c2pa-uuid][muxl-uuid][moof][mdat] per track; events carries the full

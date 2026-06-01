@@ -83,9 +83,11 @@ fn parse_remap_pair(s: &str) -> std::result::Result<(u32, u32), String> {
 }
 
 #[derive(Args)]
-#[command(group(ArgGroup::new("mode").required(true).args(["dir", "fmp4", "stdout"])))]
+#[command(group(ArgGroup::new("mode").required(true).args(["dir", "fmp4", "stdout", "flat"])))]
 pub struct SegmentArgs {
-    /// Input fMP4 file, or "-" for stdin.
+    /// Input MP4. The streaming modes (--dir/--fmp4/--stdout) need a
+    /// fragmented (fMP4) stream; --flat reads with random access and so also
+    /// accepts a flat (faststart) MP4. "-" is stdin (slurped for --flat).
     pub input: String,
     /// Write segments into this directory (one file per segment).
     #[arg(long, value_name = "DIR")]
@@ -96,6 +98,11 @@ pub struct SegmentArgs {
     /// Stream segments to stdout as framed CBOR events.
     #[arg(long)]
     pub stdout: bool,
+    /// Canonicalize the whole input into a single flat (faststart) MP4 at this
+    /// path ("-" for stdout). Reads with random access, so it accepts a flat
+    /// or fragmented input — the one-shot "any MP4 → canonical flat MP4" path.
+    #[arg(long, value_name = "FILE")]
+    pub flat: Option<PathBuf>,
     /// Relabel a track id in the output, given as `OLD:NEW` (repeatable). The
     /// emitted catalog and every minted fragment are minted at the new id —
     /// e.g. to give a transcoded rendition a free id so it concatenates
@@ -251,12 +258,20 @@ pub fn cmd_fmp4(args: Fmp4Args) -> crate::Result<()> {
 }
 
 pub fn cmd_segment(args: SegmentArgs) -> crate::Result<()> {
+    let remap: std::collections::BTreeMap<u32, u32> = args.remap_track.into_iter().collect();
+
+    // Flat output needs the full sample plan, so it reads with random access
+    // (and thus also accepts a flat-MP4 input). The streaming modes below take
+    // a plain Read — fragmented input only.
+    if let Some(flat_out) = args.flat {
+        return cmd_segment_flat(&args.input, &flat_out, remap);
+    }
+
     let mut input: Box<dyn Read> = if args.input == "-" {
         Box::new(io::stdin().lock())
     } else {
         Box::new(fs::File::open(&args.input)?)
     };
-    let remap: std::collections::BTreeMap<u32, u32> = args.remap_track.into_iter().collect();
 
     if let Some(dir) = args.dir {
         cmd_segment_dir(&mut input, &dir, remap)
@@ -266,8 +281,52 @@ pub fn cmd_segment(args: SegmentArgs) -> crate::Result<()> {
         cmd_segment_stdout(&mut input, remap)
     } else {
         // clap's ArgGroup guarantees one mode is set; unreachable in practice.
-        unreachable!("segment requires --dir, --fmp4, or --stdout")
+        unreachable!("segment requires --dir, --fmp4, --stdout, or --flat")
     }
+}
+
+/// Canonicalize an arbitrary MP4 (flat or fragmented) into a single flat
+/// (faststart) MP4. Unlike the streaming modes, this reads with random access:
+/// `crate::read` builds the full sample plan in one pass, then `flat::write`
+/// mints the canonical flat output, streaming sample bytes on demand. That
+/// random-access read is what lets it accept a flat input. "-" reads stdin
+/// (slurped into memory) / writes stdout.
+fn cmd_segment_flat(
+    input: &str,
+    output: &Path,
+    remap: std::collections::BTreeMap<u32, u32>,
+) -> crate::Result<()> {
+    let mut out: Box<dyn Write> = if output.as_os_str() == "-" {
+        Box::new(BufWriter::new(io::stdout().lock()))
+    } else {
+        Box::new(BufWriter::new(fs::File::create(output)?))
+    };
+
+    // pread(2) isn't available on stdin (nor on wasm), so "-" slurps into the
+    // in-memory ReadAt impl; a real path uses FileReadAt directly.
+    let info = if input == "-" {
+        let mut bytes = Vec::new();
+        io::stdin().lock().read_to_end(&mut bytes)?;
+        let mut source = crate::read(&bytes)?;
+        if !remap.is_empty() {
+            source.remap_track_ids(&remap);
+        }
+        let info = crate::flat::write(&source, &bytes, &mut out)?;
+        out.flush()?;
+        info
+    } else {
+        let reader = crate::io::FileReadAt::open(Path::new(input))?;
+        let mut source = crate::read(&reader)?;
+        if !remap.is_empty() {
+            source.remap_track_ids(&remap);
+        }
+        let info = crate::flat::write(&source, &reader, &mut out)?;
+        out.flush()?;
+        info
+    };
+
+    eprintln!("flat MP4: {} bytes ({} tracks)", info.total_bytes, info.tracks.len());
+    Ok(())
 }
 
 fn cmd_segment_dir(

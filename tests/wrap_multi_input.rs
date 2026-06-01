@@ -10,7 +10,7 @@
 use std::io::Cursor;
 use std::path::{Path, PathBuf};
 
-use muxl::cli::{cmd_wrap, WrapArgs, WrapFormat};
+use muxl::cli::{cmd_segment, cmd_wrap, SegmentArgs, WrapArgs, WrapFormat};
 use muxl::io::FileReadAt;
 
 fn fixture_path(name: &str) -> PathBuf {
@@ -164,4 +164,31 @@ fn wrap_multi_input_equals_wrapping_the_whole_fmp4() {
             "wrapping the per-track .m4s files must match wrapping the whole fMP4 ({format:?})"
         );
     }
+}
+
+/// `segment --flat` must accept a flat (faststart) MP4 — which the streaming
+/// modes can't — and emit a round-trippable MUXL flat (segments recoverable).
+#[test]
+fn segment_flat_accepts_flat_input_and_roundtrips() {
+    let dir = tempfile::tempdir().unwrap();
+    let out = dir.path().join("flat.mp4");
+    cmd_segment(SegmentArgs {
+        input: fixture_path("h264-aac.mp4").to_str().unwrap().to_string(),
+        dir: None,
+        fmp4: None,
+        stdout: false,
+        flat: Some(out.clone()),
+        remap_track: vec![],
+    })
+    .unwrap();
+
+    // The output is a MUXL flat: unwrap recovers the canonical segments.
+    let bytes = std::fs::read(&out).unwrap();
+    let segs = muxl::reader::unwrap(&bytes).unwrap();
+    assert!(
+        !segs.is_empty(),
+        "segment --flat output should unwrap to canonical segments"
+    );
+    let tracks: std::collections::BTreeSet<u32> = segs.iter().map(|s| s.track_id).collect();
+    assert!(tracks.len() >= 2, "expected video + audio tracks, got {tracks:?}");
 }

@@ -6,7 +6,7 @@
 //! any arg-parsing code:
 //!
 //! - One named `*Args` struct per subcommand (e.g. [`CatalogArgs`],
-//!   [`Fmp4Args`]).
+//!   [`SegmentArgs`]).
 //! - One public `cmd_*` handler per subcommand.
 
 use std::fs;
@@ -44,26 +44,6 @@ pub struct CatalogArgs {
     /// Machine-readable output format. Omit for a human-readable summary.
     #[arg(long, value_enum)]
     pub format: Option<CatalogFormat>,
-}
-
-#[derive(Args)]
-pub struct Fmp4Args {
-    /// Input MP4 file (flat or fragmented).
-    pub input: PathBuf,
-    /// Output fMP4 path.
-    pub output: PathBuf,
-    /// Write only the canonical ftyp+moov init segment (no fragments).
-    /// The input's fragment data is not touched.
-    #[arg(long)]
-    pub init_only: bool,
-    /// Remap a track id in the output, given as `OLD:NEW` (repeatable). The
-    /// rewrite applies to both the moov and every minted moof, so the
-    /// canonical bytes are minted at the chosen id. Used to give a freshly
-    /// canonicalized single-track segment (e.g. a transcoded rendition) a
-    /// free id so it can be concatenated alongside the tracks it derives
-    /// from without colliding.
-    #[arg(long = "remap-track", value_name = "OLD:NEW", value_parser = parse_remap_pair)]
-    pub remap_track: Vec<(u32, u32)>,
 }
 
 /// Parse a `OLD:NEW` track-id remap pair for `--remap-track`.
@@ -223,40 +203,6 @@ pub fn cmd_catalog(args: CatalogArgs) -> crate::Result<()> {
     }
 
     let _ = input;
-    Ok(())
-}
-
-pub fn cmd_fmp4(args: Fmp4Args) -> crate::Result<()> {
-    let Fmp4Args {
-        input,
-        output,
-        init_only,
-        remap_track,
-    } = args;
-    let remap: std::collections::BTreeMap<u32, u32> = remap_track.into_iter().collect();
-    let input_reader = crate::io::FileReadAt::open(&input)?;
-    let out_file = fs::File::create(&output)?;
-    let mut out = BufWriter::new(out_file);
-
-    if init_only {
-        // Cheap path — only needs the moov, not a full sample plan.
-        let mut catalog = crate::catalog::from_input(&input_reader)?;
-        if !remap.is_empty() {
-            catalog.remap_track_ids(&remap);
-        }
-        let init = crate::fmp4::init_segment(&catalog)?;
-        out.write_all(&init)?;
-        out.flush()?;
-        eprintln!("init segment: {} bytes", init.len());
-        return Ok(());
-    }
-
-    let mut source = crate::read(&input_reader)?;
-    if !remap.is_empty() {
-        source.remap_track_ids(&remap);
-    }
-    crate::fmp4::write(&source, &input_reader, &mut out)?;
-    out.flush()?;
     Ok(())
 }
 

@@ -1,6 +1,6 @@
 //! CLI entry point for the `muxl` binary — the single MUXL command-line tool.
 //!
-//! It bundles every muxing subcommand (catalog, fmp4, mp4, segment, wrap,
+//! It bundles every muxing subcommand (catalog, segment, wrap,
 //! unwrap, cid, hls), reusing the building blocks from [`muxl::cli`],
 //! alongside the sign-specific subcommands (sign-segment, sign-transcode,
 //! verify, inspect, gen-key, gen-cert, …). The binary lives in this crate
@@ -74,9 +74,8 @@ enum Command {
     // muxl subcommands, lifted verbatim. --------------------------------------
     /// Extract catalog (track config) from an MP4.
     Catalog(muxl_cli::CatalogArgs),
-    /// Write a canonical MUXL fMP4 (or just its init segment with --init-only).
-    Fmp4(muxl_cli::Fmp4Args),
-    /// Segment an fMP4 into per-GoP MUXL segments.
+    /// Segment an MP4 (flat or fragmented) into MUXL segments — to a directory,
+    /// a single fMP4 (--fmp4) or flat MP4 (--flat), or a CBOR event stream.
     Segment(muxl_cli::SegmentArgs),
     /// Wrap one or more MUXL wrappers into a presentation MP4 (fMP4 or flat),
     /// `tar`-style (output first, then inputs); "-" reads stdin / writes
@@ -324,7 +323,6 @@ pub fn cli_main() {
         // matching enum variant — we just rebuild the muxl Command from
         // our payload and hand it off.
         Command::Catalog(args) => muxl_cli::cmd_catalog(args).map_err(Into::into),
-        Command::Fmp4(args) => muxl_cli::cmd_fmp4(args).map_err(Into::into),
         Command::Segment(args) => muxl_cli::cmd_segment(args).map_err(Into::into),
         Command::Wrap(args) => muxl_cli::cmd_wrap(args).map_err(Into::into),
         Command::Unwrap(args) => muxl_cli::cmd_unwrap(args).map_err(Into::into),

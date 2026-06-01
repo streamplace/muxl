@@ -10,7 +10,7 @@
 use std::io::Cursor;
 use std::path::{Path, PathBuf};
 
-use muxl::cli::{cmd_fmp4, cmd_segment, cmd_wrap, Fmp4Args, SegmentArgs, WrapArgs, WrapFormat};
+use muxl::cli::{cmd_segment, cmd_wrap, SegmentArgs, WrapArgs, WrapFormat};
 use muxl::io::FileReadAt;
 
 fn fixture_path(name: &str) -> PathBuf {
@@ -249,27 +249,17 @@ fn segment_fmp4_accepts_flat_input() {
     assert!(tracks.len() >= 2, "expected video + audio tracks, got {tracks:?}");
 }
 
-/// `segment --fmp4` (file) must be byte-identical to the `fmp4` command — it
-/// subsumes it — AND to the streaming path that the stdin/live route uses. That
-/// triple equality is the contract behind retiring `fmp4`: a fragmented input
-/// mints the same canonical fMP4 whether read from a seekable file (random
-/// access) or a pipe (streaming).
+/// `segment --fmp4` from a file (random access — the path that replaced the old
+/// `fmp4` command, and that the Go `Canonicalize` binding now invokes) must be
+/// byte-identical to the streaming path the stdin/live route uses. A fragmented
+/// input mints the same canonical fMP4 whether read from a seekable file or a
+/// pipe — so the file and stdin routes can never silently diverge.
 #[test]
-fn segment_fmp4_file_matches_fmp4_command_and_streaming() {
+fn segment_fmp4_file_matches_streaming() {
     let dir = tempfile::tempdir().unwrap();
     let frag = fixture_path("h264-opus-frag.mp4");
 
-    // (a) the `fmp4` command — random-access read.
-    let via_fmp4 = dir.path().join("fmp4.fmp4");
-    cmd_fmp4(Fmp4Args {
-        input: frag.clone(),
-        output: via_fmp4.clone(),
-        init_only: false,
-        remap_track: vec![],
-    })
-    .unwrap();
-
-    // (b) `segment --fmp4` from the same file — also random-access.
+    // (a) `segment --fmp4` from a file — random-access read.
     let via_segment = dir.path().join("segment.fmp4");
     cmd_segment(SegmentArgs {
         input: frag.to_str().unwrap().to_string(),
@@ -281,7 +271,7 @@ fn segment_fmp4_file_matches_fmp4_command_and_streaming() {
     })
     .unwrap();
 
-    // (c) the streaming path — reassemble init + per-GoP segments exactly as
+    // (b) the streaming path — reassemble init + per-GoP segments exactly as
     // the stdin route (cmd_segment_fmp4_stream) does.
     let raw = std::fs::read(&frag).unwrap();
     let mut gops = Vec::new();
@@ -297,11 +287,9 @@ fn segment_fmp4_file_matches_fmp4_command_and_streaming() {
         }
     }
 
-    let a = std::fs::read(&via_fmp4).unwrap();
-    let b = std::fs::read(&via_segment).unwrap();
-    assert_eq!(a, b, "segment --fmp4 (file) must match the fmp4 command byte-for-byte");
+    let a = std::fs::read(&via_segment).unwrap();
     assert_eq!(
         a, streamed,
-        "the streaming (stdin/live) path must mint identical fMP4 bytes"
+        "segment --fmp4 (file/random-access) must mint identical fMP4 bytes to the streaming path"
     );
 }

@@ -298,11 +298,12 @@ func (e *WASMEngine) GenCert(ctx context.Context, in CertInput) ([]byte, error) 
 }
 
 // Canonicalize converts a flat or fragmented MP4 into a canonical MUXL fMP4
-// (ftyp+moov + canonical moof/mdat fragments). Unlike the streaming
-// [WASMEngine.SegmentEvents], it accepts a faststart (flat) MP4: canonical-form
-// derivation needs random access, so the bytes are staged through a temp file
-// mounted read-write into the sandbox rather than piped on stdin. This turns an
-// arbitrary transcoder output into MUXL that SegmentEvents/SignTranscode accept.
+// (ftyp+moov + canonical moof/mdat fragments) via `segment --fmp4`. Unlike the
+// streaming [WASMEngine.SegmentEvents] (`segment --stdout`), it accepts a
+// faststart (flat) MP4: canonical-form derivation needs random access, so the
+// bytes are staged through a temp file mounted read-write into the sandbox and
+// segmented from that path rather than piped on stdin. This turns an arbitrary
+// transcoder output into MUXL that SegmentEvents/SignTranscode accept.
 func (e *WASMEngine) Canonicalize(ctx context.Context, mp4 []byte, opts ...CanonicalizeOption) ([]byte, error) {
 	var cfg canonicalizeConfig
 	for _, opt := range opts {
@@ -319,7 +320,7 @@ func (e *WASMEngine) Canonicalize(ctx context.Context, mp4 []byte, opts ...Canon
 		return nil, fmt.Errorf("muxl: staging canonicalize input: %w", err)
 	}
 	fsCfg := wazero.NewFSConfig().WithDirMount(dir, "/work")
-	args := []string{"muxl", "fmp4", "/work/in.mp4", "/work/out.fmp4"}
+	args := []string{"muxl", "segment", "/work/in.mp4", "--fmp4", "/work/out.fmp4"}
 	// Track remaps are deterministic given the map; sort by source id so the
 	// CLI args (and any logging) are stable.
 	for _, src := range sortedU32Keys(cfg.trackRemap) {

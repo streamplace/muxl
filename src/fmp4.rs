@@ -70,7 +70,9 @@ pub fn init_segments_per_track(
 /// Write a `Source` as an fMP4 to `output`, streaming sample bytes from
 /// `input` (the original ReadAt the source was built from).
 ///
-/// Layout: init segment + [track 1 moof+mdat …] + [track 2 …] + ….
+/// Layout: init segment + the canonical time-sliced segment body — each GoP's
+/// moof+mdat pairs for all tracks contiguously (track_id-ascending), then the
+/// next GoP (see `flat::write_canonical_body`), NOT grouped per track.
 ///
 /// Returns per-track HLS metadata (byte ranges, codec info, init CIDs)
 /// collected during the write. HLS callers consume this directly; other

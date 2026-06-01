@@ -85,14 +85,17 @@ fn parse_remap_pair(s: &str) -> std::result::Result<(u32, u32), String> {
 #[derive(Args)]
 #[command(group(ArgGroup::new("mode").required(true).args(["dir", "fmp4", "stdout", "flat"])))]
 pub struct SegmentArgs {
-    /// Input MP4. The streaming modes (--dir/--fmp4/--stdout) need a
-    /// fragmented (fMP4) stream; --flat reads with random access and so also
-    /// accepts a flat (faststart) MP4. "-" is stdin (slurped for --flat).
+    /// Input MP4. A file path is read with random access, so --flat and --fmp4
+    /// accept a flat (faststart) *or* fragmented MP4. "-" is stdin: --flat
+    /// slurps it; --dir/--fmp4/--stdout stream it and so need a fragmented
+    /// (fMP4) stream (the live-ingest path).
     pub input: String,
     /// Write segments into this directory (one file per segment).
     #[arg(long, value_name = "DIR")]
     pub dir: Option<PathBuf>,
-    /// Emit a single MUXL fMP4 file covering the whole input.
+    /// Emit a single MUXL fMP4 file covering the whole input. From a file this
+    /// reads with random access (flat or fragmented input); from stdin ("-") it
+    /// stream-segments a fragmented pipe (live ingest). "-" writes stdout.
     #[arg(long, value_name = "FILE")]
     pub fmp4: Option<PathBuf>,
     /// Stream segments to stdout as framed CBOR events.
@@ -260,11 +263,23 @@ pub fn cmd_fmp4(args: Fmp4Args) -> crate::Result<()> {
 pub fn cmd_segment(args: SegmentArgs) -> crate::Result<()> {
     let remap: std::collections::BTreeMap<u32, u32> = args.remap_track.into_iter().collect();
 
-    // Flat output needs the full sample plan, so it reads with random access
-    // (and thus also accepts a flat-MP4 input). The streaming modes below take
-    // a plain Read — fragmented input only.
-    if let Some(flat_out) = args.flat {
-        return cmd_segment_flat(&args.input, &flat_out, remap);
+    // --flat and --fmp4 emit a single bounded presentation file. Given a
+    // seekable input they read with random access — which builds the full
+    // sample plan and so also accepts a *flat* (faststart) MP4, not just a
+    // fragmented one — while minting with constant memory. The streaming modes
+    // further down take a plain Read (fragmented input only): that's the
+    // live-ingest path, minting segments from chunks as they arrive.
+    if let Some(flat_out) = &args.flat {
+        return cmd_segment_presentation(&args.input, flat_out, remap, Presentation::Flat);
+    }
+    // A seekable --fmp4 input takes the same random-access path: byte-identical
+    // to the streaming segmenter for fragmented input, plus it handles flat.
+    // stdin can't seek, so "-" falls through to the streaming segmenter below,
+    // preserving live fMP4 minting from a pipe.
+    if let Some(fmp4_out) = &args.fmp4 {
+        if args.input != "-" {
+            return cmd_segment_presentation(&args.input, fmp4_out, remap, Presentation::Fmp4);
+        }
     }
 
     let mut input: Box<dyn Read> = if args.input == "-" {
@@ -276,7 +291,9 @@ pub fn cmd_segment(args: SegmentArgs) -> crate::Result<()> {
     if let Some(dir) = args.dir {
         cmd_segment_dir(&mut input, &dir, remap)
     } else if let Some(file) = args.fmp4 {
-        cmd_segment_fmp4(&mut input, &file, remap)
+        // Reached only for stdin (a seekable file took the random-access path
+        // above): stream-segment the fragmented pipe into one fMP4.
+        cmd_segment_fmp4_stream(&mut input, &file, remap)
     } else if args.stdout {
         cmd_segment_stdout(&mut input, remap)
     } else {
@@ -285,48 +302,94 @@ pub fn cmd_segment(args: SegmentArgs) -> crate::Result<()> {
     }
 }
 
-/// Canonicalize an arbitrary MP4 (flat or fragmented) into a single flat
-/// (faststart) MP4. Unlike the streaming modes, this reads with random access:
-/// `crate::read` builds the full sample plan in one pass, then `flat::write`
-/// mints the canonical flat output, streaming sample bytes on demand. That
-/// random-access read is what lets it accept a flat input. "-" reads stdin
-/// (slurped into memory) / writes stdout.
-fn cmd_segment_flat(
+/// Target container for the random-access "whole input → one presentation
+/// file" segment modes.
+#[derive(Clone, Copy)]
+enum Presentation {
+    /// Finalized flat (faststart) MP4 — `segment --flat`.
+    Flat,
+    /// Appendable fMP4 — `segment --fmp4` reading a seekable file.
+    Fmp4,
+}
+
+/// Canonicalize an arbitrary MP4 (flat *or* fragmented) into a single
+/// presentation file. Unlike the streaming modes (`--dir`/`--stdout`, and
+/// `--fmp4` reading stdin), this reads with random access: `crate::read` builds
+/// the full sample plan in one pass, then the writer mints the canonical output
+/// while streaming sample bytes from the input on demand (constant memory).
+/// That random-access read is what lets it accept a flat (faststart) input.
+/// "-" slurps stdin into memory / writes stdout.
+fn cmd_segment_presentation(
     input: &str,
     output: &Path,
     remap: std::collections::BTreeMap<u32, u32>,
+    fmt: Presentation,
 ) -> crate::Result<()> {
-    let mut out: Box<dyn Write> = if output.as_os_str() == "-" {
-        Box::new(BufWriter::new(io::stdout().lock()))
+    let sink: Box<dyn Write> = if output.as_os_str() == "-" {
+        Box::new(io::stdout().lock())
     } else {
-        Box::new(BufWriter::new(fs::File::create(output)?))
+        Box::new(fs::File::create(output)?)
     };
+    let mut out = CountingWriter::new(BufWriter::new(sink));
 
     // pread(2) isn't available on stdin (nor on wasm), so "-" slurps into the
-    // in-memory ReadAt impl; a real path uses FileReadAt directly.
-    let info = if input == "-" {
+    // in-memory ReadAt impl; a real path uses FileReadAt directly. Both expose
+    // the same `ReadAt`, so the canonicalization below is identical. (These
+    // owners must outlive `reader`, hence the deferred-init binding.)
+    let file_reader;
+    let slurped;
+    let reader: &dyn crate::io::ReadAt = if input == "-" {
         let mut bytes = Vec::new();
         io::stdin().lock().read_to_end(&mut bytes)?;
-        let mut source = crate::read(&bytes)?;
-        if !remap.is_empty() {
-            source.remap_track_ids(&remap);
-        }
-        let info = crate::flat::write(&source, &bytes, &mut out)?;
-        out.flush()?;
-        info
+        slurped = bytes;
+        &slurped
     } else {
-        let reader = crate::io::FileReadAt::open(Path::new(input))?;
-        let mut source = crate::read(&reader)?;
-        if !remap.is_empty() {
-            source.remap_track_ids(&remap);
-        }
-        let info = crate::flat::write(&source, &reader, &mut out)?;
-        out.flush()?;
-        info
+        file_reader = crate::io::FileReadAt::open(Path::new(input))?;
+        &file_reader
     };
 
-    eprintln!("flat MP4: {} bytes ({} tracks)", info.total_bytes, info.tracks.len());
+    let mut source = crate::read(reader)?;
+    if !remap.is_empty() {
+        source.remap_track_ids(&remap);
+    }
+
+    let (label, tracks) = match fmt {
+        Presentation::Flat => (
+            "flat MP4",
+            crate::flat::write(&source, reader, &mut out)?.tracks.len(),
+        ),
+        Presentation::Fmp4 => ("fMP4", crate::fmp4::write(&source, reader, &mut out)?.len()),
+    };
+    out.flush()?;
+
+    eprintln!("{label}: {} bytes ({} tracks)", out.count, tracks);
     Ok(())
+}
+
+/// A `Write` adapter that tallies bytes passed through to the inner writer —
+/// used only to report output size for the random-access presentation modes,
+/// whose writers don't return a total (and where the sink may be stdout).
+struct CountingWriter<W> {
+    inner: W,
+    count: u64,
+}
+
+impl<W: Write> CountingWriter<W> {
+    fn new(inner: W) -> Self {
+        Self { inner, count: 0 }
+    }
+}
+
+impl<W: Write> Write for CountingWriter<W> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        let n = self.inner.write(buf)?;
+        self.count += n as u64;
+        Ok(n)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush()
+    }
 }
 
 fn cmd_segment_dir(
@@ -595,7 +658,12 @@ pub fn cmd_cid(args: CidArgs) -> crate::Result<()> {
 }
 
 
-fn cmd_segment_fmp4(
+/// Streaming `--fmp4`: stream-segment a fragmented (fMP4) input arriving on a
+/// plain `Read` (e.g. a stdin pipe / live ingest) into one fMP4 file. A
+/// seekable file takes the random-access path in [`cmd_segment`] instead — both
+/// emit byte-identical output for the same fragmented input. Unlike that path,
+/// this cannot accept a flat input (no moofs ⇒ no segments).
+fn cmd_segment_fmp4_stream(
     input: &mut impl Read,
     output_path: &Path,
     remap: std::collections::BTreeMap<u32, u32>,

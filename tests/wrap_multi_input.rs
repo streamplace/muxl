@@ -10,7 +10,7 @@
 use std::io::Cursor;
 use std::path::{Path, PathBuf};
 
-use muxl::cli::{cmd_segment, cmd_wrap, SegmentArgs, WrapArgs, WrapFormat};
+use muxl::cli::{cmd_fmp4, cmd_segment, cmd_wrap, Fmp4Args, SegmentArgs, WrapArgs, WrapFormat};
 use muxl::io::FileReadAt;
 
 fn fixture_path(name: &str) -> PathBuf {
@@ -218,4 +218,90 @@ fn segment_fmp4_interleaves_per_gop_not_per_track() {
     assert_ne!(tids[0], tids[1], "GoP 0's tracks must be adjacent (per-GoP), got {tids:?}");
     assert_eq!(tids[0], tids[2], "GoP 1 must restart at track 0 (per-GoP), got {tids:?}");
     assert_eq!(tids[1], tids[3], "per-GoP cycle expected, got {tids:?}");
+}
+
+/// `segment --fmp4` from a *file* reads with random access and so must accept a
+/// flat (faststart) input — the capability that kept the `fmp4` command around.
+/// The streaming `--fmp4` path (stdin/live) sees no moofs in a flat file and
+/// would emit an empty init; the random-access path mints real segments.
+#[test]
+fn segment_fmp4_accepts_flat_input() {
+    let dir = tempfile::tempdir().unwrap();
+    let out = dir.path().join("out.fmp4");
+    cmd_segment(SegmentArgs {
+        input: fixture_path("h264-aac.mp4").to_str().unwrap().to_string(),
+        dir: None,
+        fmp4: Some(out.clone()),
+        stdout: false,
+        flat: None,
+        remap_track: vec![],
+    })
+    .unwrap();
+
+    // The output is a MUXL fMP4 whose canonical segments are recoverable.
+    let bytes = std::fs::read(&out).unwrap();
+    let segs = muxl::reader::unwrap(&bytes).unwrap();
+    assert!(
+        !segs.is_empty(),
+        "segment --fmp4 of a flat MP4 must yield segments, not just an empty init"
+    );
+    let tracks: std::collections::BTreeSet<u32> = segs.iter().map(|s| s.track_id).collect();
+    assert!(tracks.len() >= 2, "expected video + audio tracks, got {tracks:?}");
+}
+
+/// `segment --fmp4` (file) must be byte-identical to the `fmp4` command — it
+/// subsumes it — AND to the streaming path that the stdin/live route uses. That
+/// triple equality is the contract behind retiring `fmp4`: a fragmented input
+/// mints the same canonical fMP4 whether read from a seekable file (random
+/// access) or a pipe (streaming).
+#[test]
+fn segment_fmp4_file_matches_fmp4_command_and_streaming() {
+    let dir = tempfile::tempdir().unwrap();
+    let frag = fixture_path("h264-opus-frag.mp4");
+
+    // (a) the `fmp4` command — random-access read.
+    let via_fmp4 = dir.path().join("fmp4.fmp4");
+    cmd_fmp4(Fmp4Args {
+        input: frag.clone(),
+        output: via_fmp4.clone(),
+        init_only: false,
+        remap_track: vec![],
+    })
+    .unwrap();
+
+    // (b) `segment --fmp4` from the same file — also random-access.
+    let via_segment = dir.path().join("segment.fmp4");
+    cmd_segment(SegmentArgs {
+        input: frag.to_str().unwrap().to_string(),
+        dir: None,
+        fmp4: Some(via_segment.clone()),
+        stdout: false,
+        flat: None,
+        remap_track: vec![],
+    })
+    .unwrap();
+
+    // (c) the streaming path — reassemble init + per-GoP segments exactly as
+    // the stdin route (cmd_segment_fmp4_stream) does.
+    let raw = std::fs::read(&frag).unwrap();
+    let mut gops = Vec::new();
+    let catalog = muxl::segment_fmp4(&mut Cursor::new(&raw), |gop| {
+        gops.push(gop);
+        Ok(())
+    })
+    .unwrap();
+    let mut streamed = muxl::fmp4::init_segment(&catalog).unwrap();
+    for gop in &gops {
+        for data in gop.tracks.values() {
+            streamed.extend_from_slice(data);
+        }
+    }
+
+    let a = std::fs::read(&via_fmp4).unwrap();
+    let b = std::fs::read(&via_segment).unwrap();
+    assert_eq!(a, b, "segment --fmp4 (file) must match the fmp4 command byte-for-byte");
+    assert_eq!(
+        a, streamed,
+        "the streaming (stdin/live) path must mint identical fMP4 bytes"
+    );
 }

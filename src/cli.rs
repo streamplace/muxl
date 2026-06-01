@@ -623,14 +623,13 @@ fn cmd_segment_fmp4(
         .collect();
     track_ids.sort();
 
-    // Build per-track fMP4: init + [all track1 segments] + [all track2 segments]
-    let init = crate::fmp4::init_segment(&catalog)?;
-    let mut fmp4 = init;
-    for &tid in &track_ids {
-        for gop in &gops {
-            if let Some(data) = gop.tracks.get(&tid) {
-                fmp4.extend_from_slice(data);
-            }
+    // Canonical interleave (spec § Presentation Formats): each GoP's tracks
+    // contiguously in track_id order (gop.tracks is a BTreeMap), then the next
+    // GoP — NOT grouped per-track.
+    let mut fmp4 = crate::fmp4::init_segment(&catalog)?;
+    for gop in &gops {
+        for data in gop.tracks.values() {
+            fmp4.extend_from_slice(data);
         }
     }
 

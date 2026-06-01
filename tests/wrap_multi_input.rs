@@ -110,26 +110,19 @@ fn wrap_multi_input_equals_wrapping_the_whole_fmp4() {
 
     let dir = tempfile::tempdir().unwrap();
 
-    // Reference fMP4: init + the same segments, track-id ascending then GoP
-    // order — i.e. the storage layout `muxl segment --fmp4` emits.
+    // Reference fMP4: init + the canonical per-GoP segment stream (the layout
+    // `muxl segment --fmp4` / `fmp4` emit — `segments_of` is already in that
+    // order).
     let catalog = muxl::segment_fmp4(&mut Cursor::new(&src), |_| Ok(())).unwrap();
     let mut whole = muxl::fmp4::init_segment(&catalog).unwrap();
-    let mut by_track: std::collections::BTreeMap<u32, Vec<&Vec<u8>>> = Default::default();
-    for (tid, data) in &segs {
-        by_track.entry(*tid).or_default().push(data);
-    }
-    let mut ordered: Vec<(u32, &Vec<u8>)> = Vec::new();
-    for (tid, datas) in &by_track {
-        for data in datas {
-            whole.extend_from_slice(data);
-            ordered.push((*tid, data));
-        }
+    for (_tid, data) in &segs {
+        whole.extend_from_slice(data);
     }
     let whole_path = dir.path().join("whole.fmp4");
     std::fs::write(&whole_path, &whole).unwrap();
 
-    // Individual segments, written in that same storage order.
-    let inputs: Vec<PathBuf> = ordered
+    // The same segments as individual files, in the same order.
+    let inputs: Vec<PathBuf> = segs
         .iter()
         .enumerate()
         .map(|(i, (tid, data))| {
@@ -191,4 +184,38 @@ fn segment_flat_accepts_flat_input_and_roundtrips() {
     );
     let tracks: std::collections::BTreeSet<u32> = segs.iter().map(|s| s.track_id).collect();
     assert!(tracks.len() >= 2, "expected video + audio tracks, got {tracks:?}");
+}
+
+/// Multi-track output must interleave by GoP, track_id-ascending —
+/// [gop0 t1, gop0 t2, gop1 t1, gop1 t2, …] — per the spec (segments interleaved
+/// by timestamp), not grouped per-track. Guards cmd_segment_fmp4's ordering.
+#[test]
+fn segment_fmp4_interleaves_per_gop_not_per_track() {
+    let src = canonical_fmp4("h264-opus-frag.mp4");
+    let dir = tempfile::tempdir().unwrap();
+    let in_path = dir.path().join("in.fmp4");
+    std::fs::write(&in_path, &src).unwrap();
+    let out = dir.path().join("out.fmp4");
+    cmd_segment(SegmentArgs {
+        input: in_path.to_str().unwrap().to_string(),
+        dir: None,
+        fmp4: Some(out.clone()),
+        stdout: false,
+        flat: None,
+        remap_track: vec![],
+    })
+    .unwrap();
+
+    let bytes = std::fs::read(&out).unwrap();
+    let tids: Vec<u32> = muxl::reader::unwrap(&bytes)
+        .unwrap()
+        .iter()
+        .map(|s| s.track_id)
+        .collect();
+    assert!(tids.len() >= 4, "need >=2 GoPs x 2 tracks; got {tids:?}");
+    // Per-GoP: the two tracks of GoP 0 are adjacent, then GoP 1 restarts at
+    // track 0. Per-track grouping would instead repeat the first id.
+    assert_ne!(tids[0], tids[1], "GoP 0's tracks must be adjacent (per-GoP), got {tids:?}");
+    assert_eq!(tids[0], tids[2], "GoP 1 must restart at track 0 (per-GoP), got {tids:?}");
+    assert_eq!(tids[1], tids[3], "per-GoP cycle expected, got {tids:?}");
 }

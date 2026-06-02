@@ -13,6 +13,8 @@
 //! primitive — `concat` and the signing layer are byte-passthrough on top of
 //! it rather than re-minting fragments.
 
+use std::io::Read;
+
 use crate::catalog::{self, Catalog};
 use crate::error::{Error, Result};
 use crate::segment::MUXL_UUID;
@@ -158,23 +160,30 @@ fn push_segment<'a>(
 pub fn aggregate_catalog(segments: &[Segment<'_>]) -> Catalog {
     let mut agg = Catalog::default();
     for seg in segments {
-        if let Some(v) = &seg.catalog.video {
-            for (name, cfg) in &v.renditions {
-                agg.insert_video(name.clone(), cfg.clone());
-            }
-            if let Some(av) = agg.video.as_mut() {
-                av.display = av.display.or(v.display);
-                av.rotation = av.rotation.or(v.rotation);
-                av.flip = av.flip.or(v.flip);
-            }
-        }
-        if let Some(a) = &seg.catalog.audio {
-            for (name, cfg) in &a.renditions {
-                agg.insert_audio(name.clone(), cfg.clone());
-            }
-        }
+        merge_segment_catalog(&mut agg, &seg.catalog);
     }
     agg
+}
+
+/// Fold one segment's single-track catalog into a running aggregate. Renditions
+/// dedupe by name (same track → same config); video `display`/`rotation`/`flip`
+/// are taken from the first segment that carries them.
+fn merge_segment_catalog(agg: &mut Catalog, cat: &Catalog) {
+    if let Some(v) = &cat.video {
+        for (name, cfg) in &v.renditions {
+            agg.insert_video(name.clone(), cfg.clone());
+        }
+        if let Some(av) = agg.video.as_mut() {
+            av.display = av.display.or(v.display);
+            av.rotation = av.rotation.or(v.rotation);
+            av.flip = av.flip.or(v.flip);
+        }
+    }
+    if let Some(a) = &cat.audio {
+        for (name, cfg) in &a.renditions {
+            agg.insert_audio(name.clone(), cfg.clone());
+        }
+    }
 }
 
 /// Re-derive the canonical per-track event stream from a stored MUXL wrapper
@@ -188,63 +197,131 @@ pub fn aggregate_catalog(segments: &[Segment<'_>]) -> Catalog {
 /// drive live HLS / live-to-VOD / DVR exactly like freshly-segmented ones —
 /// without re-minting (and thus invalidating the signatures on) the bytes.
 pub fn segment_events(bytes: &[u8]) -> Result<Vec<crate::cbor::CborEvent>> {
-    use crate::cbor::{ByteString, CborEvent};
-    use std::collections::BTreeMap;
+    let mut events = Vec::new();
+    segment_events_streaming(bytes, |ev| {
+        events.push(ev);
+        Ok(())
+    })?;
+    Ok(events)
+}
 
-    let segments = unwrap(bytes)?;
-    if segments.is_empty() {
-        return Ok(Vec::new());
+/// In-memory streaming form of [`segment_events`]: each event is handed to
+/// `emit` the moment it is finalized, so a caller serializing straight to a sink
+/// never holds the whole event `Vec` — a full second copy of the content — at
+/// once. Still slurps `bytes` (it borrows verbatim slices); for arbitrarily
+/// large inputs use [`segment_events_stream`], which holds neither.
+pub fn segment_events_streaming<F>(bytes: &[u8], emit: F) -> Result<()>
+where
+    F: FnMut(crate::cbor::CborEvent) -> Result<()>,
+{
+    let mut builder = StreamEventBuilder::new(emit);
+    for seg in unwrap(bytes)? {
+        builder.push_segment(seg.data)?;
     }
-    let catalog = aggregate_catalog(&segments);
+    builder.finish()
+}
 
-    // track id -> media timescale, for each GoP's wall-clock duration_us.
-    let mut timescales: BTreeMap<u32, u32> = BTreeMap::new();
-    for v in catalog.video_configs() {
-        timescales.insert(v.track_id(), v.timescale());
-    }
-    for a in catalog.audio_configs() {
-        timescales.insert(a.track_id(), a.timescale());
-    }
+/// Fully streaming form of [`segment_events`] over a plain `Read`: the input is
+/// consumed front-to-back and never held in full, so peak memory is one GoP
+/// regardless of total size. This is the path for arbitrarily large VODs — the
+/// slurp-based forms hold the whole input (and, for the `Vec` form, a copy of
+/// it) in memory.
+///
+/// Accepts the same wrappers as [`unwrap`] (bare m4s, MUXL fMP4, flat MP4) but
+/// requires no random access. The `Init`/catalog is built from the first GoP —
+/// canonical interleave puts every track's first segment there — and re-emitted
+/// if a later GoP introduces a new track, matching the live segmenter and the
+/// mid-stream-init-swap path the consumer already tolerates.
+pub fn segment_events_stream<R: Read, F>(reader: R, emit: F) -> Result<()>
+where
+    F: FnMut(crate::cbor::CborEvent) -> Result<()>,
+{
+    let mut builder = StreamEventBuilder::new(emit);
+    scan_wrapper_stream(reader, |seg| builder.push_segment(seg))?;
+    builder.finish()
+}
 
-    let mut events: Vec<CborEvent> = Vec::new();
-    let track_inits: BTreeMap<String, ByteString> = crate::init::build_track_init_segments(&catalog)?
-        .into_iter()
-        .map(|(tid, b)| (tid.to_string(), ByteString(b)))
-        .collect();
-    events.push(CborEvent::Init {
-        data: crate::init::build_init_segment(&catalog)?,
-        catalog: Some(catalog.clone()),
-        track_inits,
-    });
+/// One GoP's worth of per-track event data, accumulated before being emitted as
+/// a [`CborEvent::Segment`](crate::cbor::CborEvent::Segment).
+#[derive(Default)]
+struct GopAccum {
+    tracks: std::collections::BTreeMap<String, crate::cbor::ByteString>,
+    durations: std::collections::BTreeMap<String, u64>,
+    sample_counts: std::collections::BTreeMap<String, u32>,
+    samples: std::collections::BTreeMap<String, crate::cbor::CborTrackSamples>,
+    body_size: u64,
+    duration_us: u64,
+}
 
-    // Group segments into GoPs: a new GoP begins whenever the track id is <=
-    // the previous one (tracks ascend within a GoP), matching unwrap's
-    // interleave order.
-    struct Gop {
-        tracks: BTreeMap<String, ByteString>,
-        durations: BTreeMap<String, u64>,
-        sample_counts: BTreeMap<String, u32>,
-        samples: BTreeMap<String, crate::cbor::CborTrackSamples>,
-        body_size: u64,
-        duration_us: u64,
-    }
-    let mut gops: Vec<Gop> = Vec::new();
-    let mut last_tid: Option<u32> = None;
-    for seg in &segments {
-        let (tid, ts, _dts) = crate::present::segment_index(seg.data)?;
-        if last_tid.is_none_or(|prev| tid <= prev) {
-            gops.push(Gop {
-                tracks: BTreeMap::new(),
-                durations: BTreeMap::new(),
-                sample_counts: BTreeMap::new(),
-                samples: BTreeMap::new(),
-                body_size: 0,
-                duration_us: 0,
-            });
+/// Turns a forward stream of verbatim canonical segments into the live event
+/// shape (one `Init`, then one `Segment` per GoP), holding at most one GoP.
+/// Shared by the slurp ([`segment_events_streaming`]) and fully-streaming
+/// ([`segment_events_stream`]) paths so the two emit byte-identical events.
+struct StreamEventBuilder<F> {
+    emit: F,
+    /// Aggregate catalog over every segment seen so far (grows as tracks appear).
+    running: Catalog,
+    /// Per-track media timescale, recorded as each track first appears.
+    timescales: std::collections::BTreeMap<u32, u32>,
+    /// Track ids covered by the most recently emitted `Init`.
+    emitted_tids: std::collections::HashSet<u32>,
+    init_emitted: bool,
+    /// The GoP currently being assembled introduced a track no `Init` covers yet.
+    pending_new_tid: bool,
+    cur: Option<GopAccum>,
+    last_tid: Option<u32>,
+}
+
+impl<F> StreamEventBuilder<F>
+where
+    F: FnMut(crate::cbor::CborEvent) -> Result<()>,
+{
+    fn new(emit: F) -> Self {
+        StreamEventBuilder {
+            emit,
+            running: Catalog::default(),
+            timescales: std::collections::BTreeMap::new(),
+            emitted_tids: std::collections::HashSet::new(),
+            init_emitted: false,
+            pending_new_tid: false,
+            cur: None,
+            last_tid: None,
         }
-        let gop = gops.last_mut().unwrap();
+    }
+
+    /// Feed one verbatim canonical segment, in canonical interleave order.
+    fn push_segment(&mut self, seg: &[u8]) -> Result<()> {
+        let (tid, ts, _dts) = crate::present::segment_index(seg)?;
+
+        // A track id <= the previous one closes the current GoP (tracks ascend
+        // within a GoP). Flush it *before* folding this segment's catalog in, so
+        // the closing GoP's Init reflects exactly the tracks up to and including
+        // it — not this next GoP's first track.
+        if self.last_tid.is_none_or(|prev| tid <= prev) {
+            if let Some(g) = self.cur.take() {
+                self.flush_gop(g)?;
+            }
+            self.cur = Some(GopAccum::default());
+        }
+
+        // Fold this segment's single-track catalog into the running aggregate
+        // (identical to aggregate_catalog's per-segment merge) and record its
+        // timescale, so this GoP's duration_us and the next Init are correct.
+        let cat = crate::catalog::from_segment(seg)?;
+        merge_segment_catalog(&mut self.running, &cat);
+        for v in cat.video_configs() {
+            self.timescales.insert(v.track_id(), v.timescale());
+        }
+        for a in cat.audio_configs() {
+            self.timescales.insert(a.track_id(), a.timescale());
+        }
+        if !self.emitted_tids.contains(&tid) {
+            self.pending_new_tid = true;
+        }
+
         let dur_ticks: u64 = ts.durations.iter().map(|&d| d as u64).sum();
-        if let Some(&tsc) = timescales.get(&tid) {
+        let gop = self.cur.as_mut().unwrap();
+        if let Some(&tsc) = self.timescales.get(&tid) {
             if tsc > 0 {
                 // The GoP's playable span is the longest of its tracks.
                 let us = dur_ticks * 1_000_000 / tsc as u64;
@@ -252,25 +329,330 @@ pub fn segment_events(bytes: &[u8]) -> Result<Vec<crate::cbor::CborEvent>> {
             }
         }
         let key = tid.to_string();
-        gop.body_size += seg.data.len() as u64;
+        gop.body_size += seg.len() as u64;
         gop.durations.insert(key.clone(), dur_ticks);
         gop.sample_counts.insert(key.clone(), ts.durations.len() as u32);
         gop.samples.insert(key.clone(), (&ts).into());
-        gop.tracks.insert(key, ByteString(seg.data.to_vec()));
-        last_tid = Some(tid);
+        gop.tracks
+            .insert(key, crate::cbor::ByteString(seg.to_vec()));
+        self.last_tid = Some(tid);
+        Ok(())
     }
 
-    for gop in gops {
-        events.push(CborEvent::Segment {
-            tracks: gop.tracks,
-            durations: gop.durations,
-            sample_counts: gop.sample_counts,
-            samples: gop.samples,
-            body_size: gop.body_size,
-            duration_us: gop.duration_us,
-        });
+    /// Emit one completed GoP, preceded by a fresh `Init` if this is the first
+    /// GoP or it introduced a track the last `Init` didn't cover.
+    fn flush_gop(&mut self, g: GopAccum) -> Result<()> {
+        use crate::cbor::{ByteString, CborEvent};
+        if !self.init_emitted || self.pending_new_tid {
+            let track_inits: std::collections::BTreeMap<String, ByteString> =
+                crate::init::build_track_init_segments(&self.running)?
+                    .into_iter()
+                    .map(|(tid, b)| (tid.to_string(), ByteString(b)))
+                    .collect();
+            (self.emit)(CborEvent::Init {
+                data: crate::init::build_init_segment(&self.running)?,
+                catalog: Some(self.running.clone()),
+                track_inits,
+            })?;
+            self.init_emitted = true;
+            self.pending_new_tid = false;
+            self.emitted_tids = self
+                .running
+                .video_configs()
+                .map(|v| v.track_id())
+                .chain(self.running.audio_configs().map(|a| a.track_id()))
+                .collect();
+        }
+        (self.emit)(CborEvent::Segment {
+            tracks: g.tracks,
+            durations: g.durations,
+            sample_counts: g.sample_counts,
+            samples: g.samples,
+            body_size: g.body_size,
+            duration_us: g.duration_us,
+        })
     }
-    Ok(events)
+
+    /// Flush the final GoP. No segments ⇒ no events (matches `segment_events`).
+    fn finish(&mut self) -> Result<()> {
+        if let Some(g) = self.cur.take() {
+            self.flush_gop(g)?;
+        }
+        Ok(())
+    }
+}
+
+/// A small forward-only read buffer over an arbitrary `Read`. Holds at most a
+/// single box at a time; consumed bytes are dropped as the cursor advances.
+struct ScanBuf<R> {
+    reader: R,
+    buf: Vec<u8>,
+    pos: usize,
+    eof: bool,
+}
+
+impl<R: Read> ScanBuf<R> {
+    fn new(reader: R) -> Self {
+        ScanBuf {
+            reader,
+            buf: Vec::with_capacity(1 << 16),
+            pos: 0,
+            eof: false,
+        }
+    }
+
+    fn avail(&self) -> usize {
+        self.buf.len() - self.pos
+    }
+
+    /// Ensure at least `need` bytes are buffered at the cursor, reading more as
+    /// required. Returns the count actually available (may be `< need` at EOF).
+    fn ensure(&mut self, need: usize) -> Result<usize> {
+        if self.avail() >= need {
+            return Ok(self.avail());
+        }
+        if self.pos > 0 {
+            self.buf.drain(..self.pos);
+            self.pos = 0;
+        }
+        let mut tmp = [0u8; 1 << 16];
+        while self.avail() < need && !self.eof {
+            let n = self.reader.read(&mut tmp)?;
+            if n == 0 {
+                self.eof = true;
+                break;
+            }
+            self.buf.extend_from_slice(&tmp[..n]);
+        }
+        Ok(self.avail())
+    }
+
+    fn data(&self) -> &[u8] {
+        &self.buf[self.pos..]
+    }
+
+    fn consume(&mut self, n: usize) {
+        self.pos += n;
+    }
+}
+
+/// `(fourcc, header_len, body_len)` for the next box, or `None` at clean EOF.
+/// `body_len` is `None` for the size-0 (to-EOF) form.
+type StreamBoxHeader = ([u8; 4], usize, Option<u64>);
+
+fn next_box_header<R: Read>(sb: &mut ScanBuf<R>) -> Result<Option<StreamBoxHeader>> {
+    if sb.ensure(8)? < 8 {
+        if sb.avail() == 0 {
+            return Ok(None);
+        }
+        return Err(Error::InvalidMp4("truncated box header".into()));
+    }
+    let d = sb.data();
+    let size32 = u32::from_be_bytes([d[0], d[1], d[2], d[3]]);
+    let mut kind = [0u8; 4];
+    kind.copy_from_slice(&d[4..8]);
+    let oor = || Error::InvalidMp4("box size out of range".into());
+    match size32 {
+        1 => {
+            if sb.ensure(16)? < 16 {
+                return Err(Error::InvalidMp4("truncated 64-bit box header".into()));
+            }
+            let d = sb.data();
+            let large = u64::from_be_bytes(d[8..16].try_into().unwrap());
+            Ok(Some((kind, 16, Some(large.checked_sub(16).ok_or_else(oor)?))))
+        }
+        0 => Ok(Some((kind, 8, None))),
+        n => Ok(Some((kind, 8, Some((n as u64).checked_sub(8).ok_or_else(oor)?)))),
+    }
+}
+
+/// Whether the `uuid` box at the cursor is a MUXL `uuid` (its first 16 payload
+/// bytes are [`MUXL_UUID`]).
+fn uuid_is_muxl<R: Read>(sb: &mut ScanBuf<R>, header_len: usize, body: Option<u64>) -> Result<bool> {
+    if matches!(body, Some(b) if b < 16) {
+        return Ok(false);
+    }
+    let need = header_len + 16;
+    if sb.ensure(need)? < need {
+        return Ok(false);
+    }
+    Ok(sb.data()[header_len..need] == MUXL_UUID)
+}
+
+/// Whether the box *following* the non-MUXL `uuid` at the cursor is a MUXL
+/// `uuid` — i.e. this is a signed segment's leading c2pa/S2PA prefix (the stream
+/// starts here) rather than wrapper framing before `moov`. The streaming twin of
+/// [`next_box_is_muxl`].
+fn next_box_is_muxl_stream<R: Read>(
+    sb: &mut ScanBuf<R>,
+    header_len: usize,
+    body: Option<u64>,
+) -> Result<bool> {
+    let body = match body {
+        Some(b) => b as usize,
+        None => return Ok(false),
+    };
+    let uuid_total = header_len + body;
+    if sb.ensure(uuid_total + 8)? < uuid_total + 8 {
+        return Ok(false);
+    }
+    let nh = &sb.data()[uuid_total..];
+    let next_hdr_len = if u32::from_be_bytes([nh[0], nh[1], nh[2], nh[3]]) == 1 {
+        16
+    } else {
+        8
+    };
+    let need = uuid_total + next_hdr_len + 16;
+    if sb.ensure(need)? < need {
+        return Ok(false);
+    }
+    let d = sb.data();
+    Ok(&d[uuid_total + 4..uuid_total + 8] == b"uuid"
+        && d[uuid_total + next_hdr_len..uuid_total + next_hdr_len + 16] == MUXL_UUID)
+}
+
+/// Skip `n` bytes of framing, reading and discarding in bounded chunks.
+fn skip_n<R: Read>(sb: &mut ScanBuf<R>, mut n: usize) -> Result<()> {
+    while n > 0 {
+        let want = n.min(1 << 16);
+        if sb.ensure(want)? == 0 {
+            return Err(Error::InvalidMp4("truncated box body".into()));
+        }
+        let take = sb.avail().min(n);
+        sb.consume(take);
+        n -= take;
+    }
+    Ok(())
+}
+
+/// Append the box at the cursor (header + body) to `out`, returning its total
+/// length. `body == None` reads to EOF (the size-0 form).
+fn capture_box<R: Read>(
+    sb: &mut ScanBuf<R>,
+    header_len: usize,
+    body: Option<u64>,
+    out: &mut Vec<u8>,
+) -> Result<usize> {
+    match body {
+        Some(body) => {
+            let total = header_len + body as usize;
+            let mut left = total;
+            while left > 0 {
+                let want = left.min(1 << 16);
+                if sb.ensure(want)? == 0 {
+                    return Err(Error::InvalidMp4("truncated box body".into()));
+                }
+                let take = sb.avail().min(left);
+                out.extend_from_slice(&sb.data()[..take]);
+                sb.consume(take);
+                left -= take;
+            }
+            Ok(total)
+        }
+        None => {
+            let mut total = 0;
+            while sb.ensure(1 << 16)? > 0 {
+                let take = sb.avail();
+                out.extend_from_slice(&sb.data()[..take]);
+                sb.consume(take);
+                total += take;
+            }
+            Ok(total)
+        }
+    }
+}
+
+/// Forward-scan a MUXL storage wrapper, invoking `on_segment` with each verbatim
+/// canonical segment. The streaming twin of [`locate_segment_stream`] +
+/// [`scan_segments`]: it skips a leading `ftyp`/`moov` (and other framing),
+/// descends a flat MP4's outer `mdat` envelope, and splits the canonical-segment
+/// stream on MUXL `uuid` boundaries — without seeking or holding more than one box.
+fn scan_wrapper_stream<R: Read, F>(reader: R, mut on_segment: F) -> Result<()>
+where
+    F: FnMut(&[u8]) -> Result<()>,
+{
+    let mut sb = ScanBuf::new(reader);
+    let mut in_stream = false;
+    // Bytes left in the flat MP4 `mdat` envelope; `None` = unbounded (to EOF).
+    let mut envelope_remaining: Option<u64> = None;
+    let mut seg_buf: Vec<u8> = Vec::new();
+    let mut seg_started = false;
+    let mut seg_has_muxl = false;
+
+    loop {
+        if in_stream && envelope_remaining == Some(0) {
+            break;
+        }
+        let (kind, header_len, body) = match next_box_header(&mut sb)? {
+            Some(h) => h,
+            None => break,
+        };
+
+        if !in_stream {
+            // Locating: skip framing, find the segment stream / mdat envelope.
+            match &kind {
+                b"ftyp" | b"moov" | b"free" | b"skip" | b"styp" | b"sidx" => {
+                    skip_n(&mut sb, header_len + body.map_or(0, |b| b as usize))?;
+                }
+                b"mdat" => {
+                    // Flat MP4 envelope: its body *is* the segment stream.
+                    sb.consume(header_len);
+                    in_stream = true;
+                    envelope_remaining = body;
+                }
+                // Stream starts at this box: re-read it in the in-stream branch
+                // (no consume) so its bytes join the first segment.
+                b"moof" | b"uuid" => {
+                    if &kind == b"uuid"
+                        && !uuid_is_muxl(&mut sb, header_len, body)?
+                        && !next_box_is_muxl_stream(&mut sb, header_len, body)?
+                    {
+                        // A non-MUXL uuid not heading a signed segment is wrapper
+                        // framing (e.g. a c2pa box before moov) — skip it.
+                        skip_n(&mut sb, header_len + body.map_or(0, |b| b as usize))?;
+                    } else {
+                        in_stream = true;
+                        envelope_remaining = None;
+                    }
+                }
+                _ => {
+                    skip_n(&mut sb, header_len + body.map_or(0, |b| b as usize))?;
+                }
+            }
+            continue;
+        }
+
+        // In the segment stream: split on uuid boundaries (mirrors scan_segments).
+        if &kind == b"uuid" {
+            let is_muxl = uuid_is_muxl(&mut sb, header_len, body)?;
+            // A uuid opens a new segment when it's a second muxl uuid (the
+            // previous segment's fragments are complete) or any non-muxl (c2pa)
+            // uuid, which always heads a fresh segment's signing prefix.
+            if seg_started && (!is_muxl || seg_has_muxl) {
+                on_segment(&seg_buf)?;
+                seg_buf.clear();
+                seg_has_muxl = false;
+            }
+            seg_started = true;
+            seg_has_muxl |= is_muxl;
+        } else if !seg_started {
+            return Err(Error::InvalidMp4(
+                "segment stream did not begin with a uuid box".into(),
+            ));
+        }
+
+        let consumed = capture_box(&mut sb, header_len, body, &mut seg_buf)? as u64;
+        if let Some(rem) = envelope_remaining.as_mut() {
+            *rem = rem
+                .checked_sub(consumed)
+                .ok_or_else(|| Error::InvalidMp4("box overruns mdat envelope".into()))?;
+        }
+    }
+
+    if seg_started && !seg_buf.is_empty() {
+        on_segment(&seg_buf)?;
+    }
+    Ok(())
 }
 
 /// Read an ISOBMFF box header at `pos`, returning `(fourcc, body_start,
@@ -509,6 +891,119 @@ mod tests {
         assert!(seg_count >= 2, "fixture should yield multiple GoPs, got {seg_count}");
         let expected: u64 = ordered.iter().map(|(_, b)| b.len() as u64).sum();
         assert_eq!(byte_total, expected, "verbatim segment bytes preserved");
+    }
+
+    /// A `Read` that hands out at most `chunk` bytes per call, so a single box
+    /// header/body is split across many reads — exercising the streaming
+    /// scanner's cross-read reassembly.
+    struct ChunkReader<'a> {
+        data: &'a [u8],
+        pos: usize,
+        chunk: usize,
+    }
+    impl std::io::Read for ChunkReader<'_> {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            let n = (self.data.len() - self.pos).min(self.chunk).min(buf.len());
+            buf[..n].copy_from_slice(&self.data[self.pos..self.pos + n]);
+            self.pos += n;
+            Ok(n)
+        }
+    }
+
+    fn drisl_slurp(wrapper: &[u8]) -> Vec<u8> {
+        let mut out = Vec::new();
+        segment_events_streaming(wrapper, |ev| {
+            dasl::drisl::to_writer(&mut out, &ev)
+                .map_err(|e| Error::InvalidMp4(e.to_string()))?;
+            Ok(())
+        })
+        .unwrap();
+        out
+    }
+
+    fn drisl_stream(wrapper: &[u8], chunk: usize) -> Vec<u8> {
+        let mut out = Vec::new();
+        segment_events_stream(
+            ChunkReader { data: wrapper, pos: 0, chunk },
+            |ev| {
+                dasl::drisl::to_writer(&mut out, &ev)
+                    .map_err(|e| Error::InvalidMp4(e.to_string()))?;
+                Ok(())
+            },
+        )
+        .unwrap();
+        out
+    }
+
+    /// The fully-streaming `segment_events_stream` must emit byte-identical
+    /// DRISL to the slurp-based `segment_events` for a MUXL fMP4 — regardless of
+    /// how the input is chunked across reads (1 byte at a time stresses the
+    /// box-header reassembly the hardest).
+    #[test]
+    fn stream_events_match_slurp_fmp4() {
+        let data = read_fixture("h264-opus-frag.mp4");
+        let (catalog, ordered) = segments_in_order(&data);
+        let mut fmp4 = build_init_segment(&catalog).unwrap();
+        for (_, seg) in &ordered {
+            fmp4.extend_from_slice(seg);
+        }
+
+        let slurp = drisl_slurp(&fmp4);
+        assert!(!slurp.is_empty(), "fixture must produce events");
+        for chunk in [1usize, 7, 4096, usize::MAX] {
+            assert_eq!(
+                drisl_stream(&fmp4, chunk),
+                slurp,
+                "stream (chunk={chunk}) must equal slurp for fMP4"
+            );
+        }
+    }
+
+    /// Same equivalence for a bare m4s stream (no ftyp/moov framing).
+    #[test]
+    fn stream_events_match_slurp_bare_m4s() {
+        let data = read_fixture("h264-opus-frag.mp4");
+        let (_catalog, ordered) = segments_in_order(&data);
+        let mut stream = Vec::new();
+        for (_, seg) in &ordered {
+            stream.extend_from_slice(seg);
+        }
+        assert_eq!(drisl_stream(&stream, 5), drisl_slurp(&stream));
+    }
+
+    /// Same equivalence for a flat MP4 — the scanner must descend the outer
+    /// `mdat` envelope rather than skip it.
+    #[test]
+    fn stream_events_match_slurp_flat() {
+        let data = read_fixture("h264-opus-frag.mp4");
+        let source = crate::read(&data).unwrap();
+        let mut flat = Vec::new();
+        crate::flat::write(&source, &data, &mut flat).unwrap();
+        assert_eq!(drisl_stream(&flat, 3), drisl_slurp(&flat));
+    }
+
+    /// Same equivalence for signed segments: a non-MUXL c2pa `uuid` prefix must
+    /// stay attached to the segment it heads (the scanner starts a stream at a
+    /// non-MUXL uuid only when the next box is a MUXL uuid).
+    #[test]
+    fn stream_events_match_slurp_signed_segments() {
+        let data = read_fixture("h264-opus-frag.mp4");
+        let (catalog, ordered) = segments_in_order(&data);
+        let fake_c2pa = |body: &[u8]| {
+            let total = 24 + body.len();
+            let mut b = Vec::new();
+            b.extend_from_slice(&(total as u32).to_be_bytes());
+            b.extend_from_slice(b"uuid");
+            b.extend_from_slice(&[0xd8u8; 16]); // non-MUXL usertype
+            b.extend_from_slice(body);
+            b
+        };
+        let mut fmp4 = build_init_segment(&catalog).unwrap();
+        for (i, (_, seg)) in ordered.iter().enumerate() {
+            fmp4.extend_from_slice(&fake_c2pa(format!("manifest {i}").as_bytes()));
+            fmp4.extend_from_slice(seg);
+        }
+        assert_eq!(drisl_stream(&fmp4, 9), drisl_slurp(&fmp4));
     }
 
     #[test]

@@ -524,6 +524,34 @@ pub fn cmd_wrap(args: WrapArgs) -> crate::Result<()> {
 pub fn cmd_unwrap(args: UnwrapArgs) -> crate::Result<()> {
     use std::collections::{BTreeMap, HashSet};
     let UnwrapArgs { input, dir, events } = args;
+
+    // --events: re-emit the per-track CBOR event stream (for a host that drives
+    // the live-HLS window off already-stored segments). Fully streaming — the
+    // input is consumed front-to-back and never held in full, so even a
+    // multi-GB VOD runs in ~one GoP of memory (well under the wasm cap). Each
+    // event is serialized straight to stdout as it's finalized.
+    if events {
+        let reader: Box<dyn Read> = if input.as_os_str() == "-" {
+            Box::new(io::stdin())
+        } else {
+            Box::new(fs::File::open(&input)?)
+        };
+        let mut stdout = io::stdout().lock();
+        let mut n = 0usize;
+        crate::reader::segment_events_stream(reader, |ev| {
+            dasl::drisl::to_writer(&mut stdout, &ev).map_err(|e| {
+                crate::Error::Io(io::Error::new(io::ErrorKind::Other, e.to_string()))
+            })?;
+            n += 1;
+            Ok(())
+        })?;
+        stdout.flush()?;
+        eprintln!("emitted {n} events");
+        return Ok(());
+    }
+
+    // Non-events paths unwrap to verbatim slices, which borrow the whole input,
+    // so they still slurp it.
     let bytes: Vec<u8> = if input.as_os_str() == "-" {
         let mut buf = Vec::new();
         io::stdin().lock().read_to_end(&mut buf)?;
@@ -531,22 +559,6 @@ pub fn cmd_unwrap(args: UnwrapArgs) -> crate::Result<()> {
     } else {
         fs::read(&input)?
     };
-
-    // --events: re-emit the per-track CBOR event stream (for a host that
-    // drives the live-HLS window off already-stored segments).
-    if events {
-        let mut stdout = io::stdout().lock();
-        let evs = crate::reader::segment_events(&bytes)?;
-        for ev in &evs {
-            dasl::drisl::to_writer(&mut stdout, ev).map_err(|e| {
-                crate::Error::Io(io::Error::new(io::ErrorKind::Other, e.to_string()))
-            })?;
-        }
-        stdout.flush()?;
-        eprintln!("emitted {} events", evs.len());
-        return Ok(());
-    }
-
     let segments = crate::reader::unwrap(&bytes)?;
 
     if let Some(dir) = dir {

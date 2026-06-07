@@ -18,10 +18,11 @@ path = "src/main.rs"
 
 [dependencies]
 muxl-core = { path = "../.." }
-# The Streamplace SDK fork is published/named `s2pa`; the `c2pa` key keeps our
-# source writing `use c2pa::…` via cargo's dependency rename. Once `s2pa` is on
-# crates.io this becomes `c2pa = { package = "s2pa", version = "0.58" }`.
-c2pa = { package = "s2pa", git = "https://github.com/streamplace/c2pa-rs.git", rev = "a8ee71e867c15e80d6b6393635a8d3f8e2e4d7ac", default-features = false, features = ["rust_native_crypto", "file_io"] }
+# Streamplace's SDK, published to crates.io as `s2pa` (the upstream C2PA SDK
+# plus ES256K signing, bare `.m4s` support, and DID/DRISL extensions). The
+# `c2pa` key keeps our source writing `use c2pa::…` via cargo's dependency
+# rename.
+c2pa = { package = "s2pa", version = "0.1.0", default-features = false, features = ["rust_native_crypto", "file_io"] }
 mp4-atom = { git = "https://github.com/streamplace/mp4-atom.git", branch = "streamplace" }
 clap = { version = "4", features = ["derive"] }
 # ES256K signing is wired through CallbackSigner — c2pa-rs's

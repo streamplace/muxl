@@ -2641,8 +2641,9 @@ checksum = "9774ba4a74de5f7b1c1451ed6cd5285a32eddb5cccb8cc655a4e50009e06477f"
 
 [[package]]
 name = "s2pa"
-version = "0.58.0"
-source = "git+https://github.com/streamplace/c2pa-rs.git?rev=a8ee71e867c15e80d6b6393635a8d3f8e2e4d7ac#a8ee71e867c15e80d6b6393635a8d3f8e2e4d7ac"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a8cb4b7432a8fcb2d8e6b1835dc029f5e9c0e8d0c799177f6590c8b88e6a25ff"
 dependencies = [
  "asn1-rs",
  "async-generic",

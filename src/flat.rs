@@ -492,6 +492,16 @@ pub fn build_synth_flat_header(
         });
     }
 
+    // Rebase the synthesized presentation timeline to zero. A VOD wrapped from
+    // a mid-stream point carries a large, ~common first `tfdt` on every track;
+    // without this, the moov below would emit a leading empty edit equal to
+    // that offset and inflate the movie duration by it, so players show tens of
+    // seconds of nothing before the content. Subtracting the global-minimum
+    // offset drops the common base and keeps only the small inter-track A/V
+    // skew. This rewrites the moov only — the canonical segment bytes (and their
+    // tfdts) are produced separately and are never touched.
+    rebase_start_offsets_to_zero(&mut plans);
+
     // Pass 1: build moov with placeholder co64 to measure its encoded size.
     // Per-track byte totals come from each track's measured moof sizes plus
     // sample/mdat-header bytes — the same accounting `flat::write` does.
@@ -1201,6 +1211,47 @@ fn rescale_to_movie(media_duration: u64, media_timescale: u32) -> u64 {
         / ts
 }
 
+/// Rebase per-track presentation start offsets so the earliest track begins at
+/// presentation time zero, preserving inter-track skew.
+///
+/// A VOD wrapped from a mid-stream point inherits a large, ~common `tfdt`
+/// offset on every track (e.g. ~46 s into a live stream). Left as-is, the
+/// synthesized moov emits a leading empty `elst` edit of that size and inflates
+/// the movie/track durations by it — so players render tens of seconds of
+/// nothing before the content (or disagree about the duration). Subtracting the
+/// global-minimum offset drops that common base: the earliest track lands
+/// exactly on zero (no edit), while the others keep their small relative A/V
+/// start skew, which is the legitimate use of a leading empty edit.
+///
+/// Operates only on the moov's notion of the start offset; the canonical
+/// segment bytes (and their `tfdt`s) are emitted separately and untouched.
+/// A no-op when some track already starts at zero. Spec: `§ edts/elst`.
+fn rebase_start_offsets_to_zero(plans: &mut [TrackPlan]) {
+    // Anchor = the minimum start offset across tracks, compared as a rational
+    // ticks/timescale (tracks may differ in timescale). u128 avoids overflow.
+    let Some(anchor) = plans
+        .iter()
+        .filter(|p| p.timescale != 0)
+        .min_by(|a, b| {
+            (a.start_offset_ticks as u128 * b.timescale as u128)
+                .cmp(&(b.start_offset_ticks as u128 * a.timescale as u128))
+        })
+    else {
+        return;
+    };
+    let (anchor_ticks, anchor_ts) = (anchor.start_offset_ticks, anchor.timescale);
+    if anchor_ticks == 0 {
+        // Some track already starts at presentation zero — nothing to rebase.
+        return;
+    }
+    for p in plans.iter_mut() {
+        // Subtract the anchor rescaled into this track's timescale. The anchor
+        // track lands exactly on zero; others retain their relative skew.
+        let sub = (anchor_ticks as u128 * p.timescale as u128 / anchor_ts as u128) as u64;
+        p.start_offset_ticks = p.start_offset_ticks.saturating_sub(sub);
+    }
+}
+
 /// Build a canonical `edts/elst` for a flat MP4 track.
 ///
 /// Returns `None` when `start_offset_track_ts == 0` — the common case where
@@ -1718,12 +1769,13 @@ mod tests {
     }
 
     #[test]
-    fn flat_preserves_per_track_offsets_verbatim() {
-        // Both tracks carry leading offsets: video at 50ms, audio at 10ms.
-        // Canonical form preserves both verbatim — A/V sync rides on the
-        // 40ms inter-track delta naturally; absolute time anchoring is
-        // whatever the caller set. Each track gets its own synthesized
-        // elst and first-fragment tfdt at its own offset.
+    fn flat_rebases_offsets_to_min_preserving_skew() {
+        // Both tracks carry leading offsets: video at 50ms, audio at 10ms. The
+        // synthesized moov is rebased to the global-minimum offset (audio, the
+        // earlier track) so playback starts at zero: audio gets no elst, and
+        // video keeps only the 40ms inter-track delta as its empty edit — A/V
+        // sync rides on that delta. The canonical body tfdts are NOT rebased;
+        // each first fragment keeps its own absolute offset.
         let flat_input = FileReadAt::open(&fixture_path("h264-aac.mp4")).unwrap();
         let (catalog, mut plans) = plan_from_flat_mp4(&flat_input).unwrap();
         let video_track_id = catalog.video_configs().next().unwrap().track_id();
@@ -1756,29 +1808,31 @@ mod tests {
             .find(|t| t.tkhd.track_id == audio_track_id)
             .unwrap();
 
-        // Both tracks get a synthesized empty-edit elst sized to their
-        // own offset (in the movie timescale), since neither is zero.
+        // Video keeps a 40ms empty edit (its 50ms offset minus the 10ms
+        // anchor), in the movie timescale (MOVIE_TIMESCALE = 1000).
         let video_elst = video_trak
             .edts
             .as_ref()
             .and_then(|e| e.elst.as_ref())
-            .expect("video trak should have a synthesized elst");
+            .expect("video trak should have a synthesized elst for its residual skew");
         assert_eq!(video_elst.entries.len(), 2);
-        assert_eq!(video_elst.entries[0].segment_duration, 50);
+        assert_eq!(video_elst.entries[0].segment_duration, 40);
         assert_eq!(video_elst.entries[0].media_time, u64::MAX);
         assert_eq!(video_elst.entries[1].media_time, 0);
 
-        let audio_elst = audio_trak
-            .edts
-            .as_ref()
-            .and_then(|e| e.elst.as_ref())
-            .expect("audio trak should have a synthesized elst");
-        assert_eq!(audio_elst.entries.len(), 2);
-        assert_eq!(audio_elst.entries[0].segment_duration, 10);
-        assert_eq!(audio_elst.entries[0].media_time, u64::MAX);
-        assert_eq!(audio_elst.entries[1].media_time, 0);
+        // Audio is the anchor (the earlier track), so it rebases to exactly
+        // zero — no elst at all.
+        assert!(
+            audio_trak
+                .edts
+                .as_ref()
+                .and_then(|e| e.elst.as_ref())
+                .is_none(),
+            "audio trak (the anchor) should have no elst after rebasing to zero",
+        );
 
-        // First-fragment tfdts: each carries its own absolute offset.
+        // First-fragment tfdts are NOT rebased: each keeps its own absolute
+        // offset, so downstream concatenation stays continuous.
         let video_tfdt = find_first_tfdt_for_track(&out, video_track_id).unwrap();
         let audio_tfdt = find_first_tfdt_for_track(&out, audio_track_id).unwrap();
         assert_eq!(video_tfdt, video_offset_ticks);
@@ -1786,13 +1840,13 @@ mod tests {
     }
 
     #[test]
-    fn flat_preserves_shared_absolute_offset() {
+    fn flat_rebases_shared_offset_to_zero_keeping_body_tfdts() {
         // Both tracks share a 1-second leading offset (the case mp4mux
         // produces for livestream segments where every fragment's tfdt is
-        // running-time). Canonical form preserves the offset — the output
-        // file's first-fragment tfdts are at 1s, the moov's elsts encode
-        // the shift. Concatenating segments downstream gets continuous
-        // tfdts without any rebase step.
+        // running-time). The synthesized moov rebases the shared offset away —
+        // neither track gets an elst, so the file plays from zero. But the
+        // body tfdts are preserved at 1s, so concatenating these segments
+        // downstream still yields continuous tfdts without any rebase step.
         let flat_input = FileReadAt::open(&fixture_path("h264-aac.mp4")).unwrap();
         let (catalog, mut plans) = plan_from_flat_mp4(&flat_input).unwrap();
         let video_track_id = catalog.video_configs().next().unwrap().track_id();
@@ -1815,19 +1869,15 @@ mod tests {
 
         let moov = read_moov(&mut Cursor::new(&out)).unwrap();
         for trak in &moov.trak {
-            let elst = trak
-                .edts
-                .as_ref()
-                .and_then(|e| e.elst.as_ref())
-                .unwrap_or_else(|| panic!(
-                    "track {} should have a synthesized elst for its 1s offset",
-                    trak.tkhd.track_id,
-                ));
-            // 1s in the movie timescale (MOVIE_TIMESCALE = 1000).
-            assert_eq!(elst.entries[0].segment_duration, 1000);
-            assert_eq!(elst.entries[0].media_time, u64::MAX);
+            assert!(
+                trak.edts.as_ref().and_then(|e| e.elst.as_ref()).is_none(),
+                "track {} should have no elst — the shared 1s offset is rebased away",
+                trak.tkhd.track_id,
+            );
         }
 
+        // The body tfdts keep the absolute 1s offset, so downstream
+        // concatenation stays continuous even though the moov plays from zero.
         let video_tfdt = find_first_tfdt_for_track(&out, video_track_id).unwrap();
         let audio_tfdt = find_first_tfdt_for_track(&out, audio_track_id).unwrap();
         assert_eq!(video_tfdt, video_offset);

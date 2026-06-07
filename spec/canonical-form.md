@@ -258,19 +258,22 @@ Round-trip:
 
 1. **Source → MUXL.** Any leading empty-edit entries (`media_time == -1`) at the head of a source track's `elst` are summed and rescaled from the movie timescale into the track's media timescale, becoming that track's _presentation offset_ (`start_offset_ticks` in the canonical sample plan). For an fMP4 input, the same value is read directly from the first fragment's `tfdt.base_media_decode_time`. Any non-empty entries on the source elst beyond the leading empty-edit shape are discarded; a canonical MUXL track's media timeline begins at `media_time == 0`.
 
-   Per-track presentation offsets are preserved verbatim — there is no inter-track normalization. A/V sync rides on the natural delta between each track's offset; absolute time anchoring is preserved as-is. This is load-bearing for livestream-segment workflows, where each segment of a stream carries cumulative-from-stream-start tfdts, and downstream concatenation must produce monotonic output without a rebase step. Same-track-anchor inputs (a segment of a stream at the 5-second mark with both tracks at offset 5000 ticks) preserve that 5000 in the canonical bytes; both tracks emit synthesized elsts.
+   In the **canonical bytes**, per-track presentation offsets are preserved verbatim — there is no inter-track normalization, and absolute time anchoring is kept as-is. This is load-bearing for livestream-segment workflows, where each segment of a stream carries cumulative-from-stream-start tfdts, and downstream concatenation must produce monotonic output without a rebase step. A same-track-anchor input (a segment of a stream at the 5-second mark with both tracks at offset 5000 ticks) preserves that 5000 in the canonical bytes. (The flat MP4 *presentation* rebases that shared base away — see step 2 — but it does so in the synthesized `moov` only, leaving the canonical-byte tfdts intact, so concatenation stays monotonic.)
 
-2. **MUXL → flat MP4.** For any track whose presentation offset is non-zero, `write_flat_mp4` synthesizes a canonical two-entry `elst` in that track's `trak`:
-   - Entry 1: `segment_duration = offset_movie_ts, media_time = -1` (empty edit)
-   - Entry 2: `segment_duration = media_duration_movie_ts, media_time = 0` (normal play)
+2. **MUXL → flat MP4.** The flat MP4 is a *presentation* wrapper, so its synthesized `moov` is rebased to begin playback at presentation time zero. `build_synth_flat_header` takes the global-minimum presentation offset across all tracks (the common base a mid-stream VOD inherits) and subtracts it, so the earliest track lands at offset zero and the others keep only their *residual* skew relative to it:
+   - The anchor (earliest) track gets **no `edts` box** — it plays from zero.
+   - Each remaining track gets a canonical two-entry `elst`:
+     - Entry 1: `segment_duration = residual_movie_ts, media_time = -1` (empty edit)
+     - Entry 2: `segment_duration = media_duration_movie_ts, media_time = 0` (normal play)
+   - A track whose residual is zero (its offset equalled the anchor) gets no `edts` box.
 
-   A zero offset produces no `edts` box at all.
+   The rebase rewrites the synthesized `moov` only — the canonical segment bytes (and their `tfdt`s) are written from the original absolute offsets, so step 1's concatenation continuity is unaffected. This makes a VOD wrapped from a mid-stream point (every track's first `tfdt` tens of seconds into a live stream) play as an ordinary file from zero, instead of presenting that offset as a leading empty edit followed by content.
 
 3. **MUXL → fragments.** First fragment's `tfdt` carries the presentation offset; later fragments' tfdts follow from per-sample durations as usual. No `elst` is ever in play.
 
 Two consequences worth noting:
 
-- **Capture-clock anchor preserved.** A source whose first sample lands at decode_time=24000 produces canonical bytes whose first-fragment tfdt is 24000. For HLS playback this is invisible (the playlist anchors the timeline); for direct `<video src>` playback the timeline starts at the encoded position, not at zero. Callers who specifically need a "shift to time zero" transform should apply it explicitly before writing.
+- **Capture-clock anchor preserved in the bytes; flat playback starts at zero.** A source whose first sample lands at decode_time=24000 produces canonical bytes whose first-fragment tfdt is 24000 — preserved for concatenation and provenance. The flat MP4 *presentation*, however, rebases to zero by default (step 2), so direct `<video src>` playback begins at the start of content rather than after a 24000-tick empty edit. HLS playback was always anchored by the playlist regardless.
 - **Different absolute anchors → different canonical CIDs.** Two source files with the same logical content but different leading offsets produce different canonical bytes (and therefore different CIDs). Same-logical-content / same-CID is not a property of muxl's canonical form; it never has been across all dimensions, and absolute time anchoring is a meaningful axis here. Wall-clock provenance, when needed, is carried by an upper signing layer (C2PA/S2PA), not by MUXL itself.
 
 Source `elst` patterns outside the leading-empty-edit shape — media-time offsets used for encoder priming, rate changes, trims — are not converged by MUXL and are tracked in `open-questions.md`. A source file with a priming `elst` (e.g. `media_time = 1024` for AAC) currently loses the priming metadata in the MUXL form; playback is offset by the priming duration until a separate sample-dropping normalization lands.

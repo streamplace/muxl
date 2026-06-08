@@ -155,6 +155,17 @@ func (e *WASMEngine) WrapInit(ctx context.Context, input io.Reader, out io.Write
 	return e.runWith(ctx, []string{"muxl", "wrap", "-", "-", "--format", "fmp4", "--init-only"}, nil, false, input, out, nil, nil, nil, nil, nil)
 }
 
+// Metafiles implements [Engine].
+func (e *WASMEngine) Metafiles(ctx context.Context, input io.Reader, out io.Writer) error {
+	return e.runWith(ctx, []string{"muxl", "metafile", "-"}, nil, false, input, out, nil, nil, nil, nil, nil)
+}
+
+// SynthesizeFlatHeader implements [Engine]. Synthesis is deterministic (no
+// clock, no randomness), so it runs with realClock=false and is byte-stable.
+func (e *WASMEngine) SynthesizeFlatHeader(ctx context.Context, metafiles io.Reader, out io.Writer) error {
+	return e.runWith(ctx, []string{"muxl", "flat-header", "-"}, nil, false, metafiles, out, nil, nil, nil, nil, nil)
+}
+
 // SignSegment implements [Engine]. Signing needs the real wall clock (c2pa-rs
 // checks cert validity and draws COSE nonces from real randomness), so it runs
 // with realClock=true and is not byte-stable across runs.

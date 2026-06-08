@@ -82,6 +82,28 @@ type Engine interface {
 	// WrapInit synthesizes only the per-stream init segment (ftyp+moov) — the
 	// HLS EXT-X-MAP target — from a MUXL wrapper's embedded catalogs.
 	WrapInit(ctx context.Context, input io.Reader, out io.Writer) error
+
+	// Metafiles streams the payload-free metafiles for a MUXL wrapper as raw
+	// DRISL bytes — one init then one segment per canonical .m4s, in canonical
+	// interleave order. Run it on a single signed .m4s to archive that one
+	// segment, or on a whole blob for the full stream. Store these bytes
+	// VERBATIM (the segment metafiles per segment, the init once) and feed a
+	// concatenated range straight to SynthesizeFlatHeader: keeping the bytes
+	// rather than decoding to Event and re-encoding preserves the full catalog
+	// (codec config) the synthesized moov needs.
+	Metafiles(ctx context.Context, input io.Reader, out io.Writer) error
+
+	// SynthesizeFlatHeader reads a metafile stream (one init then N segment
+	// metafiles — DRISL, in canonical interleave order, e.g. the enriched
+	// event stream re-encoded payload-free) and writes the flat-MP4 faststart
+	// header (ftyp+moov+mdat-envelope-header) for that segment range. The
+	// header's chunk offsets already include its own length, so serving
+	// [header][canonical blob bytes for the range] is a byte-range-seekable
+	// MP4 with no further offset math — the basis for "flat-MP4 VOD". A
+	// sub-range re-anchors its own edit list, so clips work the same way.
+	// Deterministic: identical input yields byte-identical output, so the
+	// header can be content-addressed and cached.
+	SynthesizeFlatHeader(ctx context.Context, metafiles io.Reader, out io.Writer) error
 }
 
 // CanonicalizeOption configures [Engine.Canonicalize].

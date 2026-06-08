@@ -611,3 +611,49 @@ func hasAction(m manifestDoc, action string) bool {
 	}
 	return false
 }
+
+// TestFlatHeaderFromMetafiles exercises the flat-MP4-VOD path end to end through
+// the Go binding: emit payload-free metafiles for a canonical wrapper, then
+// synthesize a faststart header from them. The synthesized header must be
+// byte-identical to the prefix of a real flat MP4 of the same content, so
+// serving [header][canonical blob] is an exact, byte-range-seekable MP4.
+func TestFlatHeaderFromMetafiles(t *testing.T) {
+	eng := newEngine(t)
+	ctx := context.Background()
+	frag := readFile(t, fixtureFmp4)
+
+	// Canonicalize the fragmented fixture, then build a flat MP4 as the oracle.
+	canon, err := eng.Canonicalize(ctx, frag)
+	if err != nil {
+		t.Fatalf("Canonicalize: %v", err)
+	}
+	var flat bytes.Buffer
+	if err := eng.Wrap(ctx, bytes.NewReader(canon), "flat", &flat); err != nil {
+		t.Fatalf("Wrap flat: %v", err)
+	}
+
+	// Emit verbatim metafiles for the same content, then synthesize the header.
+	var metas bytes.Buffer
+	if err := eng.Metafiles(ctx, bytes.NewReader(canon), &metas); err != nil {
+		t.Fatalf("Metafiles: %v", err)
+	}
+	if metas.Len() == 0 {
+		t.Fatal("Metafiles produced no output")
+	}
+	var hdr bytes.Buffer
+	if err := eng.SynthesizeFlatHeader(ctx, bytes.NewReader(metas.Bytes()), &hdr); err != nil {
+		t.Fatalf("SynthesizeFlatHeader: %v", err)
+	}
+	if hdr.Len() == 0 {
+		t.Fatal("SynthesizeFlatHeader produced no output")
+	}
+
+	// The synthesized header is exactly the flat MP4's prefix, so
+	// [header][canonical blob bytes] reproduces the flat MP4 byte-for-byte.
+	if !bytes.HasPrefix(flat.Bytes(), hdr.Bytes()) {
+		t.Fatalf("synthesized header (%d bytes) is not a prefix of the flat MP4 (%d bytes)", hdr.Len(), flat.Len())
+	}
+	if hdr.Len() >= flat.Len() {
+		t.Fatalf("header (%d) not shorter than the flat MP4 (%d)", hdr.Len(), flat.Len())
+	}
+}

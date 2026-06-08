@@ -93,6 +93,17 @@ type Engine interface {
 	// (codec config) the synthesized moov needs.
 	Metafiles(ctx context.Context, input io.Reader, out io.Writer) error
 
+	// Metafile returns the segment metafile (DRISL, no init) for a single
+	// canonical .m4s — the per-fragment primitive for archiving
+	// header-synthesis data (including the edit-list anchor, first_decode_times)
+	// as segments are produced, e.g. on each signed fragment inside a
+	// SignSegment loop, in memory with no re-read. It's exactly one `segment`
+	// value from Metafiles; capture one init once (Metafiles on the first
+	// segment, or the SignSegment init), then archive a Metafile per segment.
+	// Works on signed segments: byte sizes and offsets account for the c2pa
+	// uuid prefix.
+	Metafile(ctx context.Context, segment []byte) ([]byte, error)
+
 	// SynthesizeFlatHeader reads a metafile stream (one init then N segment
 	// metafiles — DRISL, in canonical interleave order, e.g. the enriched
 	// event stream re-encoded payload-free) and writes the flat-MP4 faststart

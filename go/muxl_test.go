@@ -657,3 +657,40 @@ func TestFlatHeaderFromMetafiles(t *testing.T) {
 		t.Fatalf("header (%d) not shorter than the flat MP4 (%d)", hdr.Len(), flat.Len())
 	}
 }
+
+// TestSignedMetafileFlatHeader verifies the live/sign path: metafiles built
+// from SIGNED canonical segments (c2pa-prefixed) synthesize a flat header whose
+// co64 offsets correctly account for the signature prefix. Oracle: a flat MP4
+// wrapped directly over the same signed stream. Also exercises the per-segment
+// Metafile primitive on a signed segment.
+func TestSignedMetafileFlatHeader(t *testing.T) {
+	eng := newEngine(t)
+	ctx := context.Background()
+	signed := signedM4sStream(t, eng)
+
+	var flat bytes.Buffer
+	if err := eng.Wrap(ctx, bytes.NewReader(signed), "flat", &flat); err != nil {
+		t.Fatalf("Wrap flat: %v", err)
+	}
+	var metas bytes.Buffer
+	if err := eng.Metafiles(ctx, bytes.NewReader(signed), &metas); err != nil {
+		t.Fatalf("Metafiles: %v", err)
+	}
+	var hdr bytes.Buffer
+	if err := eng.SynthesizeFlatHeader(ctx, bytes.NewReader(metas.Bytes()), &hdr); err != nil {
+		t.Fatalf("SynthesizeFlatHeader: %v", err)
+	}
+	if !bytes.HasPrefix(flat.Bytes(), hdr.Bytes()) {
+		t.Fatalf("synthesized header (%d) is not a prefix of the signed flat MP4 (%d)", hdr.Len(), flat.Len())
+	}
+
+	// Per-segment primitive: Metafile(one signed segment) is the per-fragment
+	// archive unit; it must produce a non-empty segment metafile.
+	m, err := eng.Metafile(ctx, firstSignedSegment(t, eng))
+	if err != nil {
+		t.Fatalf("Metafile: %v", err)
+	}
+	if len(m) == 0 {
+		t.Fatal("Metafile produced no output for a signed segment")
+	}
+}

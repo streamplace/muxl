@@ -160,6 +160,15 @@ func (e *WASMEngine) Metafiles(ctx context.Context, input io.Reader, out io.Writ
 	return e.runWith(ctx, []string{"muxl", "metafile", "-"}, nil, false, input, out, nil, nil, nil, nil, nil)
 }
 
+// Metafile implements [Engine].
+func (e *WASMEngine) Metafile(ctx context.Context, segment []byte) ([]byte, error) {
+	var out bytes.Buffer
+	if err := e.runWith(ctx, []string{"muxl", "metafile", "--no-init", "-"}, nil, false, bytes.NewReader(segment), &out, nil, nil, nil, nil, nil); err != nil {
+		return nil, err
+	}
+	return out.Bytes(), nil
+}
+
 // SynthesizeFlatHeader implements [Engine]. Synthesis is deterministic (no
 // clock, no randomness), so it runs with realClock=false and is byte-stable.
 func (e *WASMEngine) SynthesizeFlatHeader(ctx context.Context, metafiles io.Reader, out io.Writer) error {

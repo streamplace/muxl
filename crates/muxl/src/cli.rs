@@ -56,10 +56,11 @@ enum Command {
     /// on stdout — the per-track equivalent of the manifest+cert blob the
     /// host used to get from the iroh-streamplace c2pa binding.
     Verify,
-    /// Human-readable inspection of a MUXL segment file: per-track codec
-    /// info plus signing info (signer DID, validation state, actions,
-    /// ingredients) when a C2PA/S2PA manifest is attached. Colorized when
-    /// stdout is a TTY.
+    /// Inspect a MUXL segment file: per-track codec info plus signing info
+    /// (signer DID, validation state, actions, ingredients) when a C2PA/S2PA
+    /// manifest is attached. Colorized when stdout is a TTY; --json emits the
+    /// machine form, and --manifests adds each segment's full embedded C2PA
+    /// manifest store.
     Inspect(InspectArgs),
 
     /// Generate a fresh secp256k1 (ES256K) private key as PKCS#8 PEM.
@@ -199,6 +200,13 @@ impl SigningArgs {
 struct InspectArgs {
     /// MUXL segment file to inspect (bare .m4s, fMP4, or flat MP4).
     input: PathBuf,
+    /// Emit the report as JSON instead of the colorized human form.
+    #[arg(long)]
+    json: bool,
+    /// Include each segment's full embedded C2PA manifest store (works with
+    /// --json, where it nests under the segment).
+    #[arg(long)]
+    manifests: bool,
 }
 
 #[derive(clap::Args)]
@@ -384,7 +392,11 @@ fn cmd_sign_transcode(args: SignTranscodeArgs) -> Result<()> {
 }
 
 fn cmd_inspect(args: InspectArgs) -> Result<()> {
-    crate::inspect::inspect_file(&args.input)
+    let opts = crate::inspect::InspectOptions {
+        json: args.json,
+        manifests: args.manifests,
+    };
+    crate::inspect::inspect_file(&args.input, opts)
 }
 
 fn cmd_verify() -> Result<()> {

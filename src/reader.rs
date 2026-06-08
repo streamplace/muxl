@@ -168,7 +168,7 @@ pub fn aggregate_catalog(segments: &[Segment<'_>]) -> Catalog {
 /// Fold one segment's single-track catalog into a running aggregate. Renditions
 /// dedupe by name (same track → same config); video `display`/`rotation`/`flip`
 /// are taken from the first segment that carries them.
-fn merge_segment_catalog(agg: &mut Catalog, cat: &Catalog) {
+pub(crate) fn merge_segment_catalog(agg: &mut Catalog, cat: &Catalog) {
     if let Some(v) = &cat.video {
         for (name, cfg) in &v.renditions {
             agg.insert_video(name.clone(), cfg.clone());
@@ -574,7 +574,7 @@ fn capture_box<R: Read>(
 /// [`scan_segments`]: it skips a leading `ftyp`/`moov` (and other framing),
 /// descends a flat MP4's outer `mdat` envelope, and splits the canonical-segment
 /// stream on MUXL `uuid` boundaries — without seeking or holding more than one box.
-fn scan_wrapper_stream<R: Read, F>(reader: R, mut on_segment: F) -> Result<()>
+pub(crate) fn scan_wrapper_stream<R: Read, F>(reader: R, mut on_segment: F) -> Result<()>
 where
     F: FnMut(&[u8]) -> Result<()>,
 {

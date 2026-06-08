@@ -1,30 +1,34 @@
-//! Metafile: a payload-free, versioned view of canonical-segment metadata, and
-//! on-demand synthesis of a flat-MP4 faststart header from an ordered set of
-//! them — *without* the segment bytes.
+//! Metafile: a payload-free, versioned, self-contained view of one canonical
+//! segment's metadata, and on-demand synthesis of a flat-MP4 faststart header
+//! from an ordered set of them — *without* the segment bytes.
 //!
 //! This is what makes "flat-MP4 VOD" content-addressable. A consumer archives
-//! one small metafile per canonical segment (plus the init once), then
-//! synthesizes a faststart header for any contiguous segment range on demand.
-//! Serving `[header][canonical blob bytes for the range]` yields a
-//! byte-range-seekable MP4 whose `moov` is exact for those bytes — no random
-//! access over the blob, no re-muxing.
+//! exactly one metafile per canonical segment (`.m4s`); to play any contiguous
+//! range it feeds those metafiles to [`synthesize_flat_header`] and serves
+//! `[synthesized header][canonical blob range]` — a byte-range-seekable MP4
+//! whose `moov` is exact, with no random access over the blob and no re-mux.
 //!
-//! The wire format is DRISL / dag-cbor: one [`MetafileInit`] (carrying the
-//! catalog), then one [`MetafileSegment`] per canonical `.m4s` (per-track), in
-//! canonical interleave order. The field names match the live [`CborEvent`]
-//! stream exactly (a metafile is the payload-free subset — no `data`/`tracks`),
-//! so the same consumer-side decoder reads both. They're plain structs rather
-//! than a `#[serde(tag)]` enum so they decode cleanly under DRISL: a tagged
-//! enum buffers each variant through an intermediate that mishandles the
-//! catalog's byte fields, whereas a plain struct deserializes them directly
-//! (the same path [`crate::catalog`] round-trips through).
+//! One metafile maps 1:1 to one canonical `.m4s` and is **self-contained**: it
+//! carries that segment's single-track catalog (codec config the `moov` needs)
+//! alongside the per-sample tables, byte size, and first decode time. There is
+//! no separate init blob — the catalog is small and the canonical `.m4s`
+//! already embeds it per segment, so mirroring that keeps the archive a flat
+//! per-segment store with no coordination. The synthesizer aggregates the
+//! per-segment catalogs into the multi-track `moov`.
 //!
-//! Offsets are owned entirely by muxl: the synthesized `moov`'s `co64` already
-//! resolves to `header_len + body_offset + per_sample_offset`, so the caller
-//! passes no base offset — it serves the header bytes immediately followed by
-//! the segment bodies in input order. See `spec/canonical-form.md § Metafile`.
+//! Wire form is DRISL / dag-cbor; field names match the live [`CborEvent`]
+//! stream (a metafile is its payload-free subset — no `tracks` — plus the
+//! catalog), so the same consumer-side decoder reads both. It is a plain struct
+//! rather than a `#[serde(tag)]` enum so DRISL decodes the catalog's byte
+//! fields directly (a tagged enum buffers through an intermediate that can't).
+//!
+//! Offsets are owned entirely by muxl: the synthesized `co64` already resolves
+//! to `header_len + body_offset + per_sample_offset`, so the caller passes no
+//! base offset — it serves the header then the segment bodies in input order.
+//! See `spec/canonical-form.md § Metafile`.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::io::Read;
 
 use serde::{Deserialize, Serialize};
 
@@ -33,33 +37,25 @@ use crate::cbor::{CborTrackSamples, METAFILE_VERSION};
 use crate::error::{Error, Result};
 use crate::flat::{SegmentMetadata, build_synth_flat_header};
 
-/// The one-time per-stream metafile: the catalog the synthesizer needs
-/// (codecs, dimensions, timescales). DRISL key `type` = `"init"`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct MetafileInit {
-    /// Always `"init"` — present for wire symmetry with the [`CborEvent`]
-    /// stream and consumer routing.
+/// One canonical segment's self-contained metafile, payload-free. DRISL key
+/// `type` = `"segment"`. Single-track (one canonical `.m4s`); maps are keyed by
+/// stringified track id.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct MetafileSegment {
+    /// Always `"segment"` — present for wire symmetry with the event stream.
     #[serde(rename = "type", default)]
     pub kind: String,
     /// Wire-format version ([`METAFILE_VERSION`]).
     #[serde(default)]
     pub version: u16,
-    /// Track configuration (codec/dimensions/timescale + decoder config bytes).
+    /// This segment's single-track catalog (codec/dimensions/timescale +
+    /// decoder config bytes) — the codec config the synthesized `moov` needs.
     pub catalog: Catalog,
-}
-
-/// One canonical segment's metadata, payload-free. DRISL key `type` =
-/// `"segment"`. Maps are keyed by stringified track id. Typically single-track
-/// (one canonical `.m4s`), but a pre-grouped multi-track GoP also works.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct MetafileSegment {
-    #[serde(rename = "type", default)]
-    pub kind: String,
     /// Per-track per-sample tables (stsz/stts/ctts/stss + per-sample offsets).
     #[serde(default)]
     pub samples: BTreeMap<String, CborTrackSamples>,
-    /// Per-track on-disk byte size of this segment's body contribution
-    /// (uuid prefix + moof+mdat run, incl. any c2pa signature) — for `co64`.
+    /// Per-track on-disk byte size of this segment (uuid prefix + moof+mdat
+    /// run, incl. any c2pa signature) — for `co64` placement.
     #[serde(default)]
     pub track_byte_sizes: BTreeMap<String, u64>,
     /// Per-track decode time (`tfdt`) of this segment's first sample — the
@@ -103,24 +99,27 @@ pub struct FlatHeader {
     pub bytes: Vec<u8>,
     /// Total body bytes the header expects to follow it.
     pub total_body: u64,
-    /// Per input segment event, in order: where its bytes land in the body.
+    /// Per input segment, in order: where its bytes land in the body.
     pub segments: Vec<SegmentLayout>,
 }
 
-/// Build the metafile event for ONE canonical segment (`.m4s`).
+/// Build the self-contained metafile for ONE canonical segment (`.m4s`).
 ///
-/// Carries the per-sample tables, the segment's on-disk byte size (for `co64`
-/// placement), and the first sample's decode time (the `elst` anchor) — with
-/// no payload. `byte_size`/offsets are taken from the bytes as given, so feed
-/// the *final* stored bytes (post-signing) for an exact header.
+/// Carries the segment's single-track catalog, per-sample tables, on-disk byte
+/// size (for `co64` placement), and first sample's decode time (the `elst`
+/// anchor) — with no payload. `byte_size`/offsets are taken from the bytes as
+/// given, so feed the *final* stored bytes (post-signing) for an exact header.
 pub fn segment_metafile(segment_bytes: &[u8]) -> Result<MetafileSegment> {
     let (tid, ts, first_dts) = crate::present::segment_index(segment_bytes)?;
+    let catalog = crate::catalog::from_segment(segment_bytes)?;
     let key = tid.to_string();
     let dur_ticks: u64 = ts.durations.iter().map(|&d| d as u64).sum();
     let sample_count = ts.durations.len() as u32;
     let byte_size = segment_bytes.len() as u64;
     Ok(MetafileSegment {
         kind: "segment".into(),
+        version: METAFILE_VERSION,
+        catalog,
         samples: BTreeMap::from([(key.clone(), (&ts).into())]),
         track_byte_sizes: BTreeMap::from([(key.clone(), byte_size)]),
         first_decode_times: BTreeMap::from([(key.clone(), first_dts)]),
@@ -133,26 +132,36 @@ pub fn segment_metafile(segment_bytes: &[u8]) -> Result<MetafileSegment> {
     })
 }
 
-/// Build the `init` metafile from a catalog.
-pub fn init_metafile(catalog: &Catalog) -> MetafileInit {
-    MetafileInit {
-        kind: "init".into(),
-        version: METAFILE_VERSION,
-        catalog: catalog.clone(),
-    }
+/// Stream one self-contained metafile per canonical segment of a MUXL wrapper
+/// (bare m4s, fMP4, or flat MP4), front-to-back. Constant memory — never holds
+/// more than one segment — so it runs over a multi-GB blob in ~one GoP of RAM.
+pub fn metafiles_stream<R: Read, F>(reader: R, mut emit: F) -> Result<()>
+where
+    F: FnMut(MetafileSegment) -> Result<()>,
+{
+    crate::reader::scan_wrapper_stream(reader, |seg| emit(segment_metafile(seg)?))
 }
 
-/// Synthesize a flat-MP4 faststart header from a catalog + an ordered set of
-/// per-canonical-segment metafiles (canonical interleave order).
+/// Synthesize a flat-MP4 faststart header from an ordered set of self-contained
+/// per-segment metafiles (canonical interleave order). The multi-track catalog
+/// is aggregated from the segments' single-track catalogs.
 ///
 /// Deterministic: identical input yields byte-identical `bytes`, so the result
 /// can be content-addressed and cached. Segment metafiles are regrouped into
-/// GoPs (a new GoP begins when a track id repeats) exactly as `unwrap` orders
-/// them, then handed to [`build_synth_flat_header`].
-pub fn synthesize_flat_header(
-    init: &MetafileInit,
-    segments: &[MetafileSegment],
-) -> Result<FlatHeader> {
+/// GoPs (a new GoP begins when a track id repeats — the same rule `unwrap`
+/// orders by), then handed to [`build_synth_flat_header`].
+pub fn synthesize_flat_header(segments: &[MetafileSegment]) -> Result<FlatHeader> {
+    if segments.is_empty() {
+        return Err(Error::InvalidMp4("no metafile segments to synthesize".into()));
+    }
+
+    // Aggregate the per-segment single-track catalogs into the multi-track
+    // catalog the moov needs (same dedupe-by-rendition-name as unwrap).
+    let mut catalog = Catalog::default();
+    for seg in segments {
+        crate::reader::merge_segment_catalog(&mut catalog, &seg.catalog);
+    }
+
     // Regroup the per-track segment metafiles into per-GoP SegmentMetadata, and
     // record each metafile's body placement (cumulative byte size in order).
     let mut gops: Vec<SegmentMetadata> = Vec::new();
@@ -199,11 +208,7 @@ pub fn synthesize_flat_header(
         gops.push(g);
     }
 
-    if gops.is_empty() {
-        return Err(Error::InvalidMp4("metafile stream has no segments".into()));
-    }
-
-    let bytes = build_synth_flat_header(&init.catalog, &gops)?;
+    let bytes = build_synth_flat_header(&catalog, &gops)?;
     Ok(FlatHeader {
         bytes,
         total_body: running_body,
@@ -239,18 +244,15 @@ mod tests {
     }
 
     /// The metafile path must reproduce a flat MP4 byte-for-byte: synthesize a
-    /// header from per-segment metafiles + the catalog, concatenate the
-    /// verbatim segment bodies, and get exactly the direct flat writer's
-    /// output. This is the content-addressing guarantee.
+    /// header from per-segment metafiles, concatenate the verbatim segment
+    /// bodies, and get exactly the direct flat writer's output.
     fn assert_metafile_synth_matches_direct_flat(fixture: &str) {
         let flat = flat_wrapper(fixture);
         let segs = reader::unwrap(&flat).unwrap();
-        let catalog = reader::aggregate_catalog(&segs);
 
-        let init = init_metafile(&catalog);
         let metas: Vec<MetafileSegment> =
             segs.iter().map(|s| segment_metafile(s.data).unwrap()).collect();
-        let header = synthesize_flat_header(&init, &metas).unwrap();
+        let header = synthesize_flat_header(&metas).unwrap();
 
         // [header][verbatim segment bodies, in order] == the flat MP4.
         let mut assembled = header.bytes.clone();
@@ -284,42 +286,55 @@ mod tests {
         assert_metafile_synth_matches_direct_flat("h264-opus-frag.mp4");
     }
 
-    /// Full DRISL round-trip: encode init + segment metafiles, decode them back
-    /// positionally (the synth CLI's path), and confirm the synth from the
+    /// Full DRISL round-trip: encode the self-contained segment metafiles,
+    /// decode them back (the synth CLI's path), and confirm the synth from the
     /// decoded values byte-matches the synth from the in-memory values. Proves
-    /// the wire format carries everything and decodes under DRISL.
+    /// the wire format carries everything (incl. the catalog) and decodes.
     #[test]
     fn metafile_drisl_roundtrip_matches() {
         let flat = flat_wrapper("h264-aac.mp4");
         let segs = reader::unwrap(&flat).unwrap();
-        let catalog = reader::aggregate_catalog(&segs);
-
-        let init = init_metafile(&catalog);
         let metas: Vec<MetafileSegment> =
             segs.iter().map(|s| segment_metafile(s.data).unwrap()).collect();
-        let direct = synthesize_flat_header(&init, &metas).unwrap();
+        let direct = synthesize_flat_header(&metas).unwrap();
 
-        // Encode the whole stream: init first, then segments.
+        // Encode the segment metafiles back to back.
         let mut wire = Vec::new();
-        dasl::drisl::to_writer(&mut wire, &init).unwrap();
         for m in &metas {
             dasl::drisl::to_writer(&mut wire, m).unwrap();
         }
-
-        // Decode positionally: first value = init, rest = segments, until EOF.
+        // Decode the uniform stream until EOF.
         let mut cur = Cursor::new(&wire[..]);
-        let decoded_init: MetafileInit = dasl::drisl::de::from_reader_once(&mut cur).unwrap();
-        let mut decoded_segs: Vec<MetafileSegment> = Vec::new();
+        let mut decoded: Vec<MetafileSegment> = Vec::new();
         while (cur.position() as usize) < wire.len() {
-            decoded_segs.push(dasl::drisl::de::from_reader_once(&mut cur).unwrap());
+            decoded.push(dasl::drisl::de::from_reader_once(&mut cur).unwrap());
         }
-        assert_eq!(decoded_init.kind, "init");
-        assert_eq!(decoded_init.version, METAFILE_VERSION);
-        assert_eq!(decoded_segs.len(), metas.len());
+        assert_eq!(decoded.len(), metas.len());
+        assert!(decoded.iter().all(|m| m.kind == "segment" && m.version == METAFILE_VERSION));
 
-        let via_wire = synthesize_flat_header(&decoded_init, &decoded_segs).unwrap();
+        let via_wire = synthesize_flat_header(&decoded).unwrap();
         assert_eq!(via_wire.bytes, direct.bytes);
         assert_eq!(via_wire.total_body, direct.total_body);
         assert_eq!(via_wire.segments, direct.segments);
+    }
+
+    /// The streaming emitter yields the same self-contained metafiles as
+    /// mapping `segment_metafile` over `unwrap`.
+    #[test]
+    fn metafiles_stream_matches_unwrap() {
+        let flat = flat_wrapper("h264-opus-frag.mp4");
+        let segs = reader::unwrap(&flat).unwrap();
+        let expected: Vec<Vec<u8>> = segs
+            .iter()
+            .map(|s| dasl::drisl::to_vec(&segment_metafile(s.data).unwrap()).unwrap())
+            .collect();
+
+        let mut got: Vec<Vec<u8>> = Vec::new();
+        metafiles_stream(Cursor::new(&flat), |m| {
+            got.push(dasl::drisl::to_vec(&m).unwrap());
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(got, expected);
     }
 }

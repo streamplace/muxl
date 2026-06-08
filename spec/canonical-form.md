@@ -143,13 +143,13 @@ Given `ftyp` size `F`, `moov` size `M`, per-segment `uuid` sizes `u_s`, and per-
 
 ### Metafile Wire Format
 
-The **metafile** is the durable, versioned wire form of that per-segment metadata — what a consumer archives (one per canonical segment, plus one init) so it can synthesize a flat-MP4 faststart header for any contiguous segment range on demand, without touching the blob. This makes "flat-MP4 VOD" content-addressable: `[synthesized header][canonical blob range]` is a byte-range-seekable MP4 whose `moov` is exact.
+The **metafile** is the durable, versioned wire form of that per-segment metadata — what a consumer archives (exactly one per canonical segment) so it can synthesize a flat-MP4 faststart header for any contiguous segment range on demand, without touching the blob. This makes "flat-MP4 VOD" content-addressable: `[synthesized header][canonical blob range]` is a byte-range-seekable MP4 whose `moov` is exact.
 
-It is DRISL / dag-cbor: one `init` value, then one `segment` value per canonical `.m4s` (per-track), in canonical interleave order. Map keys are stringified track ids. The field names match the live event stream (`src/cbor.rs` `CborEvent`); a metafile is its payload-free subset (no `data`, no `tracks`), so one consumer-side decoder reads both. The first `init` carries `version` (`METAFILE_VERSION`, currently `1`); the schema evolves additively and the version is the hard gate.
+It is DRISL / dag-cbor: one self-contained `segment` value per canonical `.m4s` (per-track), in canonical interleave order — there is no separate init blob. Each metafile carries that segment's single-track `catalog` (the codec config the `moov` needs) alongside the tables, mirroring how the canonical `.m4s` already embeds its catalog per segment, so the archive is a flat per-segment store with no init coordination and the catalog is negligible next to the per-sample arrays. Map keys are stringified track ids. The field names match the live event stream (`src/cbor.rs` `CborEvent`); a metafile is its payload-free subset (no `tracks`) plus the catalog, so one consumer-side decoder reads both. Each carries `version` (`METAFILE_VERSION`, currently `1`); the schema evolves additively and the version is the hard gate.
 
 ```
-init    = { "type": "init", "version": uint, "catalog": <Catalog> }
-segment = { "type": "segment",
+segment = { "type": "segment", "version": uint,
+            "catalog": <Catalog>,                  ; this segment's single-track catalog
             "samples":            { tid: { durations, sizes, cts_offsets, sync_indices, offsets } },
             "track_byte_sizes":   { tid: uint },   ; on-disk bytes incl. any c2pa signature
             "first_decode_times": { tid: uint },   ; tfdt of first sample (track ticks)
@@ -158,11 +158,11 @@ segment = { "type": "segment",
             "body_size": uint, "duration_us": uint }
 ```
 
-`samples[tid].offsets` and `track_byte_sizes[tid]` are measured from the exact bytes stored in the blob, so they must be taken **after** c2pa signing (the signed uuid prefix shifts every offset and grows the size); the per-sample `durations`/`sizes`/`cts`/`sync` are signing-invariant.
+`samples[tid].offsets` and `track_byte_sizes[tid]` are measured from the exact bytes stored in the blob, so they must be taken **after** c2pa signing (the signed uuid prefix shifts every offset and grows the size); the per-sample `durations`/`sizes`/`cts`/`sync` are signing-invariant. The metafile is a plain struct, not a `#[serde(tag)]` enum, so DRISL decodes the catalog's byte fields (`avcC`/`esds`) directly — a tagged enum buffers them through an intermediate that does not round-trip.
 
-**Synthesis** (`muxl::metafile::synthesize_flat_header`, CLI `muxl flat-header`) consumes an `init` + an ordered set of `segment` metafiles, regroups them into GoPs (a new GoP begins when a track id repeats — the same rule `unwrap` orders by), and runs `build_synth_flat_header`. muxl owns all offset math: the synthesized `co64` already resolves to `header_len + body_offset + per_sample_offset`, so the caller passes **no** base offset — it serves the header bytes immediately followed by the segment bodies, in input order. A sub-range synthesizes its own header (the range's first `first_decode_times` re-anchors the `elst` to presentation zero), so clips fall out for free. Synthesis is a pure function of its input, so the header is content-addressable and cacheable.
+**Synthesis** (`muxl::metafile::synthesize_flat_header`, CLI `muxl flat-header`) consumes an ordered set of `segment` metafiles, aggregates their single-track catalogs into the multi-track `moov`, regroups them into GoPs (a new GoP begins when a track id repeats — the same rule `unwrap` orders by), and runs `build_synth_flat_header`. muxl owns all offset math: the synthesized `co64` already resolves to `header_len + body_offset + per_sample_offset`, so the caller passes **no** base offset — it serves the header bytes immediately followed by the segment bodies, in input order. A sub-range synthesizes its own header (the range's first `first_decode_times` re-anchors the `elst` to presentation zero), so clips fall out for free. Synthesis is a pure function of its input, so the header is content-addressable and cacheable.
 
-The metafiles for a segment are emitted by `muxl metafile` (which re-serializes the payload-free view of the event stream, streaming) or built directly from canonical segment bytes via `muxl::metafile::segment_metafile`.
+The metafiles are emitted by `muxl metafile` (one self-contained metafile per segment, streaming — constant memory over a multi-GB blob) or built directly from canonical segment bytes via `muxl::metafile::segment_metafile`.
 
 ## Box Rules
 

@@ -163,7 +163,7 @@ func (e *WASMEngine) Metafiles(ctx context.Context, input io.Reader, out io.Writ
 // Metafile implements [Engine].
 func (e *WASMEngine) Metafile(ctx context.Context, segment []byte) ([]byte, error) {
 	var out bytes.Buffer
-	if err := e.runWith(ctx, []string{"muxl", "metafile", "--no-init", "-"}, nil, false, bytes.NewReader(segment), &out, nil, nil, nil, nil, nil); err != nil {
+	if err := e.runWith(ctx, []string{"muxl", "metafile", "-"}, nil, false, bytes.NewReader(segment), &out, nil, nil, nil, nil, nil); err != nil {
 		return nil, err
 	}
 	return out.Bytes(), nil

@@ -83,31 +83,31 @@ type Engine interface {
 	// HLS EXT-X-MAP target — from a MUXL wrapper's embedded catalogs.
 	WrapInit(ctx context.Context, input io.Reader, out io.Writer) error
 
-	// Metafiles streams the payload-free metafiles for a MUXL wrapper as raw
-	// DRISL bytes — one init then one segment per canonical .m4s, in canonical
-	// interleave order. Run it on a single signed .m4s to archive that one
-	// segment, or on a whole blob for the full stream. Store these bytes
-	// VERBATIM (the segment metafiles per segment, the init once) and feed a
-	// concatenated range straight to SynthesizeFlatHeader: keeping the bytes
-	// rather than decoding to Event and re-encoding preserves the full catalog
-	// (codec config) the synthesized moov needs.
+	// Metafiles streams one self-contained metafile per canonical segment of a
+	// MUXL wrapper, as raw DRISL bytes, in canonical interleave order. Each
+	// metafile is self-describing — it carries that segment's single-track
+	// catalog (codec config) alongside the per-sample tables — so there is no
+	// separate init blob. Run it on a single .m4s to archive that one segment,
+	// or on a whole blob for one metafile per segment. Store the bytes VERBATIM
+	// and feed a concatenated range straight to SynthesizeFlatHeader; keeping
+	// the bytes rather than decoding to Event and re-encoding preserves the
+	// catalog the synthesized moov needs.
 	Metafiles(ctx context.Context, input io.Reader, out io.Writer) error
 
-	// Metafile returns the segment metafile (DRISL, no init) for a single
+	// Metafile returns the self-contained metafile (DRISL) for a single
 	// canonical .m4s — the per-fragment primitive for archiving
-	// header-synthesis data (including the edit-list anchor, first_decode_times)
-	// as segments are produced, e.g. on each signed fragment inside a
-	// SignSegment loop, in memory with no re-read. It's exactly one `segment`
-	// value from Metafiles; capture one init once (Metafiles on the first
-	// segment, or the SignSegment init), then archive a Metafile per segment.
-	// Works on signed segments: byte sizes and offsets account for the c2pa
-	// uuid prefix.
+	// header-synthesis data (per-sample tables, the segment's catalog, and the
+	// edit-list anchor first_decode_times) as segments are produced, e.g. on
+	// each signed fragment inside a SignSegment loop, in memory with no
+	// re-read. It's exactly one value from Metafiles. Works on signed segments:
+	// byte sizes and offsets account for the c2pa uuid prefix.
 	Metafile(ctx context.Context, segment []byte) ([]byte, error)
 
-	// SynthesizeFlatHeader reads a metafile stream (one init then N segment
-	// metafiles — DRISL, in canonical interleave order, e.g. the enriched
-	// event stream re-encoded payload-free) and writes the flat-MP4 faststart
-	// header (ftyp+moov+mdat-envelope-header) for that segment range. The
+	// SynthesizeFlatHeader reads a metafile stream (one self-contained segment
+	// metafile per canonical .m4s — DRISL, in canonical interleave order) and
+	// writes the flat-MP4 faststart header (ftyp+moov+mdat-envelope-header) for
+	// that segment range, aggregating the per-segment catalogs into the moov.
+	// The
 	// header's chunk offsets already include its own length, so serving
 	// [header][canonical blob bytes for the range] is a byte-range-seekable
 	// MP4 with no further offset math — the basis for "flat-MP4 VOD". A

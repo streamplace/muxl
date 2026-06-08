@@ -3,9 +3,9 @@
 //! MP4 in argument order.
 //!
 //! Exercises the public CLI handler `muxl::cli::cmd_wrap` directly so the
-//! arg-shape (output first, `inputs: Vec`) and the concatenation semantics are
-//! both pinned: a future reorder of the positional args, or a regression in
-//! clap's variadic parsing, breaks this test.
+//! arg-shape (positional `files`, output-first by default) and the
+//! concatenation semantics are both pinned: a future reorder of the positional
+//! args, or a regression in clap's variadic parsing, breaks this test.
 
 use std::io::Cursor;
 use std::path::{Path, PathBuf};
@@ -74,9 +74,10 @@ fn wrap_concatenates_multiple_m4s_in_argument_order() {
     // tar-style invocation: output path first, then every input.
     let out = dir.path().join("wrapped.mp4");
     cmd_wrap(WrapArgs {
-        output: out.clone(),
-        inputs: inputs.clone(),
+        files: std::iter::once(out.clone()).chain(inputs.clone()).collect(),
         format: WrapFormat::Fmp4,
+        flat: None,
+        fmp4: None,
         init_only: false,
     })
     .unwrap();
@@ -135,18 +136,20 @@ fn wrap_multi_input_equals_wrapping_the_whole_fmp4() {
     for format in [WrapFormat::Fmp4, WrapFormat::Flat] {
         let single = dir.path().join("single.mp4");
         cmd_wrap(WrapArgs {
-            output: single.clone(),
-            inputs: vec![whole_path.clone()],
+            files: vec![single.clone(), whole_path.clone()],
             format,
+            flat: None,
+            fmp4: None,
             init_only: false,
         })
         .unwrap();
 
         let multi = dir.path().join("multi.mp4");
         cmd_wrap(WrapArgs {
-            output: multi.clone(),
-            inputs: inputs.clone(),
+            files: std::iter::once(multi.clone()).chain(inputs.clone()).collect(),
             format,
+            flat: None,
+            fmp4: None,
             init_only: false,
         })
         .unwrap();
@@ -155,6 +158,76 @@ fn wrap_multi_input_equals_wrapping_the_whole_fmp4() {
             std::fs::read(&single).unwrap(),
             std::fs::read(&multi).unwrap(),
             "wrapping the per-track .m4s files must match wrapping the whole fMP4 ({format:?})"
+        );
+    }
+}
+
+/// The `--flat <PATH>` / `--fmp4 <PATH>` shorthands name the output (and pick
+/// the container) while leaving every positional as an input — so they must
+/// produce byte-for-byte the same wrapper as the tar-style `--format` form with
+/// the output spelled out first.
+#[test]
+fn wrap_output_flag_shorthand_matches_tar_style() {
+    let src = canonical_fmp4("h264-opus-frag.mp4");
+    let segs = segments_of(&src);
+    let dir = tempfile::tempdir().unwrap();
+
+    let inputs: Vec<PathBuf> = segs
+        .iter()
+        .enumerate()
+        .map(|(i, (tid, data))| {
+            let p = dir.path().join(format!("seg{i:03}_track{tid}.m4s"));
+            std::fs::write(&p, data).unwrap();
+            p
+        })
+        .collect();
+
+    // (shorthand setter, equivalent --format) pairs.
+    let cases: [(fn(PathBuf) -> WrapArgs, WrapFormat); 2] = [
+        (
+            |out| WrapArgs {
+                files: Vec::new(),
+                format: WrapFormat::Fmp4,
+                flat: Some(out),
+                fmp4: None,
+                init_only: false,
+            },
+            WrapFormat::Flat,
+        ),
+        (
+            |out| WrapArgs {
+                files: Vec::new(),
+                format: WrapFormat::Fmp4,
+                flat: None,
+                fmp4: Some(out),
+                init_only: false,
+            },
+            WrapFormat::Fmp4,
+        ),
+    ];
+
+    for (make_shorthand, format) in cases {
+        // tar-style: output first, then the inputs, with --format.
+        let tar = dir.path().join("tar.mp4");
+        cmd_wrap(WrapArgs {
+            files: std::iter::once(tar.clone()).chain(inputs.clone()).collect(),
+            format,
+            flat: None,
+            fmp4: None,
+            init_only: false,
+        })
+        .unwrap();
+
+        // Shorthand: positionals are all inputs; the flag names the output.
+        let short = dir.path().join("short.mp4");
+        let mut args = make_shorthand(short.clone());
+        args.files = inputs.clone();
+        cmd_wrap(args).unwrap();
+
+        assert_eq!(
+            std::fs::read(&tar).unwrap(),
+            std::fs::read(&short).unwrap(),
+            "--flat/--fmp4 shorthand must match the tar-style --format form ({format:?})"
         );
     }
 }

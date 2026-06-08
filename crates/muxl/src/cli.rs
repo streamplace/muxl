@@ -79,8 +79,10 @@ enum Command {
     Segment(muxl_cli::SegmentArgs),
     /// Wrap one or more MUXL wrappers into a presentation MP4 (fMP4 or flat),
     /// `tar`-style (output first, then inputs); "-" reads stdin / writes
-    /// stdout. With --init-only, emit just the synthesized init segment (the
-    /// inbound header-synthesis the host runs per segment).
+    /// stdout. Or name the output with --flat <PATH> / --fmp4 <PATH>, in which
+    /// case every positional is an input. With --init-only, emit just the
+    /// synthesized init segment (the inbound header-synthesis the host runs
+    /// per segment).
     Wrap(muxl_cli::WrapArgs),
     /// Unwrap any MUXL wrapper (fMP4/flat/bare m4s) into its canonical segments.
     Unwrap(muxl_cli::UnwrapArgs),

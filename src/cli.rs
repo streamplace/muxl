@@ -96,18 +96,26 @@ pub struct SegmentArgs {
 
 #[derive(Args)]
 pub struct WrapArgs {
-    /// Output MP4 path. "-" writes stdout.
-    pub output: PathBuf,
-    /// Input MUXL wrappers — fMP4, flat MP4, or bare m4s segment streams.
-    /// Given `tar`-style (output first, then inputs): each input is unwrapped
-    /// to its canonical segments, and the segments are concatenated in
-    /// argument order into one presentation MP4. "-" reads stdin — use it as
-    /// the sole input.
-    #[arg(required = true, num_args = 1..)]
-    pub inputs: Vec<PathBuf>,
-    /// Presentation container to synthesize.
+    /// File arguments. By default these are read `tar`-style — output first,
+    /// then one or more inputs: each input (fMP4, flat MP4, or bare m4s) is
+    /// unwrapped to its canonical segments, and the segments are concatenated
+    /// in argument order into the output presentation MP4 ("-" writes stdout,
+    /// "-" as the sole input reads stdin). When --flat/--fmp4 names the output
+    /// instead, every positional here is an input.
+    #[arg(required = true, num_args = 1.., value_name = "FILE")]
+    pub files: Vec<PathBuf>,
+    /// Presentation container to synthesize when the output is given
+    /// positionally. Ignored when --flat/--fmp4 sets the output.
     #[arg(long, value_enum, default_value = "fmp4")]
     pub format: WrapFormat,
+    /// Shorthand for `--format flat <PATH>`: write a finalized flat MP4 to
+    /// PATH ("-" writes stdout) and treat every positional as an input.
+    #[arg(long, value_name = "PATH", conflicts_with_all = ["fmp4", "format"])]
+    pub flat: Option<PathBuf>,
+    /// Shorthand for `--format fmp4 <PATH>`: write an appendable fMP4 to PATH
+    /// ("-" writes stdout) and treat every positional as an input.
+    #[arg(long, value_name = "PATH", conflicts_with_all = ["flat", "format"])]
+    pub fmp4: Option<PathBuf>,
     /// Emit only the synthesized init segment (ftyp+moov) — the EXT-X-MAP
     /// target for HLS playback — instead of init+segments. Requires
     /// --format fmp4.
@@ -439,7 +447,31 @@ pub fn cmd_hls(args: HlsArgs) -> crate::Result<()> {
 /// presentation MP4. fMP4 is the verbatim fast-forward path; flat is the
 /// interim Source-based flatten.
 pub fn cmd_wrap(args: WrapArgs) -> crate::Result<()> {
-    let WrapArgs { output, inputs, format, init_only } = args;
+    let WrapArgs { files, format, flat, fmp4, init_only } = args;
+
+    // Resolve the output path + container. The --flat/--fmp4 shorthands name
+    // the output explicitly (and pick the container), so every positional is
+    // an input. Without them we keep the `tar`-style contract: the first
+    // positional is the output, the rest are inputs. (clap makes --flat and
+    // --fmp4 mutually exclusive with each other and with an explicit --format.)
+    let (output, format, inputs): (PathBuf, WrapFormat, Vec<PathBuf>) = if let Some(out) = flat {
+        (out, WrapFormat::Flat, files)
+    } else if let Some(out) = fmp4 {
+        (out, WrapFormat::Fmp4, files)
+    } else {
+        let mut files = files.into_iter();
+        // clap guarantees at least one positional via `required`.
+        let output = files.next().expect("clap guarantees >=1 positional");
+        let inputs: Vec<PathBuf> = files.collect();
+        if inputs.is_empty() {
+            return Err(crate::Error::InvalidMp4(
+                "expected at least one input after the output path \
+                 (or use --flat/--fmp4 to name the output)"
+                    .into(),
+            ));
+        }
+        (output, format, inputs)
+    };
 
     // Read every input wrapper up front. The segments recovered by `unwrap`
     // borrow these buffers, so all of them must outlive the combined segment

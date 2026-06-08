@@ -164,6 +164,31 @@ pub struct CidArgs {
     pub segments: bool,
 }
 
+#[derive(Args)]
+pub struct MetafileArgs {
+    /// Input MUXL wrapper (bare m4s, fMP4, or flat MP4). "-" reads stdin.
+    /// Run on a single canonical `.m4s` to archive that segment's metafile, or
+    /// on a whole blob to (re)generate the full stream.
+    pub input: PathBuf,
+    /// Emit only the `init` metafile (the catalog) — not the per-segment ones.
+    #[arg(long, conflicts_with = "no_init")]
+    pub init_only: bool,
+    /// Emit only the per-segment metafiles — not the leading `init`. Use when
+    /// the catalog is archived separately (e.g. per-segment live ingest).
+    #[arg(long)]
+    pub no_init: bool,
+}
+
+#[derive(Args)]
+pub struct FlatHeaderArgs {
+    /// Metafile stream (DRISL: one `init` then N `segment` metafiles, in
+    /// canonical interleave order), as produced by `muxl metafile`. "-" reads
+    /// stdin. Writes the synthesized flat-MP4 faststart header (ftyp+moov+
+    /// mdat-envelope-header) to stdout; serve it followed by the canonical
+    /// segment bodies for the same range.
+    pub input: PathBuf,
+}
+
 pub fn cmd_catalog(args: CatalogArgs) -> crate::Result<()> {
     let CatalogArgs { input, format } = args;
     // Open with FileReadAt so arbitrarily-long inputs don't load into memory —
@@ -644,6 +669,121 @@ pub fn cmd_cid(args: CidArgs) -> crate::Result<()> {
     } else {
         println!("{}", crate::cid::from_file(&input)?);
     }
+    Ok(())
+}
+
+/// Emit metafiles (DRISL) for a MUXL wrapper — the payload-free per-segment
+/// metadata a consumer archives to later synthesize a flat-MP4 faststart
+/// header from a segment range alone (see [`cmd_flat_header`]). Streams
+/// front-to-back, so even a multi-GB blob runs in ~one GoP of memory. Run on a
+/// single canonical `.m4s` to archive that one segment, or on a whole blob for
+/// the full `init` + per-segment stream.
+pub fn cmd_metafile(args: MetafileArgs) -> crate::Result<()> {
+    use crate::cbor::CborEvent;
+    use crate::metafile::{MetafileInit, MetafileSegment};
+    let MetafileArgs {
+        input,
+        init_only,
+        no_init,
+    } = args;
+
+    let reader: Box<dyn Read> = if input.as_os_str() == "-" {
+        Box::new(io::stdin())
+    } else {
+        Box::new(fs::File::open(&input)?)
+    };
+    let mut stdout = io::stdout().lock();
+
+    // Reuse the streaming event builder: it emits an Init (catalog) then one
+    // Segment per GoP with the per-sample tables, byte sizes, and decode times
+    // already populated. We re-serialize the payload-free metafile view of each.
+    crate::reader::segment_events_stream(reader, |ev| {
+        match ev {
+            CborEvent::Init {
+                version,
+                catalog: Some(catalog),
+                ..
+            } if !no_init => {
+                let init = MetafileInit {
+                    kind: "init".into(),
+                    version,
+                    catalog,
+                };
+                dasl::drisl::to_writer(&mut stdout, &init).map_err(|e| {
+                    crate::Error::Io(io::Error::new(io::ErrorKind::Other, e.to_string()))
+                })?;
+            }
+            CborEvent::Segment {
+                samples,
+                track_byte_sizes,
+                first_decode_times,
+                durations,
+                sample_counts,
+                body_size,
+                duration_us,
+                ..
+            } if !init_only => {
+                let seg = MetafileSegment {
+                    kind: "segment".into(),
+                    samples,
+                    track_byte_sizes,
+                    first_decode_times,
+                    durations,
+                    sample_counts,
+                    body_size,
+                    duration_us,
+                };
+                dasl::drisl::to_writer(&mut stdout, &seg).map_err(|e| {
+                    crate::Error::Io(io::Error::new(io::ErrorKind::Other, e.to_string()))
+                })?;
+            }
+            _ => {}
+        }
+        Ok(())
+    })?;
+    stdout.flush()?;
+    Ok(())
+}
+
+/// Synthesize a flat-MP4 faststart header from a metafile stream (`init` then N
+/// `segment` metafiles, in canonical interleave order) and write it to stdout.
+/// The caller serves the header bytes followed by the canonical segment bodies
+/// for the same range. Metafiles are tiny metadata, so the stream is read in
+/// full — no payload bytes are involved.
+pub fn cmd_flat_header(args: FlatHeaderArgs) -> crate::Result<()> {
+    use crate::metafile::{MetafileInit, MetafileSegment, synthesize_flat_header};
+    let FlatHeaderArgs { input } = args;
+
+    let mut buf = Vec::new();
+    if input.as_os_str() == "-" {
+        io::stdin().read_to_end(&mut buf)?;
+    } else {
+        fs::File::open(&input)?.read_to_end(&mut buf)?;
+    }
+
+    // Positional decode: first value = init, the rest = segments, until EOF.
+    // (Plain structs, so DRISL decodes the catalog's byte fields cleanly — a
+    // tagged enum would not.)
+    let mut cur = io::Cursor::new(&buf[..]);
+    let init: MetafileInit = dasl::drisl::de::from_reader_once(&mut cur)
+        .map_err(|e| crate::Error::InvalidMp4(format!("metafile init decode: {e}")))?;
+    let mut segs: Vec<MetafileSegment> = Vec::new();
+    while (cur.position() as usize) < buf.len() {
+        let seg = dasl::drisl::de::from_reader_once(&mut cur)
+            .map_err(|e| crate::Error::InvalidMp4(format!("metafile segment decode: {e}")))?;
+        segs.push(seg);
+    }
+
+    let header = synthesize_flat_header(&init, &segs)?;
+    let mut stdout = io::stdout().lock();
+    stdout.write_all(&header.bytes)?;
+    stdout.flush()?;
+    eprintln!(
+        "flat header: {} bytes over {} segments; {} body bytes follow",
+        header.bytes.len(),
+        header.segments.len(),
+        header.total_body
+    );
     Ok(())
 }
 

@@ -10,6 +10,7 @@ mod fragment;
 pub mod hls;
 pub mod init;
 pub mod io;
+pub mod metafile;
 pub mod present;
 pub mod push;
 pub mod reader;

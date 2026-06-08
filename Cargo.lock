@@ -1691,7 +1691,7 @@ dependencies = [
 
 [[package]]
 name = "muxl"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "clap",
  "const-oid",
@@ -1712,7 +1712,7 @@ dependencies = [
 
 [[package]]
 name = "muxl-core"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "blake3",
  "clap",

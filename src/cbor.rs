@@ -30,6 +30,12 @@ use crate::segment::TrackSamples;
 #[serde(transparent)]
 pub struct ByteString(#[serde(with = "serde_bytes")] pub Vec<u8>);
 
+/// Current version of the metafile / streaming wire format. Carried on the
+/// `Init` event so durable consumers (e.g. an archive of per-segment metafiles
+/// fed back to [`crate::metafile::synthesize_flat_header`]) can gate on it.
+/// Bump on a breaking schema change; additive fields stay at the same version.
+pub const METAFILE_VERSION: u16 = 1;
+
 /// A MUXL streaming event in CBOR-serializable form.
 #[derive(Serialize, Deserialize, Debug)]
 #[serde(tag = "type")]
@@ -37,6 +43,10 @@ pub enum CborEvent {
     /// Canonical init segment (ftyp+moov).
     #[serde(rename = "init")]
     Init {
+        /// Wire-format version ([`METAFILE_VERSION`]). `0` on a stream from a
+        /// pre-versioning muxl; `1`+ once versioned.
+        #[serde(default)]
+        version: u16,
         #[serde(with = "serde_bytes")]
         data: Vec<u8>,
         /// Track configuration metadata (codecs, dimensions, timescales, etc.).
@@ -65,6 +75,20 @@ pub enum CborEvent {
         /// HLS playlist without re-parsing the segment bytes.
         #[serde(default)]
         samples: BTreeMap<String, CborTrackSamples>,
+        /// Per-track byte size of this segment's contribution to the flat-MP4
+        /// body — the on-disk size of each track's canonical bytes (uuid
+        /// prefix + moof+mdat run, including any c2pa signature). Required to
+        /// place `co64` offsets when synthesizing a header from metafiles
+        /// alone (payloads absent), where `tracks[tid].len()` isn't available.
+        #[serde(default)]
+        track_byte_sizes: BTreeMap<String, u64>,
+        /// Per-track decode time (`tfdt`) of this segment's first sample, in
+        /// the track's media timescale. Anchors the synthesized flat-MP4
+        /// `elst` when a segment range begins mid-stream (see
+        /// `spec § edts/elst`). Carried on every segment so any sub-range can
+        /// be re-anchored to presentation zero.
+        #[serde(default)]
+        first_decode_times: BTreeMap<String, u64>,
         /// Total body bytes this segment contributes when concatenated
         /// into a flat MP4. Sum of `tracks` values' lengths.
         #[serde(default)]
@@ -113,6 +137,30 @@ impl From<TrackSamples> for CborTrackSamples {
     }
 }
 
+impl From<&CborTrackSamples> for TrackSamples {
+    fn from(s: &CborTrackSamples) -> Self {
+        Self {
+            durations: s.durations.clone(),
+            sizes: s.sizes.clone(),
+            cts_offsets: s.cts_offsets.clone(),
+            sync_indices: s.sync_indices.clone(),
+            offsets_in_track: s.offsets.clone(),
+        }
+    }
+}
+
+impl From<CborTrackSamples> for TrackSamples {
+    fn from(s: CborTrackSamples) -> Self {
+        Self {
+            durations: s.durations,
+            sizes: s.sizes,
+            cts_offsets: s.cts_offsets,
+            sync_indices: s.sync_indices,
+            offsets_in_track: s.offsets,
+        }
+    }
+}
+
 impl CborEvent {
     /// Convert a [`SegmenterEvent`] reference into a serializable CBOR event.
     pub fn from_event(event: &SegmenterEvent) -> Self {
@@ -124,6 +172,7 @@ impl CborEvent {
                     .map(|(tid, bytes)| (tid.to_string(), ByteString(bytes)))
                     .collect();
                 CborEvent::Init {
+                    version: METAFILE_VERSION,
                     data: data.clone(),
                     catalog: Some(catalog.clone()),
                     track_inits,
@@ -150,6 +199,16 @@ impl CborEvent {
                     .iter()
                     .map(|(tid, s)| (tid.to_string(), s.into()))
                     .collect(),
+                track_byte_sizes: gop
+                    .tracks
+                    .iter()
+                    .map(|(tid, data)| (tid.to_string(), data.len() as u64))
+                    .collect(),
+                first_decode_times: gop
+                    .first_decode_times
+                    .iter()
+                    .map(|(tid, dt)| (tid.to_string(), *dt))
+                    .collect(),
                 body_size: gop.body_size,
                 duration_us: gop.duration_us,
             },
@@ -166,35 +225,51 @@ impl CborEvent {
                     .map(|(tid, bytes)| (tid.to_string(), ByteString(bytes)))
                     .collect();
                 CborEvent::Init {
+                    version: METAFILE_VERSION,
                     data,
                     catalog: Some(catalog),
                     track_inits,
                 }
             }
-            SegmenterEvent::Segment(gop) => CborEvent::Segment {
-                tracks: gop
+            SegmenterEvent::Segment(gop) => {
+                // Compute the per-track byte sizes before `tracks` is moved.
+                let track_byte_sizes = gop
                     .tracks
-                    .into_iter()
-                    .map(|(tid, data)| (tid.to_string(), ByteString(data)))
-                    .collect(),
-                durations: gop
-                    .durations
-                    .into_iter()
-                    .map(|(tid, dur)| (tid.to_string(), dur))
-                    .collect(),
-                sample_counts: gop
-                    .sample_counts
-                    .into_iter()
-                    .map(|(tid, count)| (tid.to_string(), count))
-                    .collect(),
-                samples: gop
-                    .samples
-                    .into_iter()
-                    .map(|(tid, s)| (tid.to_string(), s.into()))
-                    .collect(),
-                body_size: gop.body_size,
-                duration_us: gop.duration_us,
-            },
+                    .iter()
+                    .map(|(tid, data)| (tid.to_string(), data.len() as u64))
+                    .collect();
+                let first_decode_times = gop
+                    .first_decode_times
+                    .iter()
+                    .map(|(tid, dt)| (tid.to_string(), *dt))
+                    .collect();
+                CborEvent::Segment {
+                    tracks: gop
+                        .tracks
+                        .into_iter()
+                        .map(|(tid, data)| (tid.to_string(), ByteString(data)))
+                        .collect(),
+                    durations: gop
+                        .durations
+                        .into_iter()
+                        .map(|(tid, dur)| (tid.to_string(), dur))
+                        .collect(),
+                    sample_counts: gop
+                        .sample_counts
+                        .into_iter()
+                        .map(|(tid, count)| (tid.to_string(), count))
+                        .collect(),
+                    samples: gop
+                        .samples
+                        .into_iter()
+                        .map(|(tid, s)| (tid.to_string(), s.into()))
+                        .collect(),
+                    track_byte_sizes,
+                    first_decode_times,
+                    body_size: gop.body_size,
+                    duration_us: gop.duration_us,
+                }
+            }
         }
     }
 }

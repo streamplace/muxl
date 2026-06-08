@@ -249,6 +249,8 @@ struct GopAccum {
     durations: std::collections::BTreeMap<String, u64>,
     sample_counts: std::collections::BTreeMap<String, u32>,
     samples: std::collections::BTreeMap<String, crate::cbor::CborTrackSamples>,
+    track_byte_sizes: std::collections::BTreeMap<String, u64>,
+    first_decode_times: std::collections::BTreeMap<String, u64>,
     body_size: u64,
     duration_us: u64,
 }
@@ -291,7 +293,7 @@ where
 
     /// Feed one verbatim canonical segment, in canonical interleave order.
     fn push_segment(&mut self, seg: &[u8]) -> Result<()> {
-        let (tid, ts, _dts) = crate::present::segment_index(seg)?;
+        let (tid, ts, dts) = crate::present::segment_index(seg)?;
 
         // A track id <= the previous one closes the current GoP (tracks ascend
         // within a GoP). Flush it *before* folding this segment's catalog in, so
@@ -333,6 +335,8 @@ where
         gop.durations.insert(key.clone(), dur_ticks);
         gop.sample_counts.insert(key.clone(), ts.durations.len() as u32);
         gop.samples.insert(key.clone(), (&ts).into());
+        gop.track_byte_sizes.insert(key.clone(), seg.len() as u64);
+        gop.first_decode_times.insert(key.clone(), dts);
         gop.tracks
             .insert(key, crate::cbor::ByteString(seg.to_vec()));
         self.last_tid = Some(tid);
@@ -350,6 +354,7 @@ where
                     .map(|(tid, b)| (tid.to_string(), ByteString(b)))
                     .collect();
             (self.emit)(CborEvent::Init {
+                version: crate::cbor::METAFILE_VERSION,
                 data: crate::init::build_init_segment(&self.running)?,
                 catalog: Some(self.running.clone()),
                 track_inits,
@@ -368,6 +373,8 @@ where
             durations: g.durations,
             sample_counts: g.sample_counts,
             samples: g.samples,
+            track_byte_sizes: g.track_byte_sizes,
+            first_decode_times: g.first_decode_times,
             body_size: g.body_size,
             duration_us: g.duration_us,
         })

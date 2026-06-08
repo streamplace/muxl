@@ -70,6 +70,11 @@ pub struct GopSegment {
     /// reconstruct a flat-MP4 moov (co64/stts/stsz/stss) or build an
     /// HLS playlist without re-parsing the segment bytes.
     pub samples: BTreeMap<u32, TrackSamples>,
+    /// Per-track decode time (`tfdt`) of this segment's first sample, in the
+    /// track's media timescale. Anchors a synthesized flat-MP4 `elst` when a
+    /// segment range begins mid-stream; carried so downstream consumers can
+    /// re-anchor any sub-range to presentation zero.
+    pub first_decode_times: BTreeMap<u32, u64>,
     /// Total body bytes this segment contributes when concatenated into a
     /// flat MP4 (sum of `tracks` values' lengths). Used by downstream
     /// consumers to compute cumulative byte offsets in the synth flat MP4
@@ -261,6 +266,7 @@ pub(crate) fn flush_track_bufs(
     let mut durations = BTreeMap::new();
     let mut sample_counts = BTreeMap::new();
     let mut samples = BTreeMap::new();
+    let mut first_decode_times = BTreeMap::new();
     let mut body_size: u64 = 0;
     for (&track_id, buf) in track_bufs.iter_mut() {
         if !buf.is_empty() {
@@ -269,6 +275,8 @@ pub(crate) fn flush_track_bufs(
             let mut combined = Vec::with_capacity(prefix.len() + buf.len());
             combined.extend_from_slice(&prefix);
             combined.append(buf);
+            // The track's GoP-start decode time is the first inner moof's tfdt.
+            first_decode_times.insert(track_id, crate::present::segment_index(&combined)?.2);
             body_size += combined.len() as u64;
             tracks.insert(track_id, combined);
             durations.insert(track_id, track_durations.remove(&track_id).unwrap_or(0));
@@ -294,6 +302,7 @@ pub(crate) fn flush_track_bufs(
             durations,
             sample_counts,
             samples,
+            first_decode_times,
             body_size,
             duration_us,
         }))

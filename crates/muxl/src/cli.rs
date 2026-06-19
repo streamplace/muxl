@@ -91,6 +91,14 @@ enum Command {
     Cid(muxl_cli::CidArgs),
     /// Generate HLS playback artifacts (CID-addressed blobs + optional playlists).
     Hls(muxl_cli::HlsArgs),
+    /// Emit payload-free metafiles (DRISL) for a MUXL wrapper — the per-segment
+    /// metadata a consumer archives to later synthesize flat-MP4 faststart
+    /// headers from segment ranges, without the blob.
+    Metafile(muxl_cli::MetafileArgs),
+    /// Synthesize a flat-MP4 faststart header from a metafile stream (the
+    /// inverse of `metafile`): feed `init` + segment metafiles on stdin, get
+    /// the header bytes to prepend to the canonical blob over byte ranges.
+    FlatHeader(muxl_cli::FlatHeaderArgs),
 }
 
 #[derive(clap::Args)]
@@ -338,6 +346,8 @@ pub fn cli_main() {
         Command::Unwrap(args) => muxl_cli::cmd_unwrap(args).map_err(Into::into),
         Command::Cid(args) => muxl_cli::cmd_cid(args).map_err(Into::into),
         Command::Hls(args) => muxl_cli::cmd_hls(args).map_err(Into::into),
+        Command::Metafile(args) => muxl_cli::cmd_metafile(args).map_err(Into::into),
+        Command::FlatHeader(args) => muxl_cli::cmd_flat_header(args).map_err(Into::into),
     };
     if let Err(e) = result {
         eprintln!("Error: {e}");

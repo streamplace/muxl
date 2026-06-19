@@ -164,6 +164,24 @@ pub struct CidArgs {
     pub segments: bool,
 }
 
+#[derive(Args)]
+pub struct MetafileArgs {
+    /// Input MUXL wrapper (bare m4s, fMP4, or flat MP4). "-" reads stdin.
+    /// Run on a single canonical `.m4s` to archive that segment's metafile, or
+    /// on a whole blob to emit one self-contained metafile per segment.
+    pub input: PathBuf,
+}
+
+#[derive(Args)]
+pub struct FlatHeaderArgs {
+    /// Metafile stream (DRISL: one self-contained `segment` metafile per
+    /// canonical `.m4s`, in canonical interleave order) as produced by
+    /// `muxl metafile`. "-" reads stdin. Writes the synthesized flat-MP4
+    /// faststart header (ftyp+moov+mdat-envelope-header) to stdout; serve it
+    /// followed by the canonical segment bodies for the same range.
+    pub input: PathBuf,
+}
+
 pub fn cmd_catalog(args: CatalogArgs) -> crate::Result<()> {
     let CatalogArgs { input, format } = args;
     // Open with FileReadAt so arbitrarily-long inputs don't load into memory —
@@ -644,6 +662,69 @@ pub fn cmd_cid(args: CidArgs) -> crate::Result<()> {
     } else {
         println!("{}", crate::cid::from_file(&input)?);
     }
+    Ok(())
+}
+
+/// Emit one self-contained metafile (DRISL) per canonical segment of a MUXL
+/// wrapper — the payload-free per-segment metadata a consumer archives to
+/// later synthesize a flat-MP4 faststart header from a segment range alone
+/// (see [`cmd_flat_header`]). Streams front-to-back, so even a multi-GB blob
+/// runs in ~one GoP of memory. Run on a single canonical `.m4s` to archive
+/// that one segment, or on a whole blob for one metafile per segment.
+pub fn cmd_metafile(args: MetafileArgs) -> crate::Result<()> {
+    let MetafileArgs { input } = args;
+    let reader: Box<dyn Read> = if input.as_os_str() == "-" {
+        Box::new(io::stdin())
+    } else {
+        Box::new(fs::File::open(&input)?)
+    };
+    let mut stdout = io::stdout().lock();
+    crate::metafile::metafiles_stream(reader, |m| {
+        dasl::drisl::to_writer(&mut stdout, &m).map_err(|e| {
+            crate::Error::Io(io::Error::new(io::ErrorKind::Other, e.to_string()))
+        })
+    })?;
+    stdout.flush()?;
+    Ok(())
+}
+
+/// Synthesize a flat-MP4 faststart header from a metafile stream (one
+/// self-contained `segment` metafile per canonical `.m4s`, in canonical
+/// interleave order) and write it to stdout. The caller serves the header bytes
+/// followed by the canonical segment bodies for the same range. Metafiles are
+/// tiny metadata, so the stream is read in full — no payload bytes are involved.
+pub fn cmd_flat_header(args: FlatHeaderArgs) -> crate::Result<()> {
+    use crate::metafile::{MetafileSegment, synthesize_flat_header};
+    let FlatHeaderArgs { input } = args;
+
+    let mut buf = Vec::new();
+    if input.as_os_str() == "-" {
+        io::stdin().read_to_end(&mut buf)?;
+    } else {
+        fs::File::open(&input)?.read_to_end(&mut buf)?;
+    }
+
+    // Decode the uniform stream of self-contained segment metafiles until EOF.
+    // (Plain structs, so DRISL decodes the catalog's byte fields cleanly — a
+    // tagged enum would not.)
+    let mut cur = io::Cursor::new(&buf[..]);
+    let mut segs: Vec<MetafileSegment> = Vec::new();
+    while (cur.position() as usize) < buf.len() {
+        let seg = dasl::drisl::de::from_reader_once(&mut cur)
+            .map_err(|e| crate::Error::InvalidMp4(format!("metafile decode: {e}")))?;
+        segs.push(seg);
+    }
+
+    let header = synthesize_flat_header(&segs)?;
+    let mut stdout = io::stdout().lock();
+    stdout.write_all(&header.bytes)?;
+    stdout.flush()?;
+    eprintln!(
+        "flat header: {} bytes over {} segments; {} body bytes follow",
+        header.bytes.len(),
+        header.segments.len(),
+        header.total_body
+    );
     Ok(())
 }
 

@@ -168,7 +168,7 @@ pub fn aggregate_catalog(segments: &[Segment<'_>]) -> Catalog {
 /// Fold one segment's single-track catalog into a running aggregate. Renditions
 /// dedupe by name (same track → same config); video `display`/`rotation`/`flip`
 /// are taken from the first segment that carries them.
-fn merge_segment_catalog(agg: &mut Catalog, cat: &Catalog) {
+pub(crate) fn merge_segment_catalog(agg: &mut Catalog, cat: &Catalog) {
     if let Some(v) = &cat.video {
         for (name, cfg) in &v.renditions {
             agg.insert_video(name.clone(), cfg.clone());
@@ -249,6 +249,8 @@ struct GopAccum {
     durations: std::collections::BTreeMap<String, u64>,
     sample_counts: std::collections::BTreeMap<String, u32>,
     samples: std::collections::BTreeMap<String, crate::cbor::CborTrackSamples>,
+    track_byte_sizes: std::collections::BTreeMap<String, u64>,
+    first_decode_times: std::collections::BTreeMap<String, u64>,
     body_size: u64,
     duration_us: u64,
 }
@@ -291,7 +293,7 @@ where
 
     /// Feed one verbatim canonical segment, in canonical interleave order.
     fn push_segment(&mut self, seg: &[u8]) -> Result<()> {
-        let (tid, ts, _dts) = crate::present::segment_index(seg)?;
+        let (tid, ts, dts) = crate::present::segment_index(seg)?;
 
         // A track id <= the previous one closes the current GoP (tracks ascend
         // within a GoP). Flush it *before* folding this segment's catalog in, so
@@ -333,6 +335,8 @@ where
         gop.durations.insert(key.clone(), dur_ticks);
         gop.sample_counts.insert(key.clone(), ts.durations.len() as u32);
         gop.samples.insert(key.clone(), (&ts).into());
+        gop.track_byte_sizes.insert(key.clone(), seg.len() as u64);
+        gop.first_decode_times.insert(key.clone(), dts);
         gop.tracks
             .insert(key, crate::cbor::ByteString(seg.to_vec()));
         self.last_tid = Some(tid);
@@ -350,6 +354,7 @@ where
                     .map(|(tid, b)| (tid.to_string(), ByteString(b)))
                     .collect();
             (self.emit)(CborEvent::Init {
+                version: crate::cbor::METAFILE_VERSION,
                 data: crate::init::build_init_segment(&self.running)?,
                 catalog: Some(self.running.clone()),
                 track_inits,
@@ -368,6 +373,8 @@ where
             durations: g.durations,
             sample_counts: g.sample_counts,
             samples: g.samples,
+            track_byte_sizes: g.track_byte_sizes,
+            first_decode_times: g.first_decode_times,
             body_size: g.body_size,
             duration_us: g.duration_us,
         })
@@ -567,7 +574,7 @@ fn capture_box<R: Read>(
 /// [`scan_segments`]: it skips a leading `ftyp`/`moov` (and other framing),
 /// descends a flat MP4's outer `mdat` envelope, and splits the canonical-segment
 /// stream on MUXL `uuid` boundaries — without seeking or holding more than one box.
-fn scan_wrapper_stream<R: Read, F>(reader: R, mut on_segment: F) -> Result<()>
+pub(crate) fn scan_wrapper_stream<R: Read, F>(reader: R, mut on_segment: F) -> Result<()>
 where
     F: FnMut(&[u8]) -> Result<()>,
 {

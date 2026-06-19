@@ -64,6 +64,10 @@ pub enum SignedEvent {
         sample_counts: BTreeMap<String, u32>,
         #[serde(default)]
         samples: BTreeMap<String, CborTrackSamples>,
+        /// Per-track on-disk byte size of each track's signed canonical
+        /// segment in this GoP. Required to place `co64` from metafiles alone.
+        #[serde(default)]
+        track_byte_sizes: BTreeMap<String, u64>,
         #[serde(default)]
         first_decode_times: BTreeMap<String, u64>,
         #[serde(default)]
@@ -79,6 +83,20 @@ impl SignedEvent {
     /// bytes (c2pa-uuid prefixed). `samples.offsets_in_track` must be
     /// pre-shifted past the c2pa-uuid prefix.
     pub fn signed_from_gop(gop: GopSegment) -> Self {
+        // Per-track byte sizes reflect the signed bytes now in `gop.tracks`;
+        // compute before the map is moved. `first_decode_times` are the
+        // underlying moof tfdts (unchanged by signing — c2pa only prepends a
+        // uuid box) carried from the segmenter.
+        let track_byte_sizes = gop
+            .tracks
+            .iter()
+            .map(|(tid, data)| (tid.to_string(), data.len() as u64))
+            .collect();
+        let first_decode_times = gop
+            .first_decode_times
+            .iter()
+            .map(|(tid, dt)| (tid.to_string(), *dt))
+            .collect();
         SignedEvent::SignedSegment {
             number: gop.number,
             tracks: gop
@@ -101,10 +119,8 @@ impl SignedEvent {
                 .into_iter()
                 .map(|(tid, s)| (tid.to_string(), s.into()))
                 .collect(),
-            // `first_decode_times` would come from the upstream segmenter
-            // when it knows; for now we leave it empty (Streamplace already
-            // tracks first-segment tfdts through its DB rows).
-            first_decode_times: BTreeMap::new(),
+            track_byte_sizes,
+            first_decode_times,
             body_size: gop.body_size,
             duration_us: gop.duration_us,
         }

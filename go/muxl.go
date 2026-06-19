@@ -82,6 +82,39 @@ type Engine interface {
 	// WrapInit synthesizes only the per-stream init segment (ftyp+moov) — the
 	// HLS EXT-X-MAP target — from a MUXL wrapper's embedded catalogs.
 	WrapInit(ctx context.Context, input io.Reader, out io.Writer) error
+
+	// Metafiles streams one self-contained metafile per canonical segment of a
+	// MUXL wrapper, as raw DRISL bytes, in canonical interleave order. Each
+	// metafile is self-describing — it carries that segment's single-track
+	// catalog (codec config) alongside the per-sample tables — so there is no
+	// separate init blob. Run it on a single .m4s to archive that one segment,
+	// or on a whole blob for one metafile per segment. Store the bytes VERBATIM
+	// and feed a concatenated range straight to SynthesizeFlatHeader; keeping
+	// the bytes rather than decoding to Event and re-encoding preserves the
+	// catalog the synthesized moov needs.
+	Metafiles(ctx context.Context, input io.Reader, out io.Writer) error
+
+	// Metafile returns the self-contained metafile (DRISL) for a single
+	// canonical .m4s — the per-fragment primitive for archiving
+	// header-synthesis data (per-sample tables, the segment's catalog, and the
+	// edit-list anchor first_decode_times) as segments are produced, e.g. on
+	// each signed fragment inside a SignSegment loop, in memory with no
+	// re-read. It's exactly one value from Metafiles. Works on signed segments:
+	// byte sizes and offsets account for the c2pa uuid prefix.
+	Metafile(ctx context.Context, segment []byte) ([]byte, error)
+
+	// SynthesizeFlatHeader reads a metafile stream (one self-contained segment
+	// metafile per canonical .m4s — DRISL, in canonical interleave order) and
+	// writes the flat-MP4 faststart header (ftyp+moov+mdat-envelope-header) for
+	// that segment range, aggregating the per-segment catalogs into the moov.
+	// The
+	// header's chunk offsets already include its own length, so serving
+	// [header][canonical blob bytes for the range] is a byte-range-seekable
+	// MP4 with no further offset math — the basis for "flat-MP4 VOD". A
+	// sub-range re-anchors its own edit list, so clips work the same way.
+	// Deterministic: identical input yields byte-identical output, so the
+	// header can be content-addressed and cached.
+	SynthesizeFlatHeader(ctx context.Context, metafiles io.Reader, out io.Writer) error
 }
 
 // CanonicalizeOption configures [Engine.Canonicalize].
@@ -209,6 +242,9 @@ type Event struct {
 	Number uint32 `cbor:"number,omitempty"`
 
 	// Init event:
+	// Version is the metafile/wire-format version (muxl METAFILE_VERSION).
+	// 0 on a stream from a pre-versioning muxl.
+	Version uint16 `cbor:"version,omitempty"`
 	// Data is the full ftyp+moov for all tracks combined.
 	Data []byte `cbor:"data,omitempty"`
 	// Catalog describes per-track codec/dimensions/timescale.
@@ -224,11 +260,41 @@ type Event struct {
 	Durations map[string]uint64 `cbor:"durations,omitempty"`
 	// SampleCounts is per-track sample (frame) count for this segment.
 	SampleCounts map[string]uint32 `cbor:"sample_counts,omitempty"`
+	// Samples is per-track per-sample metadata (stsz/stts/ctts/stss +
+	// per-sample byte offsets) — enough to rebuild a flat-MP4 moov without
+	// the segment bytes. Keyed by stringified track ID.
+	Samples map[string]TrackSamples `cbor:"samples,omitempty"`
+	// TrackByteSizes is the per-track on-disk byte size of this segment's
+	// contribution to the flat-MP4 body (uuid prefix + moof+mdat run,
+	// including any c2pa signature). Needed to place co64 offsets when
+	// synthesizing a header from metafiles alone. Keyed by stringified track ID.
+	TrackByteSizes map[string]uint64 `cbor:"track_byte_sizes,omitempty"`
+	// FirstDecodeTimes is the per-track tfdt of this segment's first sample
+	// (track media timescale) — anchors the synthesized flat-MP4 edit list
+	// when a range begins mid-stream. Keyed by stringified track ID.
+	FirstDecodeTimes map[string]uint64 `cbor:"first_decode_times,omitempty"`
 	// BodySize is the total bytes this segment contributes to the
 	// concatenated output (sum of len(Tracks[*])).
 	BodySize uint64 `cbor:"body_size,omitempty"`
 	// DurationUs is the segment's playable wall duration in microseconds.
 	DurationUs uint64 `cbor:"duration_us,omitempty"`
+}
+
+// TrackSamples is the per-sample metadata for one track in one segment —
+// parallel arrays, all the same length as the track's sample count. Mirrors
+// muxl's CborTrackSamples. Lets a consumer rebuild stsz/stts/ctts/stss/co64.
+type TrackSamples struct {
+	// Durations is the per-sample duration in the track's media timescale (stts).
+	Durations []uint32 `cbor:"durations"`
+	// Sizes is the per-sample encoded byte size (mdat payload only) (stsz).
+	Sizes []uint32 `cbor:"sizes"`
+	// CtsOffsets is the per-sample composition-time offset, signed (ctts).
+	CtsOffsets []int32 `cbor:"cts_offsets"`
+	// SyncIndices is the 1-based indices of sync (key) samples (stss).
+	SyncIndices []uint32 `cbor:"sync_indices"`
+	// Offsets is the per-sample payload byte offset within this track's
+	// segment buffer (co64 = headerLen + blobOffset + Offsets[i]).
+	Offsets []uint64 `cbor:"offsets"`
 }
 
 // Catalog mirrors the Rust authoritative type; only the fields consumers need

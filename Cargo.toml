@@ -13,7 +13,7 @@ default-members = [".", "crates/muxl"]
 # [lib] below) so downstream code still writes `use muxl::…`. The `muxl` CLI
 # binary lives in crates/muxl, which depends on this crate.
 name = "muxl-core"
-version = "0.3.3"
+version = "0.3.4"
 edition = "2024"
 license = "Apache-2.0"
 

@@ -697,6 +697,222 @@ pub(crate) fn read_box_header(bytes: &[u8], pos: usize) -> Result<([u8; 4], usiz
     Ok((kind, body_start, box_end))
 }
 
+/// Byte offset at which the canonical-segment stream begins inside a storage
+/// wrapper, resolved with random access: only the leading container framing is
+/// read, never the body. The mirror of [`locate_segment_stream`] for inputs too
+/// large to hold in memory.
+///
+/// This is the base a caller holding *fragment-relative* offsets — an HLS
+/// metafile's `offset`, say — adds to reach an absolute position in the blob.
+/// muxl owns the number because muxl synthesized the header that displaces the
+/// fragments: a caller computing it by hand has to re-derive the `mdat`
+/// envelope's framing, including the 64-bit `largesize` form that any body over
+/// 4 GiB forces, and silently reads garbage the day it guesses wrong.
+///
+/// Returns 0 for a bare segment stream (nothing displaces it).
+pub fn segment_stream_start<R: crate::io::ReadAt + ?Sized>(input: &R) -> Result<u64> {
+    let size = input.size().map_err(Error::Io)?;
+    let mut pos = 0u64;
+    while pos + 8 <= size {
+        let (kind, body_start, box_end) = read_box_header_at(input, pos, size)?;
+        match &kind {
+            // Container framing — skip past it.
+            b"ftyp" | b"moov" | b"free" | b"skip" | b"styp" | b"sidx" => pos = box_end,
+            // Flat MP4 outer envelope: its payload *is* the segment stream.
+            b"mdat" => return Ok(body_start),
+            // Start of a bare / fMP4 segment stream.
+            b"moof" => return Ok(pos),
+            b"uuid" => {
+                if is_muxl_uuid_at(input, body_start, box_end)? {
+                    return Ok(pos);
+                }
+                // A non-MUXL uuid is either a signed segment's leading c2pa/S2PA
+                // box — immediately followed by its MUXL uuid, so the segment
+                // stream starts here — or a wrapper-level box that
+                // sign_per_track places after ftyp and before moov, which is
+                // framing to skip. Disambiguate on the next box, exactly as
+                // `next_box_is_muxl` does for the in-memory path.
+                if box_end + 8 <= size {
+                    let (next_kind, next_body, next_end) = read_box_header_at(input, box_end, size)?;
+                    if &next_kind == b"uuid" && is_muxl_uuid_at(input, next_body, next_end)? {
+                        return Ok(pos);
+                    }
+                }
+                pos = box_end;
+            }
+            // Unknown leading box — skip conservatively.
+            _ => pos = box_end,
+        }
+    }
+    // No recognizable framing: the whole input is the segment stream.
+    Ok(0)
+}
+
+/// Whether the `uuid` box body at `body_start` carries [`MUXL_UUID`].
+fn is_muxl_uuid_at<R: crate::io::ReadAt + ?Sized>(
+    input: &R,
+    body_start: u64,
+    box_end: u64,
+) -> Result<bool> {
+    if body_start + 16 > box_end {
+        return Ok(false);
+    }
+    let mut uuid = [0u8; 16];
+    input.read_exact_at(body_start, &mut uuid).map_err(Error::Io)?;
+    Ok(uuid == MUXL_UUID)
+}
+
+/// Random-access box header read: returns the FourCC, the offset its body
+/// starts at, and the offset one past its end. Handles all three ISO-BMFF
+/// sizings — 32-bit, `size == 1` 64-bit `largesize`, and `size == 0`
+/// extends-to-EOF.
+fn read_box_header_at<R: crate::io::ReadAt + ?Sized>(
+    input: &R,
+    pos: u64,
+    size: u64,
+) -> Result<([u8; 4], u64, u64)> {
+    let bad = || Error::InvalidMp4(format!("malformed box header at offset {pos}"));
+
+    let avail = size.saturating_sub(pos);
+    if avail < 8 {
+        return Err(bad());
+    }
+    let want = if avail >= 16 { 16 } else { 8 };
+    let mut hdr = [0u8; 16];
+    input
+        .read_exact_at(pos, &mut hdr[..want])
+        .map_err(Error::Io)?;
+
+    let mut kind = [0u8; 4];
+    kind.copy_from_slice(&hdr[4..8]);
+
+    let (body_start, box_end) = match u32::from_be_bytes([hdr[0], hdr[1], hdr[2], hdr[3]]) {
+        // 64-bit largesize follows the FourCC. The `mdat` envelope over a
+        // >4 GiB body always lands here.
+        1 => {
+            if want < 16 {
+                return Err(bad());
+            }
+            let large = u64::from_be_bytes([
+                hdr[8], hdr[9], hdr[10], hdr[11], hdr[12], hdr[13], hdr[14], hdr[15],
+            ]);
+            if large < 16 {
+                return Err(bad());
+            }
+            (pos + 16, pos.checked_add(large).ok_or_else(bad)?)
+        }
+        // Extends to EOF.
+        0 => (pos + 8, size),
+        n if n < 8 => return Err(bad()),
+        n => (pos + 8, pos.checked_add(n as u64).ok_or_else(bad)?),
+    };
+    if box_end > size {
+        return Err(bad());
+    }
+    Ok((kind, body_start, box_end))
+}
+
+/// Where a caller's recorded segment offset is measured from. Storage layouts
+/// differ on this — a flat-MP4 blob's index is usually relative to the
+/// fragments, which the synthesized header displaces, while an
+/// `[init][segments]` blob's is usually absolute — and guessing wrong reads a
+/// header's worth of the wrong bytes. Callers state which they hold; muxl does
+/// the arithmetic either way.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SegmentOffset {
+    /// Relative to the first canonical segment, so muxl resolves the container
+    /// framing ahead of it and adds that itself.
+    Stream(u64),
+    /// An absolute byte position in the input; nothing is added.
+    File(u64),
+}
+
+/// Read `count` canonical segments out of a storage wrapper, starting at
+/// `offset`, touching only those segments' bytes.
+///
+/// [`SegmentOffset`] says what the offset is measured from — muxl resolves the
+/// container framing for a [`SegmentOffset::Stream`] offset. Keeping that
+/// addition here is the point: callers index fragments, muxl owns where the
+/// bytes live.
+///
+/// Segment extents come from the same `uuid`-boundary rule [`unwrap`] uses, so
+/// the caller supplies only a starting point — it never has to record, or get
+/// right, how long a segment is. `count` of `None` reads to the end of the
+/// stream. The returned bytes are verbatim, so signatures over them survive.
+pub fn read_segments_at<R: crate::io::ReadAt + ?Sized>(
+    input: &R,
+    offset: SegmentOffset,
+    count: Option<u64>,
+) -> Result<Vec<u8>> {
+    let total = input.size().map_err(Error::Io)?;
+    // Only a stream-relative offset needs the container framing resolved; a
+    // file offset is already absolute.
+    let (base, offset) = match offset {
+        SegmentOffset::Stream(o) => (segment_stream_start(input)?, o),
+        SegmentOffset::File(o) => (0, o),
+    };
+    let start = base
+        .checked_add(offset)
+        .filter(|&s| s <= total)
+        .ok_or_else(|| {
+            Error::InvalidMp4(format!(
+                "segment offset {offset} runs past the end of the input \
+                 (segment stream starts at {base}, input is {total} bytes)"
+            ))
+        })?;
+
+    // Walk box headers forward, applying `scan_segments`' boundary rule, until
+    // `count` segments have been closed. Only headers are read here — the
+    // payload is fetched once, as a single span, below.
+    let mut pos = start;
+    let mut closed = 0u64;
+    let mut seg_open = false;
+    let mut seg_has_muxl = false;
+    let end = loop {
+        if pos + 8 > total {
+            break total;
+        }
+        let (kind, body_start, box_end) = read_box_header_at(input, pos, total)?;
+        if &kind == b"uuid" {
+            let is_muxl = is_muxl_uuid_at(input, body_start, box_end)?;
+            // A uuid box opens a new segment when either it's a second muxl
+            // uuid (the previous segment's fragments are complete) or it's a
+            // non-muxl (c2pa) uuid, which always heads a signing prefix.
+            if seg_open && (!is_muxl || seg_has_muxl) {
+                closed += 1;
+                if count.is_some_and(|c| closed >= c) {
+                    break pos;
+                }
+                seg_has_muxl = false;
+            }
+            seg_open = true;
+            seg_has_muxl |= is_muxl;
+        } else if !seg_open {
+            return Err(Error::InvalidMp4(format!(
+                "offset {offset} does not land on a segment boundary \
+                 (found a {} box, expected uuid)",
+                String::from_utf8_lossy(&kind)
+            )));
+        }
+        pos = box_end;
+    };
+
+    if let Some(c) = count
+        && closed + u64::from(seg_open) < c
+    {
+        return Err(Error::InvalidMp4(format!(
+            "requested {c} segments from offset {offset} but the stream held only {}",
+            closed + u64::from(seg_open)
+        )));
+    }
+
+    let len = usize::try_from(end - start)
+        .map_err(|_| Error::InvalidMp4("segment span too large for this platform".into()))?;
+    let mut buf = vec![0u8; len];
+    input.read_exact_at(start, &mut buf).map_err(Error::Io)?;
+    Ok(buf)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1018,5 +1234,110 @@ mod tests {
         // A moof with no preceding uuid is not a canonical segment stream.
         let bytes = b"\x00\x00\x00\x08moof".to_vec();
         assert!(unwrap(&bytes).is_err());
+    }
+
+    /// Build a flat MP4 (ftyp+moov+mdat envelope) from a fixture, the shape a
+    /// finalized VOD blob has, plus the fragment-relative offset of each
+    /// canonical segment within it.
+    fn flat_with_offsets(fixture: &str) -> (Vec<u8>, Vec<(Vec<u8>, u64)>) {
+        let data = read_fixture(fixture);
+        let (catalog, ordered) = segments_in_order(&data);
+        let slices: Vec<&[u8]> = ordered.iter().map(|(_, s)| s.as_slice()).collect();
+        let mut flat = Vec::new();
+        crate::present::write_flat_from_m4s(&catalog, &slices, &mut flat).unwrap();
+
+        let mut offsets = Vec::new();
+        let mut running = 0u64;
+        for (_, seg) in &ordered {
+            offsets.push((seg.clone(), running));
+            running += seg.len() as u64;
+        }
+        (flat, offsets)
+    }
+
+    #[test]
+    fn read_segments_at_indexes_a_flat_blob_by_fragment_offset() {
+        let (flat, offsets) = flat_with_offsets("h264-opus-frag.mp4");
+
+        // The stream starts past ftyp+moov+the mdat box header — exactly the
+        // base a caller must NOT have to compute for itself.
+        let base = segment_stream_start(&flat).unwrap();
+        assert!(base > 0, "a flat MP4 displaces its fragments");
+        assert_eq!(
+            base as usize + offsets.iter().map(|(s, _)| s.len()).sum::<usize>(),
+            flat.len(),
+            "fragments must fill the mdat envelope exactly"
+        );
+
+        // Every segment is recoverable, verbatim, from its offset alone — no
+        // length passed in; muxl derives the extent from the uuid boundaries.
+        for (want, offset) in &offsets {
+            let got = read_segments_at(&flat, SegmentOffset::Stream(*offset), Some(1)).unwrap();
+            assert_eq!(&got, want, "segment at fragment offset {offset}");
+        }
+
+        // Several at once are returned contiguously, in stream order.
+        let first_three: Vec<u8> = offsets[..3].iter().flat_map(|(s, _)| s.clone()).collect();
+        assert_eq!(read_segments_at(&flat, SegmentOffset::Stream(0), Some(3)).unwrap(), first_three);
+
+        // No count reads to the end of the stream.
+        let all: Vec<u8> = offsets.iter().flat_map(|(s, _)| s.clone()).collect();
+        assert_eq!(read_segments_at(&flat, SegmentOffset::Stream(0), None).unwrap(), all);
+    }
+
+    #[test]
+    fn read_segments_at_rejects_offsets_that_are_not_fragment_relative() {
+        let (flat, offsets) = flat_with_offsets("h264-opus-frag.mp4");
+        let base = segment_stream_start(&flat).unwrap();
+
+        // Passing an *absolute* blob offset — the mistake that reads garbage
+        // when a caller adds the flat-header size itself — must fail loudly
+        // rather than return whatever bytes happen to live there.
+        let (_, mid) = &offsets[offsets.len() / 2];
+        assert!(
+            read_segments_at(&flat, SegmentOffset::Stream(base + mid), Some(1)).is_err(),
+            "an absolute offset must not be mistaken for a fragment offset"
+        );
+
+        // That same absolute offset is correct when declared as one.
+        assert_eq!(
+            read_segments_at(&flat, SegmentOffset::File(base + mid), Some(1)).unwrap(),
+            offsets[offsets.len() / 2].0,
+            "SegmentOffset::File must not add the stream base"
+        );
+
+        // Landing inside a box is likewise an error, not silent garbage.
+        assert!(read_segments_at(&flat, SegmentOffset::Stream(4), Some(1)).is_err());
+
+        // Asking for more segments than remain is an error, not a short read.
+        assert!(read_segments_at(&flat, SegmentOffset::Stream(0), Some(offsets.len() as u64 + 1)).is_err());
+    }
+
+    #[test]
+    fn segment_stream_start_handles_64bit_mdat_largesize() {
+        // A body over 4 GiB forces the `size == 1` + 64-bit largesize form, so
+        // the payload starts 16 bytes in rather than 8. Real blobs that hit
+        // this are too big for a test, so build the framing by hand around a
+        // real segment stream.
+        let (flat, offsets) = flat_with_offsets("h264-opus-frag.mp4");
+        let base = segment_stream_start(&flat).unwrap() as usize;
+        let body = &flat[base..];
+
+        let mut blob = Vec::new();
+        blob.extend_from_slice(b"\x00\x00\x00\x10ftypmuxltest");
+        blob.extend_from_slice(&1u32.to_be_bytes()); // size == 1 → largesize
+        blob.extend_from_slice(b"mdat");
+        blob.extend_from_slice(&((body.len() + 16) as u64).to_be_bytes());
+        let header_len = blob.len() as u64;
+        blob.extend_from_slice(body);
+
+        assert_eq!(
+            segment_stream_start(&blob).unwrap(),
+            header_len,
+            "largesize mdat payload starts 16 bytes past the box start"
+        );
+        // And the offsets still resolve against it.
+        let (want, offset) = &offsets[offsets.len() / 2];
+        assert_eq!(&read_segments_at(&blob, SegmentOffset::Stream(*offset), Some(1)).unwrap(), want);
     }
 }

@@ -138,6 +138,28 @@ pub struct UnwrapArgs {
     /// `track<id>/`, plus a per-track `init.mp4`. Omit for a stderr summary.
     #[arg(long, value_name = "DIR")]
     pub dir: Option<PathBuf>,
+    /// Start at this byte offset *within the canonical segment stream* — the
+    /// number an HLS metafile records — rather than at the first segment. NOT
+    /// an absolute file offset: muxl resolves the container framing (a flat
+    /// MP4's ftyp+moov+mdat envelope, whose `mdat` uses the 64-bit `largesize`
+    /// form once the body passes 4 GiB) and adds it itself.
+    ///
+    /// Implies random access: only the requested segments' bytes are read, so
+    /// pulling one GoP out of a multi-gigabyte blob costs a few small reads
+    /// instead of a full scan. Requires a seekable input (not "-").
+    #[arg(long, conflicts_with = "file_offset")]
+    pub offset: Option<u64>,
+    /// Like --offset, but an absolute byte position in the file rather than a
+    /// position within the segment stream — for an index built over the whole
+    /// file (an `[init][segments]` blob's, say) instead of over the fragments.
+    /// Nothing is added to it.
+    #[arg(long)]
+    pub file_offset: Option<u64>,
+    /// Emit only this many segments. Extents come from muxl's own `uuid`
+    /// boundaries, so the caller supplies a starting point and never has to
+    /// record how long a segment is. Omit to read to the end of the stream.
+    #[arg(long)]
+    pub count: Option<u64>,
 }
 
 #[derive(Args)]
@@ -572,8 +594,38 @@ pub fn cmd_wrap(args: WrapArgs) -> crate::Result<()> {
 /// reader. With `--dir`, writes one `.m4s` per segment under `track<id>/`
 /// plus a per-track `init.mp4`; otherwise prints a summary.
 pub fn cmd_unwrap(args: UnwrapArgs) -> crate::Result<()> {
-    use std::collections::{BTreeMap, HashSet};
-    let UnwrapArgs { input, dir, events } = args;
+    let UnwrapArgs { input, dir, events, offset, count, file_offset } = args;
+
+    // --offset/--file-offset/--count: window the stream to specific segments,
+    // read with random access. Byte extents are muxl's to resolve — the caller
+    // passes the coordinates it already has (an HLS metafile's offset) and
+    // never adds a flat-header size of its own.
+    if offset.is_some() || file_offset.is_some() || count.is_some() {
+        if events {
+            return Err(crate::Error::InvalidMp4(
+                "--offset/--file-offset/--count cannot be combined with --events".into(),
+            ));
+        }
+        if input.as_os_str() == "-" {
+            return Err(crate::Error::InvalidMp4(
+                "--offset/--file-offset/--count need a seekable input, not \"-\"".into(),
+            ));
+        }
+        let at = match file_offset {
+            Some(o) => crate::reader::SegmentOffset::File(o),
+            None => crate::reader::SegmentOffset::Stream(offset.unwrap_or(0)),
+        };
+        let reader = crate::io::FileReadAt::open(&input)?;
+        let bytes = crate::reader::read_segments_at(&reader, at, count)?;
+
+        if let Some(dir) = dir {
+            return write_segments_to_dir(&crate::reader::unwrap(&bytes)?, &dir);
+        }
+        let mut out = BufWriter::new(io::stdout().lock());
+        out.write_all(&bytes)?;
+        out.flush()?;
+        return Ok(());
+    }
 
     // --events: re-emit the per-track CBOR event stream (for a host that drives
     // the live-HLS window off already-stored segments). Fully streaming — the
@@ -612,30 +664,39 @@ pub fn cmd_unwrap(args: UnwrapArgs) -> crate::Result<()> {
     let segments = crate::reader::unwrap(&bytes)?;
 
     if let Some(dir) = dir {
-        let mut counters: BTreeMap<u32, u32> = BTreeMap::new();
-        let mut inited: HashSet<u32> = HashSet::new();
-        for seg in &segments {
-            let tid = seg.track_id;
-            let track_dir = dir.join(format!("track{tid}"));
-            fs::create_dir_all(&track_dir)?;
-            if inited.insert(tid) {
-                fs::write(track_dir.join("init.mp4"), crate::present::init(&seg.catalog)?)?;
-            }
-            let n = counters.entry(tid).or_default();
-            fs::write(track_dir.join(format!("segment_{n:04}.m4s")), seg.data)?;
-            *n += 1;
-        }
-        eprintln!(
-            "unwrapped {} segments across {} tracks",
-            segments.len(),
-            counters.len()
-        );
+        write_segments_to_dir(&segments, &dir)?;
     } else {
         for (i, seg) in segments.iter().enumerate() {
             eprintln!("segment {i}: track {} ({} bytes)", seg.track_id, seg.data.len());
         }
         eprintln!("{} segments total", segments.len());
     }
+    Ok(())
+}
+
+/// Write recovered segments out as one `.m4s` per segment under `track<id>/`,
+/// with a per-track `init.mp4` synthesized from the first segment's embedded
+/// catalog.
+fn write_segments_to_dir(segments: &[crate::reader::Segment<'_>], dir: &Path) -> crate::Result<()> {
+    use std::collections::{BTreeMap, HashSet};
+    let mut counters: BTreeMap<u32, u32> = BTreeMap::new();
+    let mut inited: HashSet<u32> = HashSet::new();
+    for seg in segments {
+        let tid = seg.track_id;
+        let track_dir = dir.join(format!("track{tid}"));
+        fs::create_dir_all(&track_dir)?;
+        if inited.insert(tid) {
+            fs::write(track_dir.join("init.mp4"), crate::present::init(&seg.catalog)?)?;
+        }
+        let n = counters.entry(tid).or_default();
+        fs::write(track_dir.join(format!("segment_{n:04}.m4s")), seg.data)?;
+        *n += 1;
+    }
+    eprintln!(
+        "unwrapped {} segments across {} tracks",
+        segments.len(),
+        counters.len()
+    );
     Ok(())
 }
 

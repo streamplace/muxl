@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"testing/fstest"
@@ -129,6 +130,74 @@ func (e *WASMEngine) SegmentEvents(ctx context.Context, input io.Reader, events 
 // UnwrapEvents implements [Engine].
 func (e *WASMEngine) UnwrapEvents(ctx context.Context, input io.Reader, events chan<- *Event) error {
 	return e.runWith(ctx, []string{"muxl", "unwrap", "--events", "-"}, nil, false, input, nil, nil, nil, nil, nil, events)
+}
+
+// ReadSegmentsOption tunes [WASMEngine.ReadSegments].
+type ReadSegmentsOption func(*readSegmentsConfig)
+
+type readSegmentsConfig struct{ fileOffset bool }
+
+// WithFileOffset declares that the offset is an absolute byte position in the
+// input rather than a position within the canonical-segment stream — for an
+// index built over the whole file (an `[init][segments]` blob's, say) instead
+// of over the fragments. Nothing is added to it.
+//
+// Which one a caller holds is a property of how its index was built, and
+// guessing reads a header's worth of the wrong bytes, so it is stated rather
+// than inferred.
+func WithFileOffset() ReadSegmentsOption {
+	return func(c *readSegmentsConfig) { c.fileOffset = true }
+}
+
+// ReadSegments returns `count` canonical segments read from `offset` bytes
+// into src's canonical-segment stream, verbatim.
+//
+// offset is relative to the start of the segment stream — the number an HLS
+// metafile records — NOT an absolute offset into src. muxl resolves the
+// container framing (a flat MP4's ftyp+moov+mdat envelope, whose mdat takes
+// the 64-bit largesize form once the body passes 4 GiB) and adds it itself,
+// which is the point: callers index fragments and never carry a header size of
+// their own. An offset that doesn't land on a segment boundary is an error,
+// not a short read of whatever bytes live there.
+//
+// Segment extents come from muxl's own uuid boundaries, so no length is
+// passed. count <= 0 reads to the end of the stream.
+//
+// src is addressed through a read-only single-file mount, so only the
+// requested segments' bytes are ever read: extracting one GoP from a
+// multi-gigabyte blob costs a few small reads rather than a full scan, and
+// works over storage the guest can't reach directly (an S3-backed ReaderAt
+// turns each read into a range GET).
+func (e *WASMEngine) ReadSegments(ctx context.Context, src io.ReaderAt, size int64, offset int64, count int, opts ...ReadSegmentsOption) ([]byte, error) {
+	if size < 0 {
+		return nil, fmt.Errorf("muxl: negative input size %d", size)
+	}
+	if offset < 0 {
+		return nil, fmt.Errorf("muxl: negative segment offset %d", offset)
+	}
+	var cfg readSegmentsConfig
+	for _, opt := range opts {
+		opt(&cfg)
+	}
+
+	const mountPath = "/in"
+	const fileName = "blob.mp4"
+	fsCfg := wazero.NewFSConfig().WithFSMount(readAtFS{name: fileName, src: src, size: size}, mountPath)
+
+	offsetFlag := "--offset"
+	if cfg.fileOffset {
+		offsetFlag = "--file-offset"
+	}
+	args := []string{"muxl", "unwrap", mountPath + "/" + fileName, offsetFlag, strconv.FormatInt(offset, 10)}
+	if count > 0 {
+		args = append(args, "--count", strconv.Itoa(count))
+	}
+
+	var out bytes.Buffer
+	if err := e.runWith(ctx, args, fsCfg, false, nil, &out, nil, nil, nil, nil, nil); err != nil {
+		return nil, err
+	}
+	return out.Bytes(), nil
 }
 
 // Verify implements [Engine].

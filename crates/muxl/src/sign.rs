@@ -894,13 +894,12 @@ mod tests {
 }
 
 /// Canonical segments for signing, verification, and inspection tests: a real
-/// AV GoP plus a hand-minted WebVTT segment.
+/// AV GoP plus a canonical WebVTT segment.
 #[cfg(test)]
 pub(crate) mod test_segments {
     use std::io::Cursor;
     use std::path::PathBuf;
 
-    use mp4_atom::{Encode, Mfhd, Moof, Tfdt, Tfhd, Traf, Trun, TrunEntry};
     use muxl::catalog::{Catalog, Container, TextConfig};
 
     use super::SignerKey;
@@ -942,47 +941,14 @@ pub(crate) mod test_segments {
     /// An unsigned canonical WebVTT segment: the MUXL uuid (single-track text
     /// catalog), then one canonical moof+mdat whose sample is a single cue.
     pub fn text_segment(catalog: &Catalog, track_id: u32, cue: &str) -> Vec<u8> {
-        let mut payload = Vec::new();
-        payload.extend_from_slice(&((16 + cue.len()) as u32).to_be_bytes());
-        payload.extend_from_slice(b"vttc");
-        payload.extend_from_slice(&((8 + cue.len()) as u32).to_be_bytes());
-        payload.extend_from_slice(b"payl");
-        payload.extend_from_slice(cue.as_bytes());
-
-        let mut moof = Moof {
-            mfhd: Mfhd { sequence_number: 1 },
-            traf: vec![Traf {
-                tfhd: Tfhd {
-                    track_id,
-                    ..Default::default()
-                },
-                tfdt: Some(Tfdt {
-                    base_media_decode_time: 0,
-                }),
-                trun: vec![Trun {
-                    data_offset: Some(0),
-                    entries: vec![TrunEntry {
-                        duration: Some(1000),
-                        size: Some(payload.len() as u32),
-                        flags: Some(0x02000000),
-                        cts: None,
-                    }],
-                }],
-                ..Default::default()
-            }],
-        };
-        let mut sized = Vec::new();
-        moof.encode(&mut sized).unwrap();
-        moof.traf[0].trun[0].data_offset = Some((sized.len() + 8) as i32);
-        let mut moof_bytes = Vec::new();
-        moof.encode(&mut moof_bytes).unwrap();
-
-        let mut out = muxl::segment::mint_canonical_segment_prefix(catalog, track_id).unwrap();
-        out.extend_from_slice(&moof_bytes);
-        out.extend_from_slice(&((8 + payload.len()) as u32).to_be_bytes());
-        out.extend_from_slice(b"mdat");
-        out.extend_from_slice(&payload);
-        out
+        let config = catalog.text_configs().find(|c| c.track_id() == track_id).unwrap();
+        muxl::text::build_track(config, &[muxl::text::Cue {
+            start: 0,
+            end: 1000,
+            text: cue.into(),
+            id: None,
+            settings: None,
+        }], 0, 1000).unwrap()
     }
 
     pub fn signer() -> SignerKey {

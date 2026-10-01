@@ -11,11 +11,6 @@
 //! different resolutions). Each input produces exactly one flat MP4 blob
 //! regardless of how many tracks it carries.
 //!
-//! Timed-text (WebVTT) tracks become `TYPE=SUBTITLES` renditions whose media
-//! playlists byte-range the `wvtt` fMP4 fragments in the blob, just like the
-//! audio and video playlists. Players must support WebVTT-in-fMP4 (`wvtt`) to
-//! render them (for example hls.js and Shaka; Apple's native player expects
-//! plain `.vtt` subtitle segments).
 
 use std::collections::HashSet;
 use std::fs;
@@ -418,24 +413,6 @@ fn write_playlists(
             entry.key,
         ));
     }
-    // Subtitle renditions (WebVTT in fMP4). Only emitted when a text track
-    // exists, so AV-only master playlists are unchanged.
-    let has_subtitles = entries.iter().any(|e| e.track.track_type == "text");
-    for entry in entries {
-        if entry.track.track_type != "text" {
-            continue;
-        }
-        let t = &entry.track;
-        let language = t.language.as_deref().unwrap_or("und");
-        let name = t.label.as_deref().unwrap_or(language);
-        master.push_str(&format!(
-            "#EXT-X-MEDIA:TYPE=SUBTITLES,GROUP-ID=\"subs\",NAME=\"{}\",\
-             LANGUAGE=\"{}\",DEFAULT=NO,AUTOSELECT=YES,URI=\"{primary_blob_cid}.text-{}.m3u8\"\n",
-            hls_quoted(name),
-            hls_quoted(language),
-            entry.key,
-        ));
-    }
     master.push('\n');
 
     // CODECS string for video variants — pair with the AAC audio track when present.
@@ -445,12 +422,6 @@ fn write_playlists(
         .or_else(|| entries.iter().find(|e| e.track.track_type == "audio"))
         .map(|e| e.track.codec.as_str())
         .unwrap_or("mp4a.40.2");
-    // With subtitles, each variant names the group and lists the text codec.
-    let (subs_attr, subs_codec) = if has_subtitles {
-        (",SUBTITLES=\"subs\"", ",wvtt")
-    } else {
-        ("", "")
-    };
 
     for entry in entries {
         if entry.track.track_type != "video" {
@@ -474,8 +445,8 @@ fn write_playlists(
         };
 
         master.push_str(&format!(
-            "#EXT-X-STREAM-INF:AUDIO=\"audio\"{subs_attr},BANDWIDTH={bandwidth},\
-             CODECS=\"{},{audio_codec}{subs_codec}\",RESOLUTION={}x{},FRAME-RATE={frame_rate:.3}\n",
+            "#EXT-X-STREAM-INF:AUDIO=\"audio\",BANDWIDTH={bandwidth},\
+             CODECS=\"{},{audio_codec}\",RESOLUTION={}x{},FRAME-RATE={frame_rate:.3}\n",
             t.codec, t.width, t.height,
         ));
         master.push_str(&format!("{primary_blob_cid}.video-{}.m3u8\n", entry.key));
@@ -489,6 +460,9 @@ fn write_playlists(
     // Per-track media playlists.
     for entry in entries {
         let t = &entry.track;
+        if t.track_type == "text" {
+            continue;
+        }
         let ts = t.timescale as f64;
         let blob_file = format!("{}.mp4", t.blob_cid);
 
@@ -522,7 +496,6 @@ fn write_playlists(
         playlist.push_str("#EXT-X-ENDLIST\n");
         let prefix = match t.track_type.as_str() {
             "video" => "video",
-            "text" => "text",
             _ => "audio",
         };
         fs::write(
@@ -593,18 +566,6 @@ fn write_metadata_json(
     Ok(())
 }
 
-/// Make `s` safe inside an HLS quoted-string attribute, which may not contain
-/// `"`, CR, or LF (RFC 8216 § 4.2).
-fn hls_quoted(s: &str) -> String {
-    s.chars()
-        .map(|c| match c {
-            '"' => '\'',
-            '\r' | '\n' => ' ',
-            c => c,
-        })
-        .collect()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -663,27 +624,6 @@ mod tests {
         let (_dir, m) = master(false);
         assert!(!m.contains("SUBTITLES"), "got: {m}");
         assert!(m.contains("CODECS=\"avc1.64001f,opus\""), "got: {m}");
-    }
-
-    #[test]
-    fn text_track_becomes_subtitles_rendition() {
-        let (dir, m) = master(true);
-        assert!(
-            m.contains(
-                "#EXT-X-MEDIA:TYPE=SUBTITLES,GROUP-ID=\"subs\",NAME=\"Live 'captions'\",\
-                 LANGUAGE=\"en-US\",DEFAULT=NO,AUTOSELECT=YES,URI=\"blob.text-3.m3u8\""
-            ),
-            "got: {m}"
-        );
-        assert!(
-            m.contains("#EXT-X-STREAM-INF:AUDIO=\"audio\",SUBTITLES=\"subs\",BANDWIDTH="),
-            "got: {m}"
-        );
-        assert!(m.contains("CODECS=\"avc1.64001f,opus,wvtt\""), "got: {m}");
-
-        let media = fs::read_to_string(dir.path().join("blob.text-3.m3u8")).unwrap();
-        assert!(media.contains("#EXT-X-MAP:URI=\"init3.mp4\""), "got: {media}");
-        assert!(media.contains("#EXT-X-BYTERANGE:10@0"), "got: {media}");
     }
 
     #[test]

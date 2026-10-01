@@ -17,6 +17,7 @@ package muxl
 import (
 	"context"
 	"io"
+	"time"
 )
 
 // Engine is the MUXL/S2PA backend: canonical segmentation, S2PA signing and
@@ -187,7 +188,10 @@ type SignerInput struct {
 	// previously declared tracks receive gap-only segments. Track IDs and
 	// language/label must remain fixed for the session.
 	TextFn func(context.Context, TextRequest) (*TextAttachment, error)
-	Alg    string
+	// SegmentTimeFn supplies the media-start wall clock stamped into dc:date.
+	// Nil retains the ordinary signing-time stamp, byte-identically.
+	SegmentTimeFn func(startMs uint64) time.Time
+	Alg           string
 }
 
 // TranscodeInput is the signing bundle for [Engine.SignTranscode]. Exactly one

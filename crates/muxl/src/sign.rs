@@ -250,7 +250,9 @@ unsafe extern "C" {
     /// JSON TextAttachment for this media span. Zero means no new text;
     /// u32::MAX means failure (continue with empty declared tracks).
     /// Size probes must return the same cached attachment on retry.
-    fn host_get_text(start_ms: u64, end_ms: u64, max_track_id: u32, out_ptr: u32, out_max: u32) -> u32;
+    fn host_get_text(start_ms: u64, end_ms: u64, out_ptr: u32, out_max: u32) -> u32;
+    /// UTC Unix milliseconds for the media start, or i64::MIN for signing time.
+    fn host_get_segment_time(start_ms: u64) -> i64;
 }
 
 #[cfg(not(target_family = "wasm"))]
@@ -264,13 +266,16 @@ unsafe fn host_get_manifest(_: u32, _: u32, _: u32) -> u32 {
 }
 
 #[cfg(not(target_family = "wasm"))]
-unsafe fn host_get_text(_: u64, _: u64, _: u32, _: u32, _: u32) -> u32 { 0 }
+unsafe fn host_get_text(_: u64, _: u64, _: u32, _: u32) -> u32 { 0 }
+
+#[cfg(not(target_family = "wasm"))]
+unsafe fn host_get_segment_time(_: u64) -> i64 { i64::MIN }
 
 fn host_text(req: muxl::text::TextRequest) -> muxl::text::TextAttachment {
-    let n = unsafe { host_get_text(req.start_ms, req.end_ms, req.max_track_id, 0, 0) };
+    let n = unsafe { host_get_text(req.start_ms, req.end_ms, 0, 0) };
     if n == 0 || n == u32::MAX || n as usize > HOST_MANIFEST_MAX_LEN { return Default::default(); }
     let mut buf = vec![0; n as usize];
-    let n = unsafe { host_get_text(req.start_ms, req.end_ms, req.max_track_id, buf.as_mut_ptr() as u32, buf.len() as u32) };
+    let n = unsafe { host_get_text(req.start_ms, req.end_ms, buf.as_mut_ptr() as u32, buf.len() as u32) };
     if n == u32::MAX || n as usize > buf.len() { return Default::default(); }
     serde_json::from_slice(&buf[..n as usize]).unwrap_or_default()
 }
@@ -588,11 +593,16 @@ fn handle_event<W: Write>(
             // bytes and shifts per-sample offsets past the leading c2pa-uuid
             // prefix.
             let segment_base = next_track()?;
+            let mut segment_when = None;
             if let Some(fetch) = text_fn.as_deref_mut() {
                 let req = muxl::text::StreamingText::request(catalog_state, &gop)?;
                 text.attach(&mut gop, req, fetch(req))?;
+                let millis = unsafe { host_get_segment_time(req.start_ms) };
+                if millis != i64::MIN {
+                    segment_when = Some(rfc3339_from_unix(millis.div_euclid(1000), millis.rem_euclid(1000) as u32));
+                }
             }
-            let segment_manifest = stamp_segment_manifest(&segment_base, &now_rfc3339_utc());
+            let segment_manifest = stamp_segment_manifest(&segment_base, &segment_when.unwrap_or_else(now_rfc3339_utc));
             let prefix_size = sign_gop_canonical_segments_in_place(
                 &mut gop,
                 &segment_manifest,

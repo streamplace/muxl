@@ -46,10 +46,10 @@ callers.
 
 `SignerInput.TextFn` is an optional per-GoP callback. It receives `TextRequest`
 with the reference AV GoP's absolute stream-millisecond interval `[StartMs,
-EndMs)` and `MaxTrackID`, the highest input track ID. Return `TextAttachment`
-containing `TextTrackAttachment` entries: an immutable `TextTrack` configuration
-(`TrackID`, BCP 47 `Language`, `Label`) and its overlapping `TextCue`s. Allocate
-text IDs above `MaxTrackID`; do not reuse an AV or another text track's ID.
+EndMs)`. Return `TextAttachment` containing `TextTrackAttachment` entries: an
+immutable `TextTrack` configuration (`TrackID`, BCP 47 `Language`, `Label`) and
+its overlapping `TextCue`s. Reserve a text ID namespace distinct from input AV
+and downstream renditions; do not reuse another track's ID.
 
 The signer encodes WebVTT and gap-covering segments before signing, without
 changing AV bytes or playable duration. Once declared, a text track appears in
@@ -58,6 +58,10 @@ callback fails. Language/label changes require a new track ID. Callbacks may
 block to await source captions; callers should decouple their media producer.
 A nil callback preserves the pre-text signed bytes. Cue IDs should identify the
 session and remain stable across GoP boundaries so readers can coalesce them.
+
+`SignerInput.SegmentTimeFn` optionally maps each absolute media start in
+milliseconds to its signed UTC start time. Nil retains the existing signing-time
+stamp. It is independent of text and can be used for AV-only origins as well.
 
 ### Transcode provenance
 

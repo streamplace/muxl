@@ -166,7 +166,6 @@ pub fn build_track(config: &TextConfig, cues: &[Cue], start: u64, end: u64) -> R
 pub struct TextRequest {
     pub start_ms: u64,
     pub end_ms: u64,
-    pub max_track_id: u32,
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -201,10 +200,7 @@ impl StreamingText {
         let start = gop.first_decode_times[&reference.0];
         Ok(TextRequest {
             start_ms: crate::segment::ticks_to_ms(start, reference.1),
-            end_ms: crate::segment::ticks_to_ms(start + gop.durations[&reference.0], reference.1),
-            max_track_id: catalog.video_configs().map(|c| c.track_id())
-                .chain(catalog.audio_configs().map(|c| c.track_id()))
-                .chain(catalog.text_configs().map(|c| c.track_id())).max().unwrap_or(0),
+            end_ms: gop.reference_end_ms.unwrap_or_else(|| crate::segment::ticks_to_ms(start + gop.durations[&reference.0], reference.1)),
         })
     }
 
@@ -316,7 +312,7 @@ mod tests {
         let mut state = StreamingText::default();
         let first = StreamingText::request(&catalog, &gops[0]).unwrap();
         let wanted = cue(first.end_ms - 100, first.end_ms + 100, "boundary");
-        let id = first.max_track_id + 1;
+        let id = 100;
         let mut recovered = Vec::new();
         for (i, gop) in gops.iter_mut().enumerate() {
             let req = StreamingText::request(&catalog, gop).unwrap();
@@ -351,5 +347,36 @@ mod tests {
             assert_eq!(gop.tracks, before);
             assert_eq!(gop.body_size, body);
         }
+    }
+    #[test]
+    fn streaming_text_covers_discontinuous_tfdt_until_next_keyframe() {
+        let mut input = std::fs::read("samples/fixtures/h264-opus-frag.mp4").unwrap();
+        let mut at = 4;
+        while at + 16 <= input.len() {
+            if &input[at..at+4] == b"tfdt" {
+                let size = u32::from_be_bytes(input[at-4..at].try_into().unwrap());
+                if size == 20 && input[at+4] == 1 {
+                    let value = u64::from_be_bytes(input[at+8..at+16].try_into().unwrap());
+                    if value > 0 { input[at+8..at+16].copy_from_slice(&(value+100).to_be_bytes()); }
+                } else if size == 16 && input[at+4] == 0 {
+                    let value = u32::from_be_bytes(input[at+8..at+12].try_into().unwrap());
+                    if value > 0 { input[at+8..at+12].copy_from_slice(&(value+100).to_be_bytes()); }
+                }
+            }
+            at += 1;
+        }
+        let mut gops = Vec::new();
+        let catalog = crate::segment_fmp4(&mut Cursor::new(input), |g| { gops.push(g); Ok(()) }).unwrap();
+        let first = StreamingText::request(&catalog,&gops[0]).unwrap();
+        let second = StreamingText::request(&catalog,&gops[1]).unwrap();
+        assert_eq!(first.end_ms,second.start_ms,"text must tile the actual keyframe boundary, including decode gaps");
+        let mut state = StreamingText::default();
+        let id = 100;
+        let wanted = cue(first.end_ms-3,first.end_ms,"gap words");
+        state.attach(&mut gops[0],first,TextAttachment { tracks:vec![TextTrackAttachment {
+            track_id:id,language:"en".into(),label:Some("human".into()),cues:vec![wanted.clone()],
+        }] }).unwrap();
+        assert_eq!(cues_from_fragments(&gops[0].tracks[&id],1000).unwrap(),vec![wanted]);
+        assert_eq!(gops[0].samples[&id].durations.iter().map(|&d|d as u64).sum::<u64>(),second.start_ms-first.start_ms);
     }
 }

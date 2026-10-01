@@ -80,6 +80,9 @@ pub struct GopSegment {
     /// segment range begins mid-stream; carried so downstream consumers can
     /// re-anchor any sub-range to presentation zero.
     pub first_decode_times: BTreeMap<u32, u64>,
+    /// Actual reference cut boundary in milliseconds (next keyframe, or
+    /// final reference sample end on flush), including decode-time gaps.
+    pub reference_end_ms: Option<u64>,
     /// Total body bytes this segment contributes when concatenated into a
     /// flat MP4 (sum of `tracks` values' lengths). Used by downstream
     /// consumers to compute cumulative byte offsets in the synth flat MP4
@@ -507,7 +510,7 @@ impl StreamSegmenter {
     fn flush_gop(&mut self, text_end: Option<u64>) -> Result<Option<GopSegment>> {
         self.segment_number += 1;
         let number = self.segment_number;
-        let av = flush_track_bufs(
+        let mut av = flush_track_bufs(
             &mut self.track_bufs,
             &mut self.track_durations,
             &mut self.track_sample_counts,
@@ -517,6 +520,7 @@ impl StreamSegmenter {
             &self.catalog,
             number,
         )?;
+        if let Some(gop) = av.as_mut() { gop.reference_end_ms = text_end; }
 
         let mut text_parts = Vec::new();
         if let Some(end) = text_end {
@@ -548,6 +552,7 @@ impl StreamSegmenter {
             sample_counts: BTreeMap::new(),
             samples: BTreeMap::new(),
             first_decode_times: BTreeMap::new(),
+            reference_end_ms: text_end,
             body_size: 0,
             duration_us: 0,
         });
@@ -660,6 +665,7 @@ pub(crate) fn flush_track_bufs(
             sample_counts,
             samples,
             first_decode_times,
+            reference_end_ms: None,
             body_size,
             duration_us,
         }))

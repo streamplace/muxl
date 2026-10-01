@@ -20,7 +20,7 @@ func TestSignSegmentText(t *testing.T) {
 	in.TextFn = func(ctx context.Context, req muxl.TextRequest) (*muxl.TextAttachment, error) {
 		calls++
 		if calls == 1 {
-			track = muxl.TextTrack{TrackID: req.MaxTrackID + 1, Language: "en-US", Label: "ingest"}
+			track = muxl.TextTrack{TrackID: 100, Language: "en-US", Label: "ingest"}
 			want = muxl.TextCue{Start: req.EndMs - 100, End: req.EndMs + 100, Text: "across the boundary", ID: "crossing"}
 		}
 		return &muxl.TextAttachment{Tracks: []muxl.TextTrackAttachment{{TextTrack: track, Cues: []muxl.TextCue{want}}}}, nil
@@ -88,7 +88,7 @@ func TestSignSegmentTextErrorKeepsTrackContinuous(t *testing.T) {
 		if calls > 1 {
 			return nil, fmt.Errorf("speech unavailable")
 		}
-		return &muxl.TextAttachment{Tracks: []muxl.TextTrackAttachment{{TextTrack: muxl.TextTrack{TrackID: req.MaxTrackID + 1, Language: "en", Label: "auto"}, Cues: []muxl.TextCue{{Start: req.StartMs, End: req.StartMs + 100, Text: "first"}}}}}, nil
+		return &muxl.TextAttachment{Tracks: []muxl.TextTrackAttachment{{TextTrack: muxl.TextTrack{TrackID: 100, Language: "en", Label: "auto"}, Cues: []muxl.TextCue{{Start: req.StartMs, End: req.StartMs + 100, Text: "first"}}}}}, nil
 	}
 	events, err := collectEvents(func(events chan<- *muxl.Event) error {
 		return eng.SignSegment(context.Background(), bytes.NewReader(readFile(t, fixtureFmp4)), in, nil, nil, events)
@@ -100,11 +100,11 @@ func TestSignSegmentTextErrorKeepsTrackContinuous(t *testing.T) {
 		if ev.Type != "signed-segment" || ev.Number != 2 {
 			continue
 		}
-		data, ok := ev.Tracks["3"]
+		data, ok := ev.Tracks["100"]
 		if !ok {
 			t.Fatal("callback error removed declared text track")
 		}
-		cues, err := eng.ReadTextCues(context.Background(), bytes.NewReader(data), 3)
+		cues, err := eng.ReadTextCues(context.Background(), bytes.NewReader(data), 100)
 		if err != nil || len(cues) != 0 {
 			t.Fatalf("error GoP must carry gaps: %+v %v", cues, err)
 		}

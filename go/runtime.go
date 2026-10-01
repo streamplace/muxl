@@ -9,6 +9,7 @@ import (
 	"io"
 	"log/slog"
 	"sort"
+	"strconv"
 	"strings"
 
 	"github.com/hyphacoop/go-dasl/drisl"
@@ -173,7 +174,7 @@ func (e *WASMEngine) runWith(
 	manifestFn func(kind uint32) ([]byte, error),
 	initCh, segCh chan<- []byte,
 	eventCh chan<- *Event,
-	textFn ...func(context.Context, TextRequest) (*TextAttachment, error),
+	callbacks ...signerCallbacks,
 ) error {
 	instanceID := e.counter.Add(1)
 	instanceName := fmt.Sprintf("muxl-%d", instanceID)
@@ -186,9 +187,15 @@ func (e *WASMEngine) runWith(
 		e.manifestFetchers.Store(instanceName, manifestFn)
 		defer e.manifestFetchers.Delete(instanceName)
 	}
-	if len(textFn) > 0 && textFn[0] != nil {
-		e.textFetchers.Store(instanceName, &textFetcher{fn: textFn[0]})
-		defer e.textFetchers.Delete(instanceName)
+	if len(callbacks) > 0 {
+		if callbacks[0].text != nil {
+			e.textFetchers.Store(instanceName, &textFetcher{fn: callbacks[0].text})
+			defer e.textFetchers.Delete(instanceName)
+		}
+		if callbacks[0].segmentTime != nil {
+			e.segmentTimes.Store(instanceName, callbacks[0].segmentTime)
+			defer e.segmentTimes.Delete(instanceName)
+		}
 	}
 
 	cfg := wazero.NewModuleConfig().
@@ -299,14 +306,24 @@ func parseEvents(ctx context.Context, r io.Reader, initCh, segCh chan<- []byte, 
 			}
 		case "segment", "signed-segment":
 			if segCh != nil {
-				keys := make([]string, 0, len(ev.Tracks))
-				for k := range ev.Tracks {
-					keys = append(keys, k)
+				type numericTrack struct {
+					id  uint32
+					key string
 				}
-				sort.Strings(keys)
-				var combined []byte
+				keys := make([]numericTrack, 0, len(ev.Tracks))
+				size := 0
+				for k, data := range ev.Tracks {
+					id, err := strconv.ParseUint(k, 10, 32)
+					if err != nil {
+						return fmt.Errorf("invalid track id %q: %w", k, err)
+					}
+					keys = append(keys, numericTrack{id: uint32(id), key: k})
+					size += len(data)
+				}
+				sort.Slice(keys, func(i, j int) bool { return keys[i].id < keys[j].id })
+				combined := make([]byte, 0, size)
 				for _, k := range keys {
-					combined = append(combined, ev.Tracks[k]...)
+					combined = append(combined, ev.Tracks[k.key]...)
 				}
 				select {
 				case <-ctx.Done():

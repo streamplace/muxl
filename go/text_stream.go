@@ -8,11 +8,9 @@ import (
 )
 
 // TextRequest describes the GoP's [StartMs, EndMs) absolute media span.
-// MaxTrackID is the highest input track ID; use MaxTrackID+1 for a new track.
 type TextRequest struct {
-	StartMs    uint64 `json:"startMs"`
-	EndMs      uint64 `json:"endMs"`
-	MaxTrackID uint32 `json:"maxTrackId"`
+	StartMs uint64 `json:"startMs"`
+	EndMs   uint64 `json:"endMs"`
 }
 
 // TextAttachment declares new tracks and supplies cues for this GoP.
@@ -34,13 +32,13 @@ type textFetcher struct {
 }
 
 // A size retry must not invoke a blocking callback twice or consume cues twice.
-func (e *WASMEngine) hostGetText(ctx context.Context, mod api.Module, start, end uint64, maxTrackID, outPtr, outMax uint32) uint32 {
+func (e *WASMEngine) hostGetText(ctx context.Context, mod api.Module, start, end uint64, outPtr, outMax uint32) uint32 {
 	v, ok := e.textFetchers.Load(mod.Name())
 	if !ok {
 		return 0
 	}
 	f := v.(*textFetcher)
-	req := TextRequest{StartMs: start, EndMs: end, MaxTrackID: maxTrackID}
+	req := TextRequest{StartMs: start, EndMs: end}
 	if f.pending == nil || f.request != req {
 		attachment, err := f.fn(ctx, req)
 		if err != nil {

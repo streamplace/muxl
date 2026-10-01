@@ -48,6 +48,7 @@ type WASMEngine struct {
 	signers          sync.Map // instance name -> func([]byte) ([]byte, error)
 	manifestFetchers sync.Map // instance name -> func(kind uint32) ([]byte, error)
 	textFetchers     sync.Map // instance name -> *textFetcher
+	segmentTimes     sync.Map // instance name -> func(uint64) time.Time
 	logger           *slog.Logger
 	memInitial       uint64
 	memMax           uint64
@@ -95,6 +96,7 @@ func NewWASM(ctx context.Context, opts ...Option) (*WASMEngine, error) {
 		NewFunctionBuilder().WithFunc(e.hostSign).Export("host_sign").
 		NewFunctionBuilder().WithFunc(e.hostGetManifest).Export("host_get_manifest").
 		NewFunctionBuilder().WithFunc(e.hostGetText).Export("host_get_text").
+		NewFunctionBuilder().WithFunc(e.hostGetSegmentTime).Export("host_get_segment_time").
 		Instantiate(ctx); err != nil {
 		_ = e.runtime.Close(ctx)
 		return nil, fmt.Errorf("muxl: registering host module: %w", err)
@@ -264,7 +266,7 @@ func (e *WASMEngine) SignSegment(ctx context.Context, input io.Reader, in Signer
 	if alg == "" {
 		alg = "es256k"
 	}
-	dynamicManifest := in.TrackManifestFn != nil || in.WrapperManifestFn != nil || in.TextFn != nil
+	dynamicManifest := in.TrackManifestFn != nil || in.WrapperManifestFn != nil || in.TextFn != nil || in.SegmentTimeFn != nil
 	keysFS := fstest.MapFS{
 		"cert.pem": {Data: in.CertPEM},
 	}
@@ -291,7 +293,7 @@ func (e *WASMEngine) SignSegment(ctx context.Context, input io.Reader, in Signer
 	}
 	fsCfg := wazero.NewFSConfig().WithFSMount(keysFS, "/keys")
 	manifestFn := manifestFetcher(in)
-	return e.runWith(ctx, args, fsCfg, true, input, nil, in.Sign, manifestFn, init, seg, events, in.TextFn)
+	return e.runWith(ctx, args, fsCfg, true, input, nil, in.Sign, manifestFn, init, seg, events, signerCallbacks{text: in.TextFn, segmentTime: in.SegmentTimeFn})
 }
 
 // manifestFetcher returns the per-instance fetcher we register for the
@@ -301,7 +303,7 @@ func (e *WASMEngine) SignSegment(ctx context.Context, input io.Reader, in Signer
 // just TrackManifestFn (the common case in Streamplace) without rewriting the
 // wrapper too.
 func manifestFetcher(in SignerInput) func(kind uint32) ([]byte, error) {
-	if in.TrackManifestFn == nil && in.WrapperManifestFn == nil && in.TextFn == nil {
+	if in.TrackManifestFn == nil && in.WrapperManifestFn == nil && in.TextFn == nil && in.SegmentTimeFn == nil {
 		return nil
 	}
 	return func(kind uint32) ([]byte, error) {

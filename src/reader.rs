@@ -303,6 +303,14 @@ struct GopAccum {
     has_non_text: bool,
 }
 
+struct PendingSegment {
+    data: Vec<u8>,
+    catalog: Catalog,
+    tid: u32,
+    samples: crate::segment::TrackSamples,
+    dts: u64,
+}
+
 /// Turns a forward stream of verbatim canonical segments into the live event
 /// shape (one `Init`, then one `Segment` per GoP), holding at most one GoP.
 /// Shared by the slurp ([`segment_events_streaming`]) and fully-streaming
@@ -314,13 +322,11 @@ struct StreamEventBuilder<F> {
     /// Per-track media timescale and text flag, recorded as each track
     /// first appears.
     timescales: std::collections::BTreeMap<u32, (u32, bool)>,
-    /// Track ids covered by the most recently emitted `Init`.
-    emitted_tids: std::collections::HashSet<u32>,
-    init_emitted: bool,
-    /// The GoP currently being assembled introduced a track no `Init` covers yet.
-    pending_new_tid: bool,
+    /// Catalog last exposed to consumers, including source/language changes.
+    emitted_catalog: Option<Catalog>,
     cur: Option<GopAccum>,
-    last_tid: Option<u32>,
+    /// Non-reference tracks received ahead of the next reference boundary.
+    pending: Vec<PendingSegment>,
 }
 
 impl<F> StreamEventBuilder<F>
@@ -332,74 +338,76 @@ where
             emit,
             running: Catalog::default(),
             timescales: std::collections::BTreeMap::new(),
-            emitted_tids: std::collections::HashSet::new(),
-            init_emitted: false,
-            pending_new_tid: false,
+            emitted_catalog: None,
             cur: None,
-            last_tid: None,
+            pending: Vec::new(),
         }
     }
 
-    /// Feed one verbatim canonical segment, in canonical interleave order.
+    /// A reference AV track repetition closes a GoP. Track order does not:
+    /// text may precede AV, but never starts a group or steals the prior AV.
     fn push_segment(&mut self, seg: &[u8]) -> Result<()> {
-        let (tid, ts, dts) = crate::present::segment_index(seg)?;
-
-        // A track id <= the previous one closes the current GoP (tracks ascend
-        // within a GoP). Flush it *before* folding this segment's catalog in, so
-        // the closing GoP's Init reflects exactly the tracks up to and including
-        // it — not this next GoP's first track.
-        if self.last_tid.is_none_or(|prev| tid <= prev) {
-            if let Some(g) = self.cur.take() {
-                self.flush_gop(g)?;
-            }
-            self.cur = Some(GopAccum::default());
+        let (tid, samples, dts) = crate::present::segment_index(seg)?;
+        let catalog = crate::catalog::from_segment(seg)?;
+        let reference = self.running.video_configs().chain(catalog.video_configs())
+            .min_by_key(|c| c.track_id()).map(|c| (c.track_id(),c.timescale()))
+            .or_else(|| self.running.audio_configs().chain(catalog.audio_configs())
+                .min_by_key(|c| c.track_id()).map(|c| (c.track_id(),c.timescale())))
+            .or_else(|| self.running.text_configs().chain(catalog.text_configs())
+                .min_by_key(|c| c.track_id()).map(|c| (c.track_id(),c.timescale())))
+            .ok_or_else(|| Error::InvalidMp4("segment has no reference track".into()))?;
+        let reference_key = reference.0.to_string();
+        let boundary = tid == reference.0 && self.cur.as_ref()
+            .is_some_and(|g| g.tracks.contains_key(&reference_key));
+        let ahead = !boundary && self.cur.as_ref().is_some_and(|g| {
+            if g.tracks.contains_key(&tid.to_string()) { return true; }
+            let Some(&start) = g.first_decode_times.get(&reference_key) else { return false; };
+            let Some(&duration) = g.durations.get(&reference_key) else { return false; };
+            let Some(track) = catalog_track(&catalog,tid) else { return false; };
+            g.has_non_text && tid != reference.0 && track.timescale > 0 && reference.1 > 0 &&
+                crate::segment::ticks_to_ms(dts,track.timescale) >= crate::segment::ticks_to_ms(start+duration,reference.1)
+        });
+        let segment = PendingSegment {data:seg.to_vec(),catalog,tid,samples,dts};
+        if ahead {
+            self.pending.push(segment);
+            return Ok(());
         }
-
-        // Fold this segment's single-track catalog into the running aggregate
-        // (identical to aggregate_catalog's per-segment merge) and record its
-        // timescale, so this GoP's duration_us and the next Init are correct.
-        let cat = crate::catalog::from_segment(seg)?;
-        merge_segment_catalog(&mut self.running, &cat);
-        for t in catalog_tracks(&cat) {
-            self.timescales.insert(t.track_id, (t.timescale, t.is_text));
+        if boundary {
+            if let Some(g) = self.cur.take() { self.flush_gop(g)?; }
+            for pending in std::mem::take(&mut self.pending) { self.append_segment(pending); }
         }
-        if !self.emitted_tids.contains(&tid) {
-            self.pending_new_tid = true;
-        }
-
-        let dur_ticks: u64 = ts.durations.iter().map(|&d| d as u64).sum();
-        let gop = self.cur.as_mut().unwrap();
-        if let Some(&(tsc, is_text)) = self.timescales.get(&tid) {
-            gop.has_non_text |= !is_text;
-            if tsc > 0 {
-                // The GoP's playable span is the longest of its video/audio
-                // tracks. Text only counts in a GoP with no video or audio.
-                let us = dur_ticks * 1_000_000 / tsc as u64;
-                if is_text {
-                    gop.text_duration_us = gop.text_duration_us.max(us);
-                } else {
-                    gop.duration_us = gop.duration_us.max(us);
-                }
-            }
-        }
-        let key = tid.to_string();
-        gop.body_size += seg.len() as u64;
-        gop.durations.insert(key.clone(), dur_ticks);
-        gop.sample_counts.insert(key.clone(), ts.durations.len() as u32);
-        gop.samples.insert(key.clone(), (&ts).into());
-        gop.track_byte_sizes.insert(key.clone(), seg.len() as u64);
-        gop.first_decode_times.insert(key.clone(), dts);
-        gop.tracks
-            .insert(key, crate::cbor::ByteString(seg.to_vec()));
-        self.last_tid = Some(tid);
+        self.append_segment(segment);
         Ok(())
     }
 
-    /// Emit one completed GoP, preceded by a fresh `Init` if this is the first
-    /// GoP or it introduced a track the last `Init` didn't cover.
+    fn append_segment(&mut self, segment: PendingSegment) {
+        let PendingSegment {data,catalog,tid,samples:ts,dts} = segment;
+        merge_segment_catalog(&mut self.running,&catalog);
+        for t in catalog_tracks(&catalog) { self.timescales.insert(t.track_id,(t.timescale,t.is_text)); }
+        let dur_ticks: u64 = ts.durations.iter().map(|&d| d as u64).sum();
+        let gop = self.cur.get_or_insert_with(GopAccum::default);
+        if let Some(&(tsc,is_text)) = self.timescales.get(&tid) {
+            gop.has_non_text |= !is_text;
+            if tsc > 0 {
+                let us = dur_ticks*1_000_000/tsc as u64;
+                if is_text { gop.text_duration_us=gop.text_duration_us.max(us); }
+                else { gop.duration_us=gop.duration_us.max(us); }
+            }
+        }
+        let key=tid.to_string();
+        gop.body_size+=data.len() as u64;
+        gop.durations.insert(key.clone(),dur_ticks);
+        gop.sample_counts.insert(key.clone(),ts.durations.len() as u32);
+        gop.samples.insert(key.clone(),(&ts).into());
+        gop.track_byte_sizes.insert(key.clone(),data.len() as u64);
+        gop.first_decode_times.insert(key.clone(),dts);
+        gop.tracks.insert(key,crate::cbor::ByteString(data));
+    }
+
+    /// Emit one completed GoP, with a fresh Init for any catalog change.
     fn flush_gop(&mut self, g: GopAccum) -> Result<()> {
         use crate::cbor::{ByteString, CborEvent};
-        if !self.init_emitted || self.pending_new_tid {
+        if self.emitted_catalog.as_ref() != Some(&self.running) {
             let track_inits: std::collections::BTreeMap<String, ByteString> =
                 crate::init::build_track_init_segments(&self.running)?
                     .into_iter()
@@ -411,9 +419,7 @@ where
                 catalog: Some(self.running.clone()),
                 track_inits,
             })?;
-            self.init_emitted = true;
-            self.pending_new_tid = false;
-            self.emitted_tids = catalog_tracks(&self.running).map(|t| t.track_id).collect();
+            self.emitted_catalog = Some(self.running.clone());
         }
         let duration_us = if g.has_non_text {
             g.duration_us
@@ -434,6 +440,9 @@ where
 
     /// Flush the final GoP. No segments ⇒ no events (matches `segment_events`).
     fn finish(&mut self) -> Result<()> {
+        if !self.pending.is_empty() {
+            return Err(Error::InvalidMp4("non-reference segments without a following reference GoP".into()));
+        }
         if let Some(g) = self.cur.take() {
             self.flush_gop(g)?;
         }
@@ -1644,5 +1653,45 @@ mod tests {
         }
         let total_ms: u64 = ts.text_durations.iter().map(|&d| d as u64).sum();
         assert_eq!(total_us, total_ms * 1000);
+    }
+    #[test]
+    fn text_before_av_groups_by_reference_and_reemits_changed_config() {
+        use crate::cbor::CborEvent;
+        let input = read_fixture("h264-opus-frag.mp4");
+        let mut gops = Vec::new();
+        let catalog = crate::segment_fmp4(&mut std::io::Cursor::new(input),|g| { gops.push(g);Ok(()) }).unwrap();
+        let mut bytes = Vec::new();
+        for (epoch,index) in [0usize,1,0].into_iter().enumerate() {
+            let req = crate::text::StreamingText::request(&catalog,&gops[index]).unwrap();
+            let config = crate::catalog::TextConfig {
+                codec:"wvtt".into(),container:crate::catalog::Container::cmaf(1000,10),
+                language:if epoch==2 {"es"} else {"en"}.into(),
+                label:Some(if epoch==2 {"human"} else {"auto"}.into()),config:"WEBVTT".into(),
+            };
+            let cue = crate::text::Cue { start:req.start_ms,end:req.end_ms,text:format!("epoch {epoch}"),id:Some(format!("e{epoch}")),settings:None };
+            bytes.extend(crate::text::build_track(&config,&[cue],req.start_ms,req.end_ms).unwrap());
+            for data in gops[index].tracks.values() { bytes.extend_from_slice(data); }
+        }
+        let events = segment_events(&bytes).unwrap();
+        let mut groups = Vec::new();
+        let mut configs = Vec::new();
+        for event in events { match event {
+            CborEvent::Init {catalog:Some(catalog),..} => configs.push(catalog.text_configs().next().unwrap().clone()),
+            CborEvent::Segment {tracks,first_decode_times,..} => {
+                assert!(tracks.contains_key("1") && tracks.contains_key("2") && tracks.contains_key("10"));
+                let cues = crate::text::cues_from_fragments(&tracks["10"].0,1000).unwrap();
+                groups.push((first_decode_times["1"],cues[0].text.clone()));
+            },
+            _ => {},
+        } }
+        assert_eq!(groups.len(),3);
+        assert_eq!(groups[0].1,"epoch 0");
+        assert_eq!(groups[1].1,"epoch 1");
+        assert_eq!(groups[2].1,"epoch 2");
+        assert_eq!(groups[0].0,groups[2].0);
+        assert_eq!(configs.len(),2);
+        assert_eq!(configs[0].language,"en");
+        assert_eq!(configs[1].language,"es");
+        assert_eq!(configs[1].label.as_deref(),Some("human"));
     }
 }

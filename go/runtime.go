@@ -226,6 +226,11 @@ func (e *WASMEngine) runWith(
 	if parse {
 		stdoutReader, stdoutWriter = io.Pipe()
 		cfg = cfg.WithStdout(stdoutWriter)
+		defer stdoutReader.Close()
+		// Context cancellation cannot interrupt a WASI host write blocked on
+		// this pipe after event delivery stops.
+		stop := context.AfterFunc(ctx, func() { stdoutReader.CloseWithError(ctx.Err()) })
+		defer stop()
 	} else if stdout != nil {
 		cfg = cfg.WithStdout(stdout)
 	}

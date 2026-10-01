@@ -171,6 +171,10 @@ decoder.Decode(&event) // {"type": "init", "data": <bytes>}
 
 See [`examples/go-wasi/`](examples/go-wasi/) for a complete working example.
 
+The embedded Go engine's streaming calls terminate on context cancellation even
+when the caller has stopped consuming its event channel. Cancelling one call
+does not close the engine or affect other operations.
+
 The embedded Go module exposes WebVTT through `TextEngine` (implemented by
 `WASMEngine`, without changing the existing `Engine` interface):
 

@@ -312,7 +312,7 @@ struct PendingSegment {
 }
 
 /// Turns a forward stream of verbatim canonical segments into the live event
-/// shape (one `Init`, then one `Segment` per GoP), holding at most one GoP.
+/// shape, holding the current AV group and text received ahead of its AV.
 /// Shared by the slurp ([`segment_events_streaming`]) and fully-streaming
 /// ([`segment_events_stream`]) paths so the two emit byte-identical events.
 struct StreamEventBuilder<F> {
@@ -325,7 +325,10 @@ struct StreamEventBuilder<F> {
     /// Catalog last exposed to consumers, including source/language changes.
     emitted_catalog: Option<Catalog>,
     cur: Option<GopAccum>,
-    /// Non-reference tracks received ahead of the next reference boundary.
+    /// AV ordering retains the legacy numeric-wrap grouping for flat blobs,
+    /// including sparse leading/trailing non-reference tracks.
+    last_av_tid: Option<u32>,
+    /// Text tracks received ahead of the next AV boundary.
     pending: Vec<PendingSegment>,
 }
 
@@ -340,12 +343,13 @@ where
             timescales: std::collections::BTreeMap::new(),
             emitted_catalog: None,
             cur: None,
+            last_av_tid: None,
             pending: Vec::new(),
         }
     }
 
-    /// A reference AV track repetition closes a GoP. Track order does not:
-    /// text may precede AV, but never starts a group or steals the prior AV.
+    /// AV numeric wraps close a GoP, as in the legacy reader. Text order does
+    /// not: text may precede AV without stealing the prior GoP's reference.
     fn push_segment(&mut self, seg: &[u8]) -> Result<()> {
         let (tid, samples, dts) = crate::present::segment_index(seg)?;
         let catalog = crate::catalog::from_segment(seg)?;
@@ -357,9 +361,18 @@ where
                 .min_by_key(|c| c.track_id()).map(|c| (c.track_id(),c.timescale())))
             .ok_or_else(|| Error::InvalidMp4("segment has no reference track".into()))?;
         let reference_key = reference.0.to_string();
-        let boundary = tid == reference.0 && self.cur.as_ref()
-            .is_some_and(|g| g.tracks.contains_key(&reference_key));
-        let ahead = !boundary && self.cur.as_ref().is_some_and(|g| {
+        let is_text = catalog_track(&catalog,tid).is_some_and(|t| t.is_text);
+        let has_av = self.running.video_configs().next().is_some()
+            || self.running.audio_configs().next().is_some()
+            || catalog.video_configs().next().is_some()
+            || catalog.audio_configs().next().is_some();
+        let boundary = if is_text {
+            !has_av && tid == reference.0 && self.cur.as_ref()
+                .is_some_and(|g| g.tracks.contains_key(&reference_key))
+        } else {
+            self.last_av_tid.is_some_and(|last| tid <= last)
+        };
+        let ahead = is_text && !boundary && self.cur.as_ref().is_some_and(|g| {
             if g.tracks.contains_key(&tid.to_string()) { return true; }
             let Some(&start) = g.first_decode_times.get(&reference_key) else { return false; };
             let Some(&duration) = g.durations.get(&reference_key) else { return false; };
@@ -374,9 +387,22 @@ where
         }
         if boundary {
             if let Some(g) = self.cur.take() { self.flush_gop(g)?; }
-            for pending in std::mem::take(&mut self.pending) { self.append_segment(pending); }
+            self.drain_pending()?;
         }
+        if !is_text { self.last_av_tid = Some(tid); }
         self.append_segment(segment);
+        Ok(())
+    }
+
+    /// Sparse inputs may end without another AV reference. Retain every
+    /// pending segment, splitting repeated IDs rather than overwriting bytes.
+    fn drain_pending(&mut self) -> Result<()> {
+        for pending in std::mem::take(&mut self.pending) {
+            if self.cur.as_ref().is_some_and(|g| g.tracks.contains_key(&pending.tid.to_string())) {
+                if let Some(g) = self.cur.take() { self.flush_gop(g)?; }
+            }
+            self.append_segment(pending);
+        }
         Ok(())
     }
 
@@ -441,7 +467,8 @@ where
     /// Flush the final GoP. No segments ⇒ no events (matches `segment_events`).
     fn finish(&mut self) -> Result<()> {
         if !self.pending.is_empty() {
-            return Err(Error::InvalidMp4("non-reference segments without a following reference GoP".into()));
+            if let Some(g) = self.cur.take() { self.flush_gop(g)?; }
+            self.drain_pending()?;
         }
         if let Some(g) = self.cur.take() {
             self.flush_gop(g)?;
@@ -1693,5 +1720,67 @@ mod tests {
         assert_eq!(configs[0].language,"en");
         assert_eq!(configs[1].language,"es");
         assert_eq!(configs[1].label.as_deref(),Some("human"));
+    }
+    #[test]
+    fn sparse_av_flat_blobs_preserve_legacy_groups_and_all_bytes() {
+        use crate::cbor::CborEvent;
+        let input = read_fixture("h264-opus-frag.mp4");
+        let (catalog, ordered) = segments_in_order(&input);
+        assert_eq!(ordered.iter().map(|(id,_)| *id).collect::<Vec<_>>(),vec![1,2,1,2]);
+        // Track-major storage, a leading audio fragment, and repeated trailing
+        // audio were all accepted before timed-text grouping was introduced.
+        for layout in [vec![0usize,2,1,3],vec![1,0,3,2],vec![0,1,3,1]] {
+            let mut expected = Vec::new();
+            let mut current = std::collections::BTreeMap::new();
+            let mut last = 0;
+            let mut body = Vec::new();
+            for &index in &layout {
+                let (tid,data) = &ordered[index];
+                if *tid <= last && !current.is_empty() {
+                    expected.push(std::mem::take(&mut current));
+                }
+                current.insert(tid.to_string(),data.clone());
+                body.extend_from_slice(data);
+                last = *tid;
+            }
+            expected.push(current);
+            // The reader descends the flat blob's outer mdat without relying
+            // on sample tables. Use the same header/envelope shape as storage.
+            let mut blob = build_init_segment(&catalog).unwrap();
+            blob.extend_from_slice(&1u32.to_be_bytes());
+            blob.extend_from_slice(b"mdat");
+            blob.extend_from_slice(&(16+body.len() as u64).to_be_bytes());
+            blob.extend_from_slice(&body);
+            let actual: Vec<std::collections::BTreeMap<String,Vec<u8>>> = segment_events(&blob).unwrap().into_iter()
+                .filter_map(|e| match e { CborEvent::Segment {tracks,..} => Some(tracks.into_iter().map(|(id,data)| (id,data.0)).collect()), _=>None }).collect();
+            assert_eq!(actual,expected,"layout {layout:?} must retain legacy AV grouping and verbatim bytes");
+            for chunk in [1,7,usize::MAX] {
+                assert_eq!(drisl_stream(&blob,chunk),drisl_slurp(&blob));
+            }
+        }
+    }
+
+    #[test]
+    fn trailing_text_without_another_av_reference_is_preserved() {
+        use crate::cbor::CborEvent;
+        let input = read_fixture("h264-opus-frag.mp4");
+        let (catalog,ordered) = segments_in_order(&input);
+        let mut blob = build_init_segment(&catalog).unwrap();
+        for (_,data) in ordered { blob.extend(data); }
+        let config = crate::catalog::TextConfig {
+            codec:"wvtt".into(),container:crate::catalog::Container::cmaf(1000,100),
+            language:"en".into(),label:Some("human".into()),config:"WEBVTT".into(),
+        };
+        let mut expected = Vec::new();
+        for start in [10_000,11_000] {
+            let cue = crate::text::Cue {start,end:start+1000,text:format!("tail {start}"),id:None,settings:None};
+            let track = crate::text::build_track(&config,&[cue],start,start+1000).unwrap();
+            blob.extend_from_slice(&track);
+            expected.push(track);
+        }
+        let actual: Vec<_> = segment_events(&blob).unwrap().into_iter()
+            .filter_map(|e| match e { CborEvent::Segment {mut tracks,..} => tracks.remove("100").map(|data|data.0), _=>None }).collect();
+        assert_eq!(actual,expected,"trailing text fragments must neither be rejected nor overwrite each other");
+        assert_eq!(drisl_stream(&blob,7),drisl_slurp(&blob));
     }
 }

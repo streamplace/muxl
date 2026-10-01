@@ -63,6 +63,11 @@ session and remain stable across GoP boundaries so readers can coalesce them.
 milliseconds to its signed UTC start time. Nil retains the existing signing-time
 stamp. It is independent of text and can be used for AV-only origins as well.
 
+`UnwrapEvents` preserves legacy AV numeric-wrap grouping, including sparse
+leading/trailing AV fragments in flat blobs. Text can precede its AV GoP;
+trailing text without a following AV reference remains readable rather than
+being discarded or rejected.
+
 ### Transcode provenance
 
 `SignTranscode` signs a transcoded output segment so its C2PA manifest names the

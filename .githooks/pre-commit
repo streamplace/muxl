@@ -25,19 +25,12 @@ cd "$(git rev-parse --show-toplevel)"
 # Paths whose changes can alter the wasm output: the library crate (root src/ +
 # its manifest), the CLI crate (crates/muxl/), and the lockfile.
 if ! git diff --cached --name-only \
-     | grep -qE '^(src/|crates/mp4-atom/|crates/muxl/src/|crates/muxl/Cargo\.toml$|Cargo\.toml$|Cargo\.lock$)'; then
+     | grep -qE '^(src/|crates/muxl/src/|crates/muxl/Cargo\.toml$|Cargo\.toml$|Cargo\.lock$)'; then
     exit 0
 fi
 
 echo "pre-commit: Rust sources changed — rebuilding go/muxl.wasm…"
-build_wasm() {
-    if [ -n "${MUXL_BUILD_CONTAINER:-}" ]; then
-        docker exec -w "$PWD" "$MUXL_BUILD_CONTAINER" just build-go-wasm
-    else
-        just build-go-wasm
-    fi
-}
-if ! build_wasm; then
+if ! just build-go-wasm; then
     cat >&2 <<'MSG'
 ✗ pre-commit: failed to rebuild go/muxl.wasm.
   Needs clang + the wasm32-wasip1 target. Options:

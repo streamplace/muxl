@@ -23,8 +23,7 @@ muxl-core = { path = "../.." }
 # `c2pa` key keeps our source writing `use c2pa::…` via cargo's dependency
 # rename.
 c2pa = { package = "s2pa", version = "0.1.0", default-features = false, features = ["rust_native_crypto", "file_io"] }
-# Must be the same vendored crate muxl-core uses (see crates/mp4-atom/VENDORED.md).
-mp4-atom = { path = "../mp4-atom" }
+mp4-atom = { git = "https://github.com/streamplace/mp4-atom.git", rev = "2310bbe4224ecf395b99618e3368964fd4b2d409" }
 clap = { version = "4", features = ["derive"] }
 # ES256K signing is wired through CallbackSigner — c2pa-rs's
 # rust_native_crypto path validates ES256K but doesn't sign with it.

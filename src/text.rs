@@ -160,6 +160,91 @@ pub fn build_track(config: &TextConfig, cues: &[Cue], start: u64, end: u64) -> R
     Ok(out)
 }
 
+/// Span requested by the streaming signer, on the absolute media timeline.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TextRequest {
+    pub start_ms: u64,
+    pub end_ms: u64,
+    pub max_track_id: u32,
+}
+
+#[derive(Debug, Default, Serialize, Deserialize)]
+pub struct TextAttachment {
+    #[serde(default)]
+    pub tracks: Vec<TextTrackAttachment>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TextTrackAttachment {
+    pub track_id: u32,
+    pub language: String,
+    pub label: Option<String>,
+    #[serde(default)]
+    pub cues: Vec<Cue>,
+}
+
+/// Session state: declared tracks remain continuous even if a host call fails.
+#[derive(Default)]
+pub struct StreamingText {
+    tracks: BTreeMap<u32, TextConfig>,
+}
+
+impl StreamingText {
+    pub fn request(catalog: &Catalog, gop: &crate::GopSegment) -> Result<TextRequest> {
+        let reference = catalog.video_configs().min_by_key(|c| c.track_id())
+            .map(|c| (c.track_id(), c.timescale()))
+            .or_else(|| catalog.audio_configs().min_by_key(|c| c.track_id())
+                .map(|c| (c.track_id(), c.timescale())))
+            .ok_or_else(|| invalid("streaming text requires an AV reference track"))?;
+        let start = gop.first_decode_times[&reference.0];
+        Ok(TextRequest {
+            start_ms: crate::segment::ticks_to_ms(start, reference.1),
+            end_ms: crate::segment::ticks_to_ms(start + gop.durations[&reference.0], reference.1),
+            max_track_id: catalog.video_configs().map(|c| c.track_id())
+                .chain(catalog.audio_configs().map(|c| c.track_id()))
+                .chain(catalog.text_configs().map(|c| c.track_id())).max().unwrap_or(0),
+        })
+    }
+
+    pub fn attach(&mut self, gop: &mut crate::GopSegment, req: TextRequest, attachment: TextAttachment) -> Result<()> {
+        let mut cues = BTreeMap::new();
+        for track in attachment.tracks {
+            if track.track_id == 0 || gop.tracks.contains_key(&track.track_id) {
+                return Err(invalid("streaming text track id must be nonzero and unused"));
+            }
+            let config = TextConfig {
+                codec: "wvtt".into(), container: crate::catalog::Container::cmaf(1000, track.track_id),
+                language: if track.language.is_empty() { "und".into() } else { track.language },
+                label: track.label.filter(|s| !s.is_empty()), config: "WEBVTT".into(),
+            };
+            if let Some(previous) = self.tracks.get(&track.track_id) {
+                if previous != &config { return Err(invalid("streaming text track configuration changed")); }
+            } else {
+                self.tracks.insert(track.track_id, config);
+            }
+            if cues.insert(track.track_id, track.cues).is_some() {
+                return Err(invalid("duplicate streaming text track"));
+            }
+        }
+        for (&id, config) in &self.tracks {
+            let mut catalog = Catalog::default();
+            catalog.insert_text(format!("text{id}"), config.clone());
+            let samples = crate::segment::text_span_samples(cues.get(&id).map(Vec::as_slice).unwrap_or(&[]), req.start_ms, req.end_ms)?;
+            let mut progress = TrackProgress::starting_at(req.start_ms);
+            let (data, meta) = crate::segment::mint_text_segment(&catalog, id, &mut progress, &samples)?;
+            gop.body_size += data.len() as u64;
+            gop.durations.insert(id, req.end_ms - req.start_ms);
+            gop.sample_counts.insert(id, samples.len() as u32);
+            gop.first_decode_times.insert(id, req.start_ms);
+            gop.samples.insert(id, meta);
+            gop.tracks.insert(id, data);
+        }
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -222,5 +307,49 @@ mod tests {
         let mut roundtrip=Vec::new();
         crate::segment_fmp4(&mut Cursor::new(&normalized),|g|{roundtrip.push(g);Ok(())}).unwrap();
         assert_eq!(roundtrip,output);
+    }
+    #[test]
+    fn attach_in_stream_is_continuous_and_preserves_av() {
+        let input = std::fs::read("samples/fixtures/h264-opus-frag.mp4").unwrap();
+        let mut gops = Vec::new();
+        let catalog = crate::segment_fmp4(&mut Cursor::new(input), |g| { gops.push(g); Ok(()) }).unwrap();
+        let mut state = StreamingText::default();
+        let first = StreamingText::request(&catalog, &gops[0]).unwrap();
+        let wanted = cue(first.end_ms - 100, first.end_ms + 100, "boundary");
+        let id = first.max_track_id + 1;
+        let mut recovered = Vec::new();
+        for (i, gop) in gops.iter_mut().enumerate() {
+            let req = StreamingText::request(&catalog, gop).unwrap();
+            let av = gop.tracks.clone();
+            let duration = gop.duration_us;
+            let attachment = if i < 2 { TextAttachment { tracks: vec![TextTrackAttachment {
+                track_id: id, language: "en-US".into(), label: Some("ingest".into()), cues: vec![wanted.clone()],
+            }] } } else { TextAttachment::default() };
+            state.attach(gop, req, attachment).unwrap();
+            for (tid, data) in av { assert_eq!(gop.tracks[&tid], data); }
+            assert_eq!(gop.duration_us, duration);
+            assert_eq!(gop.first_decode_times[&id], req.start_ms);
+            assert_eq!(gop.durations[&id], req.end_ms - req.start_ms);
+            assert_eq!(gop.samples[&id].durations.iter().map(|&d| d as u64).sum::<u64>(), req.end_ms - req.start_ms);
+            recovered.extend(cues_from_fragments(&gop.tracks[&id], 1000).unwrap());
+            if i > 1 { assert!(cues_from_fragments(&gop.tracks[&id], 1000).unwrap().is_empty()); }
+        }
+        assert_eq!(merge_cues(recovered), vec![wanted]);
+    }
+
+    #[test]
+    fn empty_attachment_is_byte_identical_before_declaration() {
+        let input = std::fs::read("samples/fixtures/h264-opus-frag.mp4").unwrap();
+        let mut gops = Vec::new();
+        let catalog = crate::segment_fmp4(&mut Cursor::new(input), |g| { gops.push(g); Ok(()) }).unwrap();
+        let mut state = StreamingText::default();
+        for gop in &mut gops {
+            let req = StreamingText::request(&catalog, gop).unwrap();
+            let before = gop.tracks.clone();
+            let body = gop.body_size;
+            state.attach(gop, req, TextAttachment::default()).unwrap();
+            assert_eq!(gop.tracks, before);
+            assert_eq!(gop.body_size, body);
+        }
     }
 }

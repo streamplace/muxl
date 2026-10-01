@@ -182,7 +182,12 @@ type SignerInput struct {
 	TrackManifestFn   func() ([]byte, error)
 	WrapperManifest   []byte
 	WrapperManifestFn func() ([]byte, error)
-	Alg               string
+	// TextFn is called before each GoP is signed and may block to wait for
+	// final captions. Nil preserves the no-text path. Errors are nonfatal:
+	// previously declared tracks receive gap-only segments. Track IDs and
+	// language/label must remain fixed for the session.
+	TextFn func(context.Context, TextRequest) (*TextAttachment, error)
+	Alg    string
 }
 
 // TranscodeInput is the signing bundle for [Engine.SignTranscode]. Exactly one
@@ -303,7 +308,7 @@ type TrackSamples struct {
 type Catalog struct {
 	Video *CatalogVideo `cbor:"video,omitempty"`
 	Audio *CatalogAudio `cbor:"audio,omitempty"`
-	Text *CatalogText `cbor:"text,omitempty"`
+	Text  *CatalogText  `cbor:"text,omitempty"`
 }
 
 // CatalogVideo holds the video renditions, keyed by rendition name.
@@ -323,11 +328,11 @@ type CatalogText struct {
 
 // TextConfig is the WebVTT decoder configuration and player metadata.
 type TextConfig struct {
-	Codec string `cbor:"codec"`
+	Codec     string    `cbor:"codec"`
 	Container Container `cbor:"container"`
-	Language string `cbor:"language"`
-	Label string `cbor:"label,omitempty"`
-	Config string `cbor:"config"`
+	Language  string    `cbor:"language"`
+	Label     string    `cbor:"label,omitempty"`
+	Config    string    `cbor:"config"`
 }
 
 // TrackID returns the configured CMAF track ID, or 0 for legacy.

@@ -173,6 +173,7 @@ func (e *WASMEngine) runWith(
 	manifestFn func(kind uint32) ([]byte, error),
 	initCh, segCh chan<- []byte,
 	eventCh chan<- *Event,
+	textFn ...func(context.Context, TextRequest) (*TextAttachment, error),
 ) error {
 	instanceID := e.counter.Add(1)
 	instanceName := fmt.Sprintf("muxl-%d", instanceID)
@@ -184,6 +185,10 @@ func (e *WASMEngine) runWith(
 	if manifestFn != nil {
 		e.manifestFetchers.Store(instanceName, manifestFn)
 		defer e.manifestFetchers.Delete(instanceName)
+	}
+	if len(textFn) > 0 && textFn[0] != nil {
+		e.textFetchers.Store(instanceName, &textFetcher{fn: textFn[0]})
+		defer e.textFetchers.Delete(instanceName)
 	}
 
 	cfg := wazero.NewModuleConfig().

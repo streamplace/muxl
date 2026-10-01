@@ -247,6 +247,10 @@ unsafe extern "C" {
     /// streaming signer reflects mid-stream manifest updates (e.g. a
     /// livestream-record transition from pre-live to live).
     fn host_get_manifest(kind: u32, out_ptr: u32, out_max: u32) -> u32;
+    /// JSON TextAttachment for this media span. Zero means no new text;
+    /// u32::MAX means failure (continue with empty declared tracks).
+    /// Size probes must return the same cached attachment on retry.
+    fn host_get_text(start_ms: u64, end_ms: u64, max_track_id: u32, out_ptr: u32, out_max: u32) -> u32;
 }
 
 #[cfg(not(target_family = "wasm"))]
@@ -257,6 +261,18 @@ unsafe fn host_sign(_: u32, _: u32, _: u32, _: u32) -> u32 {
 #[cfg(not(target_family = "wasm"))]
 unsafe fn host_get_manifest(_: u32, _: u32, _: u32) -> u32 {
     u32::MAX
+}
+
+#[cfg(not(target_family = "wasm"))]
+unsafe fn host_get_text(_: u64, _: u64, _: u32, _: u32, _: u32) -> u32 { 0 }
+
+fn host_text(req: muxl::text::TextRequest) -> muxl::text::TextAttachment {
+    let n = unsafe { host_get_text(req.start_ms, req.end_ms, req.max_track_id, 0, 0) };
+    if n == 0 || n == u32::MAX || n as usize > HOST_MANIFEST_MAX_LEN { return Default::default(); }
+    let mut buf = vec![0; n as usize];
+    let n = unsafe { host_get_text(req.start_ms, req.end_ms, req.max_track_id, buf.as_mut_ptr() as u32, buf.len() as u32) };
+    if n == u32::MAX || n as usize > buf.len() { return Default::default(); }
+    serde_json::from_slice(&buf[..n as usize]).unwrap_or_default()
 }
 
 /// Pre-allocated buffer for the host's signature. Sized for the largest
@@ -351,7 +367,7 @@ pub fn sign_segment_stream<R: Read, W: Write>(
     let mut fetch_track = move || -> Result<serde_json::Value> { Ok(segment_base.clone()) };
     let wrapper = wrapper_manifest.to_owned();
     let mut fetch_wrapper = move || -> Result<String> { Ok(wrapper.clone()) };
-    sign_segment_stream_with(input, output, signer, &mut fetch_track, &mut fetch_wrapper)
+    sign_segment_stream_with(input, output, signer, &mut fetch_track, &mut fetch_wrapper, None)
 }
 
 /// Stream-sign an fMP4 source like [`sign_segment_stream`], but fetch a fresh
@@ -379,7 +395,7 @@ pub fn sign_segment_stream_host<R: Read, W: Write>(
             Error::C2pa(c2pa::Error::BadParam(format!("host wrapper manifest: {e}")))
         })
     };
-    sign_segment_stream_with(input, output, signer, &mut fetch_track, &mut fetch_wrapper)
+    sign_segment_stream_with(input, output, signer, &mut fetch_track, &mut fetch_wrapper, Some(&mut host_text))
 }
 
 /// Shared streaming-sign loop. `next_track` and `next_wrapper` are invoked
@@ -391,11 +407,14 @@ fn sign_segment_stream_with<R: Read, W: Write>(
     signer: &SignerKey,
     next_track: &mut dyn FnMut() -> Result<serde_json::Value>,
     next_wrapper: &mut dyn FnMut() -> Result<String>,
+    mut text_fn: Option<&mut dyn FnMut(muxl::text::TextRequest) -> muxl::text::TextAttachment>,
 ) -> Result<()> {
     init_default_settings();
     let c2pa_signer = signer.build()?;
     let mut segmenter = Segmenter::new();
     let mut init_seen = false;
+    let mut catalog = muxl::catalog::Catalog::default();
+    let mut text = muxl::text::StreamingText::default();
     let mut buf = [0u8; 64 * 1024];
 
     loop {
@@ -410,6 +429,9 @@ fn sign_segment_stream_with<R: Read, W: Write>(
                 signer,
                 next_track,
                 next_wrapper,
+                &mut catalog,
+                &mut text,
+                &mut text_fn,
                 output,
                 &*c2pa_signer,
             )?;
@@ -422,6 +444,9 @@ fn sign_segment_stream_with<R: Read, W: Write>(
             signer,
             next_track,
             next_wrapper,
+            &mut catalog,
+            &mut text,
+            &mut text_fn,
             output,
             &*c2pa_signer,
         )?;
@@ -511,6 +536,9 @@ fn handle_event<W: Write>(
     _signer: &SignerKey,
     next_track: &mut dyn FnMut() -> Result<serde_json::Value>,
     _next_wrapper: &mut dyn FnMut() -> Result<String>,
+    catalog_state: &mut muxl::catalog::Catalog,
+    text: &mut muxl::text::StreamingText,
+    text_fn: &mut Option<&mut dyn FnMut(muxl::text::TextRequest) -> muxl::text::TextAttachment>,
     output: &mut W,
     c2pa_signer: &dyn C2paSigner,
 ) -> Result<()> {
@@ -518,6 +546,7 @@ fn handle_event<W: Write>(
     match event {
         SegmenterEvent::InitSegment { catalog, data } => {
             *init_seen = true;
+            *catalog_state = catalog.clone();
             // Build an Init event with the catalog + per-track init segments
             // so downstream consumers (Streamplace) have everything they need
             // to derive HLS playback artifacts without re-parsing.
@@ -559,6 +588,10 @@ fn handle_event<W: Write>(
             // bytes and shifts per-sample offsets past the leading c2pa-uuid
             // prefix.
             let segment_base = next_track()?;
+            if let Some(fetch) = text_fn.as_deref_mut() {
+                let req = muxl::text::StreamingText::request(catalog_state, &gop)?;
+                text.attach(&mut gop, req, fetch(req))?;
+            }
             let segment_manifest = stamp_segment_manifest(&segment_base, &now_rfc3339_utc());
             let prefix_size = sign_gop_canonical_segments_in_place(
                 &mut gop,

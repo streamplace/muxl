@@ -1,0 +1,52 @@
+use crate::*;
+
+// https://www.webmproject.org/vp9/mp4/
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct Vp08 {
+    pub visual: Visual,
+    pub vpcc: VpcC,
+    pub btrt: Option<Btrt>,
+    pub colr: Option<Colr>,
+    pub pasp: Option<Pasp>,
+}
+
+impl Atom for Vp08 {
+    const KIND: FourCC = FourCC::new(b"vp08");
+
+    fn decode_body<B: Buf>(buf: &mut B) -> Result<Self> {
+        let visual = Visual::decode(buf)?;
+
+        let mut vpcc = None;
+        let mut btrt = None;
+        let mut colr = None;
+        let mut pasp = None;
+        while let Some(atom) = Any::decode_maybe(buf)? {
+            match atom {
+                Any::VpcC(atom) => vpcc = atom.into(),
+                Any::Btrt(atom) => btrt = atom.into(),
+                Any::Colr(atom) => colr = atom.into(),
+                Any::Pasp(atom) => pasp = atom.into(),
+                unknown => Self::decode_unknown(&unknown)?,
+            }
+        }
+
+        Ok(Self {
+            visual,
+            vpcc: vpcc.ok_or(Error::MissingBox(VpcC::KIND))?,
+            btrt,
+            colr,
+            pasp,
+        })
+    }
+
+    fn encode_body<B: BufMut>(&self, buf: &mut B) -> Result<()> {
+        self.visual.encode(buf)?;
+        self.vpcc.encode(buf)?;
+        self.btrt.encode(buf)?;
+        self.colr.encode(buf)?;
+        self.pasp.encode(buf)?;
+
+        Ok(())
+    }
+}

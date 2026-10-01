@@ -125,3 +125,80 @@ pub struct Sample {
     /// The writer streams these bytes through via `ReadAt::read_at`.
     pub input_offset: u64,
 }
+
+/// Canonicalized text payloads are appended virtually to the input. AV data
+/// remains random-access and is never copied or buffered by this adapter.
+pub(crate) struct TextInput<'a, R: crate::io::ReadAt + ?Sized> {
+    input: &'a R,
+    base: u64,
+    text: Vec<u8>,
+}
+
+impl<R: crate::io::ReadAt + ?Sized> crate::io::ReadAt for TextInput<'_, R> {
+    fn size(&self) -> std::io::Result<u64> { Ok(self.base + self.text.len() as u64) }
+    fn read_at(&self, offset: u64, buf: &mut [u8]) -> std::io::Result<usize> {
+        if offset < self.base { return self.input.read_at(offset, buf); }
+        let pos = (offset-self.base) as usize;
+        if pos >= self.text.len() { return Ok(0); }
+        let count = buf.len().min(self.text.len()-pos);
+        buf[..count].copy_from_slice(&self.text[pos..pos+count]);
+        Ok(count)
+    }
+}
+
+/// Normalize text samples on all source-based minting paths. GoP bounds are
+/// derived from the AV reference and floored to milliseconds.
+pub(crate) fn normalize_text<'a, R: crate::io::ReadAt + ?Sized>(
+    source: &Source, input: &'a R,
+) -> crate::Result<(Source, TextInput<'a,R>)> {
+    use crate::segment::ticks_to_ms;
+    let mut result = source.clone();
+    let mut payloads = TextInput { input, base: input.size()?, text: Vec::new() };
+    let reference = source.plan.tracks.iter().filter(|p| p.is_video).min_by_key(|p|p.track_id)
+        .or_else(|| source.plan.tracks.iter().filter(|p| !source.catalog.text_configs().any(|t| t.track_id()==p.track_id)).min_by_key(|p|p.track_id))
+        .or_else(|| source.plan.tracks.iter().min_by_key(|p|p.track_id));
+    let Some(reference) = reference else { return Ok((result,payloads)); };
+    let mut spans = Vec::new();
+    let mut dt = reference.start_offset_ticks;
+    let mut start = ticks_to_ms(dt,reference.timescale);
+    let mut duration = 0u64;
+    let text_only = source.catalog.text_configs().any(|t|t.track_id()==reference.track_id);
+    for (i,sample) in reference.samples.iter().enumerate() {
+        if i>0 && ((reference.is_video && sample.is_sync) || (!reference.is_video && !text_only && duration >= reference.timescale as u64)) {
+            let end=ticks_to_ms(dt,reference.timescale);
+            if end>start { spans.push((start,end)); }
+            start=end;duration=0;
+        }
+        dt+=sample.duration as u64;duration+=sample.duration as u64;
+    }
+    let end=ticks_to_ms(dt,reference.timescale);
+    if text_only {
+        while start < end { let next=(start+1000).min(end); spans.push((start,next));start=next; }
+    } else if end>start { spans.push((start,end)); }
+    for config in source.catalog.text_configs() {
+        let plan=source.plan.track(config.track_id()).ok_or_else(|| crate::Error::InvalidMp4("text track missing plan".into()))?;
+        let mut cues=Vec::new();
+        let mut dt=plan.start_offset_ticks;
+        let mut bytes=Vec::new();
+        for sample in &plan.samples {
+            bytes.resize(sample.size as usize,0);
+            input.read_exact_at(sample.input_offset,&mut bytes)?;
+            cues.extend(crate::text::cues_from_sample(&bytes,ticks_to_ms(dt,plan.timescale),ticks_to_ms(dt+sample.duration as u64,plan.timescale))?);
+            dt+=sample.duration as u64;
+        }
+        let cues=crate::text::merge_cues(cues);
+        let mut samples=Vec::new();
+        for &(start,end) in &spans {
+            for sample in crate::text::canonical_samples(&cues,start,end)? {
+                samples.push(Sample {duration:sample.duration,size:sample.data.len() as u32,is_sync:true,cts_offset:0,input_offset:payloads.base+payloads.text.len() as u64});
+                payloads.text.extend_from_slice(&sample.data);
+            }
+        }
+        let normalized=result.plan.tracks.iter_mut().find(|p|p.track_id==config.track_id()).unwrap();
+        normalized.timescale=1000;
+        normalized.start_offset_ticks=spans.first().map_or(0,|s|s.0);
+        normalized.samples=samples;
+    }
+    crate::segment::normalize_text_catalog(&mut result.catalog);
+    Ok((result,payloads))
+}

@@ -8,7 +8,7 @@ All choices are provisional and subject to revision after playback testing.
 
 MUXL is a three-layer stack:
 
-- **MUXL fragment** — one encoded sample (video frame or audio packet) in a minimal `moof+mdat` pair. The smallest unit. Bit-identical regardless of how it's transported or stored.
+- **MUXL fragment** — one encoded sample (video frame, audio packet, or timed-text sample) in a minimal `moof+mdat` pair. The smallest unit. Bit-identical regardless of how it's transported or stored.
 - **MUXL canonical segment** — a `uuid` box carrying the per-track catalog as a DRISL payload, followed by one track's fragments for one GoP. The unit of content addressing.
 - **Synthesized storage format** — fMP4 (appendable) or flat MP4 (finalized faststart) wrapping N canonical segments together with a derived ISOBMFF header. The header is synthesized from the segments' embedded catalogs. Canonical segments are recoverable byte-for-byte from any storage format.
 
@@ -22,7 +22,7 @@ One sample, one `moof+mdat` pair.
 
 Each moof covers exactly one sample from one track.
 
-- **mfhd**: `sequence_number` increments by 1 per fragment within a track, starting at `1` for the first fragment of each track. Per-track counters are independent — when multiple tracks share a storage container, the same sequence_number appears once per track at each per-track index (e.g. both track 1's and track 2's first fragment have `sequence_number = 1`), but within a single track the sequence is strictly monotonic with no gaps. This is a *per-track* CMAF monotonicity guarantee rather than the *per-container* guarantee CMAF nominally requires; the per-track relaxation is what keeps fragment bytes a deterministic function of the track's own fragment index, independent of how many other tracks coexist in the container. HLS/MSE players drive timing off `tfdt` rather than sequence numbers, so the per-track scoping is benign in practice.
+- **mfhd**: video and audio `sequence_number` increments by 1 per fragment within a track, starting at `1` for the first fragment of each track. Per-track counters are independent and remain monotonic across GoPs. **Text tracks instead restart at `1` at each GoP**, making freshly attached text reproducible without a prior fragment count. Storage wrappers preserve all sequence numbers verbatim. Playback timing comes from `tfdt`.
 - **traf**: exactly one per moof.
   - **tfhd**: `track_id`; flags = `default_base_is_moof`; no default sample values (all explicit in trun).
   - **tfdt**: `base_media_decode_time` in the track's media timescale, carrying the absolute media time of this sample in the track's stream timeline.
@@ -57,7 +57,7 @@ The leading uuid is _always_ present — never omitted — so segment boundaries
 
 ### uuid Body
 
-The `uuid` box body is a single DRISL-encoded MUXL catalog ([[drisl]]) describing exactly one track — one entry in `video.renditions` _or_ one entry in `audio.renditions`, never both. The catalog is the entire body of the box; no JSON-LD wrapper, no c2pa manifest, no signature claim.
+The `uuid` box body is a single DRISL-encoded MUXL catalog ([[drisl]]) describing exactly one track — one entry in `video.renditions`, `audio.renditions`, _or_ `text.renditions`, never more than one. A catalog with no text track encodes no `text` key at all, so the uuid bytes of video and audio segments are unchanged by text support. The catalog is the entire body of the box; no JSON-LD wrapper, no c2pa manifest, no signature claim.
 
 DRISL canonical CBOR encoding makes the uuid body byte-deterministic: any two MUXL implementations producing a canonical segment for the same track configuration produce byte-identical uuid box bytes.
 
@@ -71,11 +71,13 @@ Segment boundaries are driven by video sync samples (keyframes). A new segment b
 
 For audio-only streams (no video reference), segments are 1-second wall-clock spans.
 
+Timed-text tracks never define a boundary. Each GoP gets one text segment per text track, clipped and padded to exactly the GoP's span (see § Timed Text (WebVTT) → Segmentation).
+
 Given the same samples with the same timestamps, segment boundaries are always identical.
 
 ### Per-Segment Properties
 
-- **`mfhd.sequence_number`**: per-track 1-based, monotonic across the track's fragment stream (see § MUXL Fragment → moof). The first fragment of a canonical segment for track T carries `prior_fragment_count_in_track + 1`; subsequent fragments in the segment increment by 1. Storage-format synthesizers preserve these values verbatim — rewriting would mutate the canonical bytes and break round-trip recovery. A consequence: a canonical segment's bytes are a function of the segment's position in its track, not of the segment in isolation. Fresh-minting "GoP 5 of track 1" with no stream context requires knowing how many fragments came before; recovering it from a storage format gives the original bytes back unchanged.
+- **`mfhd.sequence_number`**: video/audio use per-track 1-based counters monotonic across GoPs; text uses per-GoP 1-based counters. A fresh text segment therefore requires only its configuration, span, and cues, not stream context. Storage-format synthesizers preserve these values verbatim.
 - **`tfdt.base_media_decode_time`**: absolute media time of the segment's first sample in the track's stream timeline. Preserved verbatim across storage-format round-trips.
 
 ### Round-Trip Property
@@ -164,6 +166,80 @@ segment = { "type": "segment", "version": uint,
 
 The metafiles are emitted by `muxl metafile` (one self-contained metafile per segment, streaming — constant memory over a multi-GB blob) or built directly from canonical segment bytes via `muxl::metafile::segment_metafile`.
 
+## Timed Text (WebVTT)
+
+MUXL carries WebVTT as ISO/IEC 14496-30 timed text (sample entry `wvtt`). A text track is a first-class track: it has its own catalog rendition, its own canonical segment per GoP, and its own entry in every storage format, exactly like a video or audio track. WebVTT is the only text format. Muxer-specific subtitle formats (`tx3g`, `stpp`) are skipped on extraction.
+
+### Catalog
+
+Text renditions live in a top-level `text` group, keyed `text{track_id}` like the other groups:
+
+```json
+"text": { "renditions": { "text3": {
+  "codec": "wvtt",
+  "container": { "kind": "cmaf", "timescale": 1000, "trackId": 3 },
+  "language": "en-US",
+  "label": "captions",
+  "config": "WEBVTT"
+} } }
+```
+
+- **codec**: always `"wvtt"`.
+- **container.timescale**: always `1000`. Cue times are millisecond-precise in WebVTT, so a millisecond timescale represents them exactly.
+- **language**: a BCP 47 tag (`und` when unknown).
+- **label**: optional human-readable label. Absent (not empty) when there is none.
+- **config**: the WebVTT file header, which is the `vttC` body. It starts with `WEBVTT`. The minimal value is `"WEBVTT"`. Header blocks such as `STYLE` belong here, not in samples.
+
+The `text` group is a MUXL extension; Hang catalogs have no text group.
+
+### Init
+
+The text `trak` follows the common rules (§ Init Segment moov), with:
+
+- **tkhd**: `volume` 0, `width`/`height` 0, `alternate_group` 0, identity matrix.
+- **mdhd.timescale**: 1000.
+- **mdhd.language**: the ISO 639-2/T code of the tag's primary language subtag. Two-letter subtags map through ISO 639-1 (`en` → `eng`). Three-letter ISO 639-2/B codes are rewritten to their /T form (`ger` → `deu`). Anything else (`x-`/`i-` tags, unknown codes) is `und`.
+- **elng** (ExtendedLanguageBox, ISO/IEC 14496-12 § 8.4.6): carries the full BCP 47 tag, but only when `mdhd.language` alone would not reproduce it on extraction. `en` is written as `mdhd eng` with no `elng`; `en-US` is written as `mdhd eng` plus `elng "en-US"`. `elng` sits between `hdlr` and `minf`.
+- **hdlr**: `handler_type = "text"`, empty name.
+- **minf**: `nmhd` (no `vmhd`/`smhd`), plus the common `dinf`.
+- **stsd**: exactly one `wvtt` sample entry, `data_reference_index = 1`, containing:
+  - `vttC` = the catalog `config` string.
+  - `vlab` = the catalog `label`, only when the label is non-empty.
+  - No `btrt`.
+
+On extraction, the `text`, `subt`, and `sbtl` handlers are all accepted, but only a `wvtt` sample entry yields a rendition. `language` comes from `elng` when it is present and non-empty. Otherwise it comes from `mdhd`, shortened to ISO 639-1 where a two-letter code exists (`eng` → `en`), so ordinary muxer output yields a BCP 47 tag. An empty `vttC` is read as `"WEBVTT"`, and an empty `vlab` as no label.
+
+### Samples
+
+A WebVTT sample covers a time interval and holds the complete set of cues active for the whole interval:
+
+- **One or more active cues**: one `vttc` (VTTCueBox) per cue. Each `vttc` holds, in order, an `iden` (CueIDBox) only when the cue has a non-empty identifier, an `sttg` (CueSettingsBox) only when the cue has non-empty settings, and a `payl` (CuePayloadBox) with the cue text.
+- **No active cue**: a single `vtte` (VTTEmptyCueBox). Every gap in the timeline is an explicit `vtte` sample, so a text track's samples tile its timeline with no holes.
+
+Determinism rules:
+
+- **Canonical cue order.** The `vttc` boxes in a sample are sorted by `(text, id, settings)`, compared as UTF-8 bytes. Source cue order never affects the bytes.
+- **Overlaps split into disjoint samples.** The timeline is cut at every cue start and every cue end. Each resulting interval becomes one sample containing every cue active over it. Overlapping cues therefore never produce overlapping samples: two cues that overlap by 500 ms yield three samples (first cue alone, both cues, second cue alone).
+- **No per-sample timing boxes.** A sample's time is its decode time and duration, so `ctim` (CueTimeBox), `vsid` (CueSourceIDBox), and `vtta` (VTTAdditionalTextBox) are not emitted.
+- **Sync and timing.** Every text sample is a sync sample (`trun` flags `0x02000000`) with zero composition offset. Its duration is the length of its interval. Zero-length intervals are never emitted.
+- **Equivalent intervals.** Adjacent intervals with identical encoded active cue sets coalesce within a GoP. Identical contiguous pieces merge when reading cues; distinct adjacent cues need distinct IDs if their boundary must survive.
+
+### Segmentation
+
+Text tracks follow the GoP structure that the reference track defines. The reference track is the first video track, otherwise the first audio track. A text track is never the reference while any video or audio track exists.
+
+- **Boundary in text ticks.** A GoP that starts at reference decode time `t_ref` (reference timescale `ts_ref`) starts at `floor(t_ref * 1000 / ts_ref)` on the text track. Flooring is part of the canonical form. The flat-MP4 writer assigns text samples to GoPs with the same floored boundary, so a sample that starts exactly on a boundary lands in the GoP it opens rather than being pulled into the previous GoP by microsecond rounding.
+- **Clipping.** A cue that spans a GoP boundary is cut at the boundary. The cue appears, complete and unchanged, in a sample on each side.
+- **Padding.** Each GoP's text segment covers its GoP span exactly, from the GoP's text start to the next GoP's text start. Time with no active cue at the start, middle, or end of the span is filled with `vtte` samples. A text track therefore has a segment in every GoP, even a GoP with no captions, and the text segments of consecutive GoPs tile the stream timeline.
+- **GoP duration.** A text segment never extends a GoP's playable duration (`duration_us`). That duration comes from the GoP's video and audio tracks. It falls back to the text span only for a GoP that has no video or audio track.
+- **Text-only streams.** The smallest-id text track defines 1-second spans anchored at its first sample, with a shorter final span. Input text samples must arrive before the boundary that closes their span; live segmentation cannot retroactively modify an emitted GoP.
+
+### Storage formats and hashing
+
+Text canonical segments are interleaved, unwrapped, and recovered byte-for-byte exactly like video and audio segments (§ Interleaving Order, § Round-Trip Property). In the flat MP4, the text `trak` has populated `stts`/`stsz`/`stsc`/`co64` like any track, with no `stss` (every sample is sync) and no `ctts`. Its `co64` entries point at the `vttc`/`vtte` payloads inside the inner mdats.
+
+A text segment is a canonical segment. Its content address and any signature cover its whole byte range (uuid catalog plus every `moof+mdat`), with the same per-track hashing and signing as video and audio. Dropping, replacing, or verifying a text track never affects the other tracks.
+
 ## Box Rules
 
 ### ftyp
@@ -227,19 +303,20 @@ Sorted by track_id ascending. No udta, meta, or iods.
 - **modification_time**: 0
 - **timescale**: preserved from source track (passthrough)
 - **duration**: 0
-- **language**: `"und"`
+- **language**: `"und"` for video and audio. Timed-text tracks carry their language; see § Timed Text (WebVTT) → Init.
 
 #### hdlr
 
 - **version**: 0
 - **flags**: 0
-- **handler_type**: `"vide"` for video, `"soun"` for audio
+- **handler_type**: `"vide"` for video, `"soun"` for audio, `"text"` for timed text
 - **name**: empty string (name is cosmetic and varies across muxers)
 
 #### minf
 
 - **vmhd**: present for video tracks (default values)
 - **smhd**: present for audio tracks (default values)
+- **nmhd**: present for timed-text tracks (ISO/IEC 14496-30 § 7.3)
 - **dinf**: required, contains dref
   - **dref**: one self-contained `url` entry with empty location string (signals data is in the same file)
 
@@ -263,7 +340,7 @@ Same `mvhd`/`trak`/`tkhd`/`mdhd`/`hdlr`/`minf` rules as the init segment, with:
 - **stsz**: uniform if all samples have equal size; per-sample list otherwise
 - **stsc**: exactly one entry — `first_chunk=1, samples_per_chunk=1, sample_description_index=1`. Each sample is its own chunk, because each is preceded by its own inner moof+mdat header bytes.
 - **co64**: one entry per sample. Entry `i` = absolute file offset of sample i's bytes inside its inner mdat (past the segment's leading `uuid` and the sample's preceding `moof`). Always 64-bit, never `stco`.
-- **stss**: 1-based sync sample indices (video only; omitted for audio and all-sync tracks)
+- **stss**: 1-based sync sample indices (video only; omitted for audio, timed text, and all-sync tracks)
 
 No other `stbl` child boxes (no `stsh`/`stps`/`stdp`/`padb`/`sdtp`).
 

@@ -9,21 +9,30 @@
 use std::io::{Cursor, Read, Seek, SeekFrom};
 
 use mp4_atom::{
-    Atom, Av01, Av1c, Avc1, Avcc, Codec, Decode, Dinf, Dops, Dref, Encode, Esds, Ftyp, Hdlr, Header,
-    Mdhd, Mdia, Minf, Moov, Mp4a, Mvex, Mvhd, Opus, ReadAtom, ReadFrom, Stbl, Stco, Stsc, Stsd,
-    Stsz, StszSamples, Stts, Tkhd, Trak, Trex, Url, Visual, Vmhd, WriteTo,
+    Atom, Av01, Av1c, Avc1, Avcc, Codec, Decode, Dinf, Dops, Dref, Elng, Encode, Esds, Ftyp, Hdlr,
+    Header, Mdhd, Mdia, Minf, Moov, Mp4a, Mvex, Mvhd, Nmhd, Opus, PlainText, ReadAtom, ReadFrom,
+    Stbl, Stco, Stsc, Stsd, Stsz, StszSamples, Stts, Tkhd, Trak, Trex, Url, Visual, Vlab, Vmhd,
+    VttC, WriteTo, Wvtt,
 };
 
-use crate::catalog::{AudioConfig, Catalog, Container, VideoConfig};
+use crate::catalog::{AudioConfig, Catalog, Container, TextConfig, VideoConfig};
 use crate::error::{Error, Result};
 
 // Canonical timescale for mvhd (movie-level, not media-level)
 pub(crate) const MOVIE_TIMESCALE: u32 = 1000;
 
+/// Sample entry code for WebVTT in ISOBMFF (ISO/IEC 14496-30). The only text
+/// codec MUXL carries.
+pub const WVTT_CODEC: &str = "wvtt";
+
+/// Minimal WebVTT file header. Every `vttC` body (and therefore every
+/// `TextConfig::config`) starts with this.
+pub const WEBVTT_HEADER: &str = "WEBVTT";
+
 /// Extract a Catalog from an MP4 file's moov box.
 ///
 /// Reads codec configuration from stsd entries, dimensions from visual/audio
-/// sample entries.
+/// sample entries, and WebVTT headers and languages from text tracks.
 pub fn catalog_from_mp4<RS: Read + Seek>(mut input: RS) -> Result<Catalog> {
     let moov = read_moov(&mut input)?;
     catalog_from_moov(&moov)
@@ -51,7 +60,15 @@ pub fn catalog_from_moov(moov: &Moov) -> Result<Catalog> {
                     catalog.insert_audio(format!("audio{}", track_id), config);
                 }
             }
-            _ => {} // skip subtitle/other tracks for now
+            // 14496-30 specifies `text` for WebVTT, but accept the subtitle
+            // handlers other muxers use. Only a `wvtt` sample entry yields a
+            // rendition. Other text formats (tx3g, stpp) are still skipped.
+            b"text" | b"subt" | b"sbtl" => {
+                if let Some(config) = extract_text_config(trak)? {
+                    catalog.insert_text(format!("text{}", track_id), config);
+                }
+            }
+            _ => {} // skip other tracks
         }
     }
 
@@ -81,6 +98,9 @@ pub fn build_init_segment(catalog: &Catalog) -> Result<Vec<u8>> {
     for config in catalog.audio_configs() {
         track_defs.push(TrackDef::Audio(config));
     }
+    for config in catalog.text_configs() {
+        track_defs.push(TrackDef::Text(config));
+    }
     track_defs.sort_by_key(|t| t.track_id());
 
     let max_track_id = track_defs.iter().map(|t| t.track_id()).max().unwrap_or(0);
@@ -90,6 +110,7 @@ pub fn build_init_segment(catalog: &Catalog) -> Result<Vec<u8>> {
         traks.push(match td {
             TrackDef::Video(c) => build_video_trak(c)?,
             TrackDef::Audio(c) => build_audio_trak(c)?,
+            TrackDef::Text(c) => build_text_trak(c)?,
         });
     }
 
@@ -150,6 +171,12 @@ pub fn build_track_init_segments(catalog: &Catalog) -> Result<std::collections::
         result.insert(config.track_id(), build_init_segment(&single)?);
     }
 
+    for config in catalog.text_configs() {
+        let mut single = Catalog::default();
+        single.insert_text(format!("text{}", config.track_id()), config.clone());
+        result.insert(config.track_id(), build_init_segment(&single)?);
+    }
+
     Ok(result)
 }
 
@@ -158,6 +185,7 @@ pub fn build_track_init_segments(catalog: &Catalog) -> Result<std::collections::
 enum TrackDef<'a> {
     Video(&'a VideoConfig),
     Audio(&'a AudioConfig),
+    Text(&'a TextConfig),
 }
 
 impl TrackDef<'_> {
@@ -165,6 +193,7 @@ impl TrackDef<'_> {
         match self {
             TrackDef::Video(c) => c.track_id(),
             TrackDef::Audio(c) => c.track_id(),
+            TrackDef::Text(c) => c.track_id(),
         }
     }
 }
@@ -356,6 +385,159 @@ fn extract_audio_config(trak: &Trak) -> Result<Option<AudioConfig>> {
     Ok(None)
 }
 
+/// Extract text (WebVTT) track config from a trak.
+///
+/// `language` prefers the `elng` BCP 47 tag. Without one, it falls back to
+/// the `mdhd` ISO-639 code, shortened to its ISO 639-1 form where one exists
+/// (`eng` → `en`), so ordinary muxer output yields a BCP 47 tag. An empty
+/// `vlab` is treated as absent, and an empty `vttC` as the minimal header.
+fn extract_text_config(trak: &Trak) -> Result<Option<TextConfig>> {
+    let track_id = trak.tkhd.track_id;
+    let timescale = trak.mdia.mdhd.timescale;
+    let container = Container::cmaf(timescale, track_id);
+
+    for codec in &trak.mdia.minf.stbl.stsd.codecs {
+        if let Codec::Wvtt(wvtt) = codec {
+            let config = if wvtt.config.config.is_empty() {
+                WEBVTT_HEADER.to_string()
+            } else {
+                wvtt.config.config.clone()
+            };
+            let label = wvtt
+                .label
+                .as_ref()
+                .map(|l| l.source_label.clone())
+                .filter(|l| !l.is_empty());
+            return Ok(Some(TextConfig {
+                codec: WVTT_CODEC.into(),
+                container,
+                language: text_language_from_mdia(&trak.mdia),
+                label,
+                config,
+            }));
+        }
+    }
+    Ok(None)
+}
+
+/// Recover a text track's BCP 47 language tag from `elng` (preferred) or
+/// `mdhd`.
+fn text_language_from_mdia(mdia: &Mdia) -> String {
+    if let Some(elng) = &mdia.elng {
+        let tag = elng.extended_language.trim();
+        if !tag.is_empty() {
+            return tag.to_string();
+        }
+    }
+    language_from_mdhd(&mdia.mdhd.language)
+}
+
+/// Normalize a catalog language tag: trim it, and map empty to `und`.
+fn canonical_text_language(tag: &str) -> &str {
+    let tag = tag.trim();
+    if tag.is_empty() { "und" } else { tag }
+}
+
+/// The canonical `mdhd` language for a BCP 47 tag: the ISO-639-2/T code of its
+/// primary language subtag. Two-letter subtags map through ISO 639-1. A
+/// three-letter subtag is used as-is, except that ISO-639-2/B codes are
+/// rewritten to their /T form. Anything else (`i-`/`x-` tags, or an unknown
+/// two-letter code) maps to `und`.
+fn mdhd_language_for(tag: &str) -> String {
+    let primary = tag
+        .split(['-', '_'])
+        .next()
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    if !primary.bytes().all(|b| b.is_ascii_lowercase()) {
+        return "und".into();
+    }
+    match primary.len() {
+        2 => iso639_1_to_2t(&primary).unwrap_or("und").into(),
+        3 => match iso639_2b_to_1(&primary).and_then(iso639_1_to_2t) {
+            Some(t) => t.into(),
+            None => primary,
+        },
+        _ => "und".into(),
+    }
+}
+
+/// Inverse of [`mdhd_language_for`] for a bare `mdhd` code. Codes with an
+/// ISO 639-1 equivalent are shortened (`eng` → `en`, including /B codes such as
+/// `ger` → `de`). Other well-formed codes are kept, and malformed ones (such as
+/// the all-zero code) become `und`.
+fn language_from_mdhd(code: &str) -> String {
+    if code.len() != 3 || !code.bytes().all(|b| b.is_ascii_lowercase()) {
+        return "und".into();
+    }
+    ISO639_1_TO_2T
+        .iter()
+        .find(|(_, t)| *t == code)
+        .map(|(one, _)| *one)
+        .or_else(|| iso639_2b_to_1(code))
+        .map(str::to_string)
+        .unwrap_or_else(|| code.to_string())
+}
+
+fn iso639_1_to_2t(code: &str) -> Option<&'static str> {
+    ISO639_1_TO_2T
+        .iter()
+        .find(|(one, _)| *one == code)
+        .map(|(_, t)| *t)
+}
+
+fn iso639_2b_to_1(code: &str) -> Option<&'static str> {
+    ISO639_2B_TO_1
+        .iter()
+        .find(|(b, _)| *b == code)
+        .map(|(_, one)| *one)
+}
+
+/// ISO 639-1 → ISO 639-2/T (the form `mdhd` specifies).
+#[rustfmt::skip]
+const ISO639_1_TO_2T: &[(&str, &str)] = &[
+    ("aa", "aar"), ("ab", "abk"), ("ae", "ave"), ("af", "afr"), ("ak", "aka"), ("am", "amh"),
+    ("an", "arg"), ("ar", "ara"), ("as", "asm"), ("av", "ava"), ("ay", "aym"), ("az", "aze"),
+    ("ba", "bak"), ("be", "bel"), ("bg", "bul"), ("bi", "bis"), ("bm", "bam"), ("bn", "ben"),
+    ("bo", "bod"), ("br", "bre"), ("bs", "bos"), ("ca", "cat"), ("ce", "che"), ("ch", "cha"),
+    ("co", "cos"), ("cr", "cre"), ("cs", "ces"), ("cu", "chu"), ("cv", "chv"), ("cy", "cym"),
+    ("da", "dan"), ("de", "deu"), ("dv", "div"), ("dz", "dzo"), ("ee", "ewe"), ("el", "ell"),
+    ("en", "eng"), ("eo", "epo"), ("es", "spa"), ("et", "est"), ("eu", "eus"), ("fa", "fas"),
+    ("ff", "ful"), ("fi", "fin"), ("fj", "fij"), ("fo", "fao"), ("fr", "fra"), ("fy", "fry"),
+    ("ga", "gle"), ("gd", "gla"), ("gl", "glg"), ("gn", "grn"), ("gu", "guj"), ("gv", "glv"),
+    ("ha", "hau"), ("he", "heb"), ("hi", "hin"), ("ho", "hmo"), ("hr", "hrv"), ("ht", "hat"),
+    ("hu", "hun"), ("hy", "hye"), ("hz", "her"), ("ia", "ina"), ("id", "ind"), ("ie", "ile"),
+    ("ig", "ibo"), ("ii", "iii"), ("ik", "ipk"), ("io", "ido"), ("is", "isl"), ("it", "ita"),
+    ("iu", "iku"), ("ja", "jpn"), ("jv", "jav"), ("ka", "kat"), ("kg", "kon"), ("ki", "kik"),
+    ("kj", "kua"), ("kk", "kaz"), ("kl", "kal"), ("km", "khm"), ("kn", "kan"), ("ko", "kor"),
+    ("kr", "kau"), ("ks", "kas"), ("ku", "kur"), ("kv", "kom"), ("kw", "cor"), ("ky", "kir"),
+    ("la", "lat"), ("lb", "ltz"), ("lg", "lug"), ("li", "lim"), ("ln", "lin"), ("lo", "lao"),
+    ("lt", "lit"), ("lu", "lub"), ("lv", "lav"), ("mg", "mlg"), ("mh", "mah"), ("mi", "mri"),
+    ("mk", "mkd"), ("ml", "mal"), ("mn", "mon"), ("mr", "mar"), ("ms", "msa"), ("mt", "mlt"),
+    ("my", "mya"), ("na", "nau"), ("nb", "nob"), ("nd", "nde"), ("ne", "nep"), ("ng", "ndo"),
+    ("nl", "nld"), ("nn", "nno"), ("no", "nor"), ("nr", "nbl"), ("nv", "nav"), ("ny", "nya"),
+    ("oc", "oci"), ("oj", "oji"), ("om", "orm"), ("or", "ori"), ("os", "oss"), ("pa", "pan"),
+    ("pi", "pli"), ("pl", "pol"), ("ps", "pus"), ("pt", "por"), ("qu", "que"), ("rm", "roh"),
+    ("rn", "run"), ("ro", "ron"), ("ru", "rus"), ("rw", "kin"), ("sa", "san"), ("sc", "srd"),
+    ("sd", "snd"), ("se", "sme"), ("sg", "sag"), ("si", "sin"), ("sk", "slk"), ("sl", "slv"),
+    ("sm", "smo"), ("sn", "sna"), ("so", "som"), ("sq", "sqi"), ("sr", "srp"), ("ss", "ssw"),
+    ("st", "sot"), ("su", "sun"), ("sv", "swe"), ("sw", "swa"), ("ta", "tam"), ("te", "tel"),
+    ("tg", "tgk"), ("th", "tha"), ("ti", "tir"), ("tk", "tuk"), ("tl", "tgl"), ("tn", "tsn"),
+    ("to", "ton"), ("tr", "tur"), ("ts", "tso"), ("tt", "tat"), ("tw", "twi"), ("ty", "tah"),
+    ("ug", "uig"), ("uk", "ukr"), ("ur", "urd"), ("uz", "uzb"), ("ve", "ven"), ("vi", "vie"),
+    ("vo", "vol"), ("wa", "wln"), ("wo", "wol"), ("xh", "xho"), ("yi", "yid"), ("yo", "yor"),
+    ("za", "zha"), ("zh", "zho"), ("zu", "zul"),
+];
+
+/// ISO-639-2/B codes that differ from /T. Some muxers write these into `mdhd`.
+#[rustfmt::skip]
+const ISO639_2B_TO_1: &[(&str, &str)] = &[
+    ("alb", "sq"), ("arm", "hy"), ("baq", "eu"), ("bur", "my"), ("chi", "zh"), ("cze", "cs"),
+    ("dut", "nl"), ("fre", "fr"), ("geo", "ka"), ("ger", "de"), ("gre", "el"), ("ice", "is"),
+    ("mac", "mk"), ("mao", "mi"), ("may", "ms"), ("per", "fa"), ("rum", "ro"), ("slo", "sk"),
+    ("tib", "bo"), ("wel", "cy"),
+];
+
 /// Encode an atom to bytes (including box header).
 fn encode_atom<A: Atom + Encode>(atom: &A) -> Result<Vec<u8>> {
     let mut buf = Vec::new();
@@ -472,6 +654,7 @@ pub(crate) fn build_video_trak(config: &VideoConfig) -> Result<Trak> {
                 handler: b"vide".into(),
                 name: String::new(),
             },
+            elng: None,
             minf: Minf {
                 vmhd: Some(Vmhd::default()),
                 smhd: None,
@@ -551,10 +734,109 @@ pub(crate) fn build_audio_trak(config: &AudioConfig) -> Result<Trak> {
                 handler: b"soun".into(),
                 name: String::new(),
             },
+            elng: None,
             minf: Minf {
                 vmhd: None,
                 smhd: Some(Default::default()),
                 nmhd: None,
+                sthd: None,
+                hmhd: None,
+                dinf: canonical_dinf(),
+                stbl: empty_stbl(Stsd {
+                    codecs: vec![codec],
+                }),
+            },
+        },
+        senc: None,
+        tref: None,
+        udta: None,
+    })
+}
+
+/// Build a canonical text (WebVTT) trak box from config.
+///
+/// Canonical form (ISO/IEC 14496-30):
+/// - `hdlr` is `text` with an empty name, and `minf` carries `nmhd`.
+/// - `stsd` holds one `wvtt` sample entry (`data_reference_index` 1). It
+///   contains `vttC` = `config`, a `vlab` only when `label` is non-empty, and
+///   no `btrt`.
+/// - `mdhd.language` is the ISO-639-2/T code from [`mdhd_language_for`]. `elng`
+///   holds the full BCP 47 tag, but only when `mdhd` alone would not reproduce
+///   it on extraction. Plain `en` is written as `mdhd eng` with no `elng`;
+///   `en-US` is written as `mdhd eng` plus `elng en-US`.
+/// - `tkhd` uses volume 0, zero width and height, and no alternate group.
+pub(crate) fn build_text_trak(config: &TextConfig) -> Result<Trak> {
+    if config.codec != WVTT_CODEC {
+        return Err(Error::InvalidMp4(format!(
+            "unsupported text codec: {}",
+            config.codec
+        )));
+    }
+    if !config.config.starts_with(WEBVTT_HEADER) {
+        return Err(Error::InvalidMp4(format!(
+            "text track {}: wvtt config must start with \"{WEBVTT_HEADER}\"",
+            config.track_id()
+        )));
+    }
+
+    let language = canonical_text_language(&config.language);
+    let mdhd_language = mdhd_language_for(language);
+    let elng = (language_from_mdhd(&mdhd_language) != language).then(|| Elng {
+        extended_language: language.to_string(),
+    });
+
+    let codec = Codec::Wvtt(Wvtt {
+        plaintext: PlainText {
+            data_reference_index: 1,
+        },
+        config: VttC {
+            config: config.config.clone(),
+        },
+        label: config
+            .label
+            .as_ref()
+            .filter(|l| !l.is_empty())
+            .map(|l| Vlab {
+                source_label: l.clone(),
+            }),
+        btrt: None,
+    });
+
+    Ok(Trak {
+        tkhd: Tkhd {
+            creation_time: 0,
+            modification_time: 0,
+            track_id: config.track_id(),
+            duration: 0,
+            layer: 0,
+            alternate_group: 0,
+            enabled: true,
+            in_movie: true,
+            in_preview: false,
+            volume: 0u8.into(),
+            matrix: Default::default(),
+            width: 0u16.into(),
+            height: 0u16.into(),
+        },
+        edts: None,
+        meta: None,
+        mdia: Mdia {
+            mdhd: Mdhd {
+                creation_time: 0,
+                modification_time: 0,
+                timescale: config.timescale(),
+                duration: 0,
+                language: mdhd_language,
+            },
+            hdlr: Hdlr {
+                handler: b"text".into(),
+                name: String::new(),
+            },
+            elng,
+            minf: Minf {
+                vmhd: None,
+                smhd: None,
+                nmhd: Some(Nmhd::default()),
                 sthd: None,
                 hmhd: None,
                 dinf: canonical_dinf(),
@@ -823,6 +1105,222 @@ mod tests {
             moov.trak.len(),
             catalog.video_configs().count() + catalog.audio_configs().count()
         );
+    }
+
+    fn text_config(track_id: u32, language: &str, label: Option<&str>) -> TextConfig {
+        TextConfig {
+            codec: WVTT_CODEC.into(),
+            container: Container::cmaf(1000, track_id),
+            language: language.into(),
+            label: label.map(Into::into),
+            config: "WEBVTT\n\nSTYLE\n::cue { color: white }\n".into(),
+        }
+    }
+
+    fn text_trak(moov: &Moov) -> &Trak {
+        moov.trak
+            .iter()
+            .find(|t| t.mdia.hdlr.handler.as_ref() == b"text")
+            .expect("text trak")
+    }
+
+    fn find_tag(haystack: &[u8], tag: &[u8; 4]) -> Option<usize> {
+        haystack.windows(4).position(|w| w == tag)
+    }
+
+    #[test]
+    fn test_text_init_canonical_boxes() {
+        let mut catalog = Catalog::default();
+        catalog.insert_text("text1", text_config(1, "en-US", Some("captions")));
+        let init = build_init_segment(&catalog).unwrap();
+        let moov = read_moov(&mut Cursor::new(&init)).unwrap();
+
+        assert_eq!(moov.trak.len(), 1);
+        assert_eq!(moov.mvhd.next_track_id, 2);
+        assert_eq!(moov.mvex.as_ref().unwrap().trex[0].track_id, 1);
+
+        let trak = text_trak(&moov);
+        assert_eq!(trak.tkhd.track_id, 1);
+        assert!(trak.edts.is_none());
+        assert_eq!(trak.mdia.mdhd.timescale, 1000);
+        assert_eq!(trak.mdia.mdhd.language, "eng");
+        assert_eq!(
+            trak.mdia.elng.as_ref().map(|e| e.extended_language.as_str()),
+            Some("en-US")
+        );
+        assert!(trak.mdia.hdlr.name.is_empty());
+        let minf = &trak.mdia.minf;
+        assert!(minf.nmhd.is_some());
+        assert!(minf.vmhd.is_none() && minf.smhd.is_none() && minf.sthd.is_none());
+
+        let codecs = &minf.stbl.stsd.codecs;
+        assert_eq!(codecs.len(), 1);
+        let Codec::Wvtt(wvtt) = &codecs[0] else {
+            panic!("expected wvtt sample entry, got {:?}", codecs[0]);
+        };
+        assert_eq!(wvtt.plaintext.data_reference_index, 1);
+        assert_eq!(wvtt.config.config, "WEBVTT\n\nSTYLE\n::cue { color: white }\n");
+        assert_eq!(
+            wvtt.label.as_ref().map(|l| l.source_label.as_str()),
+            Some("captions")
+        );
+        assert!(wvtt.btrt.is_none());
+
+        // elng sits in its 14496-12 Table 1 slot: after hdlr, before minf.
+        let hdlr = find_tag(&init, b"hdlr").unwrap();
+        let elng = find_tag(&init, b"elng").unwrap();
+        let minf = find_tag(&init, b"minf").unwrap();
+        assert!(hdlr < elng && elng < minf, "hdlr={hdlr} elng={elng} minf={minf}");
+    }
+
+    #[test]
+    fn test_text_init_round_trip_and_idempotent() {
+        let mut catalog = Catalog::default();
+        catalog.insert_text("text1", text_config(1, "en-US", Some("captions")));
+        catalog.insert_text("text2", text_config(2, "es", None));
+
+        let init1 = build_init_segment(&catalog).unwrap();
+        let catalog2 = catalog_from_mp4(Cursor::new(&init1)).unwrap();
+        assert_eq!(catalog2, catalog, "text catalog must round-trip exactly");
+        let init2 = build_init_segment(&catalog2).unwrap();
+        assert_eq!(init1, init2, "text init segment should be idempotent");
+    }
+
+    #[test]
+    fn test_text_language_mapping() {
+        // (catalog language, mdhd code, elng, language extracted back)
+        let cases: &[(&str, &str, Option<&str>, &str)] = &[
+            ("en", "eng", None, "en"),
+            ("en-US", "eng", Some("en-US"), "en-US"),
+            ("de", "deu", None, "de"),
+            ("fr-CA", "fra", Some("fr-CA"), "fr-CA"),
+            ("zh-Hant", "zho", Some("zh-Hant"), "zh-Hant"),
+            ("pt-BR", "por", Some("pt-BR"), "pt-BR"),
+            // Three-letter primary subtags pass through to mdhd.
+            ("yue", "yue", None, "yue"),
+            ("yue-HK", "yue", Some("yue-HK"), "yue-HK"),
+            // Non-shortest forms keep elng so the exact tag survives.
+            ("eng", "eng", Some("eng"), "eng"),
+            ("ger", "deu", Some("ger"), "ger"),
+            ("EN", "eng", Some("EN"), "EN"),
+            ("und", "und", None, "und"),
+            ("", "und", None, "und"),
+            ("  ", "und", None, "und"),
+            ("x-klingon", "und", Some("x-klingon"), "x-klingon"),
+            ("qq", "und", Some("qq"), "qq"),
+        ];
+        for &(lang, mdhd, elng, back) in cases {
+            let trak = build_text_trak(&text_config(1, lang, None)).unwrap();
+            assert_eq!(trak.mdia.mdhd.language, mdhd, "{lang:?}: mdhd");
+            assert_eq!(
+                trak.mdia.elng.as_ref().map(|e| e.extended_language.as_str()),
+                elng,
+                "{lang:?}: elng"
+            );
+            // Through bytes, so mdhd's packed 5-bit encoding is exercised.
+            let mut catalog = Catalog::default();
+            catalog.insert_text("text1", text_config(1, lang, None));
+            let init = build_init_segment(&catalog).unwrap();
+            let got = catalog_from_mp4(Cursor::new(&init)).unwrap();
+            let got_lang = &got.text_configs().next().unwrap().language;
+            assert_eq!(got_lang, back, "{lang:?}: extracted language");
+            // Normalization is a fixed point.
+            assert_eq!(build_init_segment(&got).unwrap(), init, "{lang:?}: not idempotent");
+        }
+    }
+
+    #[test]
+    fn test_text_extraction_tolerates_muxer_variants() {
+        let mut catalog = Catalog::default();
+        catalog.insert_text("text3", text_config(3, "fr", Some("src")));
+        let init = build_init_segment(&catalog).unwrap();
+        let mut moov = read_moov(&mut Cursor::new(&init)).unwrap();
+        {
+            let trak = &mut moov.trak[0];
+            // Subtitle handler, ISO-639-2/B mdhd code, empty vlab and vttC.
+            trak.mdia.hdlr.handler = b"subt".into();
+            trak.mdia.mdhd.language = "fre".into();
+            trak.mdia.elng = None;
+            let Codec::Wvtt(wvtt) = &mut trak.mdia.minf.stbl.stsd.codecs[0] else {
+                panic!("expected wvtt");
+            };
+            wvtt.label = Some(Vlab {
+                source_label: String::new(),
+            });
+            wvtt.config.config = String::new();
+        }
+        let got = catalog_from_moov(&moov).unwrap();
+        let t = &got.text.as_ref().unwrap().renditions["text3"];
+        assert_eq!(t.language, "fr");
+        assert_eq!(t.label, None);
+        assert_eq!(t.config, WEBVTT_HEADER);
+        assert_eq!(t.track_id(), 3);
+        assert_eq!(t.timescale(), 1000);
+
+        // An unparseable (all-zero) mdhd code yields und.
+        moov.trak[0].mdia.mdhd.language = "```".into();
+        let got = catalog_from_moov(&moov).unwrap();
+        assert_eq!(got.text_configs().next().unwrap().language, "und");
+
+        // A text-handler trak without a wvtt entry is skipped, as before.
+        moov.trak[0].mdia.minf.stbl.stsd.codecs.clear();
+        let got = catalog_from_moov(&moov).unwrap();
+        assert!(got.text.is_none());
+    }
+
+    #[test]
+    fn test_text_build_rejects_invalid_config() {
+        let mut bad_codec = text_config(1, "en", None);
+        bad_codec.codec = "stpp".into();
+        assert!(build_text_trak(&bad_codec).is_err());
+
+        let mut bad_header = text_config(1, "en", None);
+        bad_header.config = "NOT VTT".into();
+        assert!(build_text_trak(&bad_header).is_err());
+
+        let mut minimal = text_config(1, "en", None);
+        minimal.config = WEBVTT_HEADER.into();
+        assert!(build_text_trak(&minimal).is_ok());
+    }
+
+    #[test]
+    fn test_av_with_text_keeps_av_traks_identical() {
+        let data = read_fixture("h264-aac.mp4");
+        let av = catalog_from_mp4(Cursor::new(data)).unwrap();
+        let av_init = build_init_segment(&av).unwrap();
+        // AV-only init bytes carry no text-only boxes.
+        for tag in [b"elng", b"wvtt", b"vttC", b"nmhd"] {
+            assert!(find_tag(&av_init, tag).is_none(), "AV init has {tag:?}");
+        }
+
+        let next_id = av.video_configs().map(|c| c.track_id())
+            .chain(av.audio_configs().map(|c| c.track_id()))
+            .max()
+            .unwrap()
+            + 1;
+        let mut mixed = av.clone();
+        mixed.insert_text(format!("text{next_id}"), text_config(next_id, "en", None));
+        let mixed_init = build_init_segment(&mixed).unwrap();
+
+        let av_moov = read_moov(&mut Cursor::new(&av_init)).unwrap();
+        let mixed_moov = read_moov(&mut Cursor::new(&mixed_init)).unwrap();
+        assert_eq!(mixed_moov.trak.len(), av_moov.trak.len() + 1);
+        assert_eq!(&mixed_moov.trak[..av_moov.trak.len()], &av_moov.trak[..]);
+        assert_eq!(mixed_moov.mvhd.next_track_id, next_id + 1);
+        assert_eq!(
+            mixed_moov.mvex.as_ref().unwrap().trex.last().unwrap().track_id,
+            next_id
+        );
+
+        let extracted = catalog_from_mp4(Cursor::new(&mixed_init)).unwrap();
+        assert_eq!(extracted.text, mixed.text);
+        assert_eq!(extracted.video_configs().count(), 1);
+        assert_eq!(extracted.audio_configs().count(), 1);
+
+        let per_track = build_track_init_segments(&mixed).unwrap();
+        assert_eq!(per_track.len(), av_moov.trak.len() + 1);
+        let text_only = catalog_from_mp4(Cursor::new(&per_track[&next_id])).unwrap();
+        assert_eq!(text_only, mixed.filter_to_track(next_id));
     }
 
     #[test]

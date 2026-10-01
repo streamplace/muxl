@@ -85,6 +85,8 @@ struct SegmentReport {
     video: Vec<VideoReport>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     audio: Vec<AudioReport>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    text: Vec<TextReport>,
     signing: SigningReport,
     /// Full embedded C2PA manifest store (only with `--manifests`, and only
     /// when the segment carries one).
@@ -122,6 +124,20 @@ struct AudioReport {
     bitrate: Option<u64>,
     timescale: u32,
     description_bytes: usize,
+}
+
+#[derive(Serialize)]
+struct TextReport {
+    codec: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    friendly: Option<&'static str>,
+    /// BCP 47 language tag.
+    language: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    label: Option<String>,
+    timescale: u32,
+    /// Size of the WebVTT header carried in `vttC`.
+    config_bytes: usize,
 }
 
 #[derive(Serialize, Default)]
@@ -172,6 +188,7 @@ fn build_report(bytes: &[u8], path: &Path, opts: InspectOptions) -> Result<Repor
             bytes: seg.data.len(),
             video: seg.catalog.video_configs().map(video_report).collect(),
             audio: seg.catalog.audio_configs().map(audio_report).collect(),
+            text: seg.catalog.text_configs().map(text_report).collect(),
             signing,
             manifests,
         });
@@ -208,6 +225,17 @@ fn audio_report(a: &muxl::catalog::AudioConfig) -> AudioReport {
         bitrate: a.bitrate,
         timescale: a.timescale(),
         description_bytes: a.description.len(),
+    }
+}
+
+fn text_report(t: &muxl::catalog::TextConfig) -> TextReport {
+    TextReport {
+        codec: t.codec.clone(),
+        friendly: friendly_codec(&t.codec),
+        language: t.language.clone(),
+        label: t.label.clone(),
+        timescale: t.timescale(),
+        config_bytes: t.config.len(),
     }
 }
 
@@ -313,6 +341,9 @@ fn render_human<W: Write>(report: &Report, out: &mut W, s: &Style) -> Result<()>
         for a in &seg.audio {
             render_audio(out, s, a)?;
         }
+        for t in &seg.text {
+            render_text(out, s, t)?;
+        }
         render_signing(out, s, &seg.signing)?;
         if let Some(manifests) = &seg.manifests {
             render_manifests(out, s, manifests)?;
@@ -377,6 +408,34 @@ fn render_audio<W: Write>(out: &mut W, s: &Style, a: &AudioReport) -> Result<()>
         s.label("cmaf:  "),
         a.timescale,
         a.description_bytes,
+    )?;
+    Ok(())
+}
+
+fn render_text<W: Write>(out: &mut W, s: &Style, t: &TextReport) -> Result<()> {
+    writeln!(
+        out,
+        "  {} {} {}",
+        s.label("text:"),
+        s.bold(&t.codec),
+        s.dim(t.friendly.map(|f| format!("({f})")).unwrap_or_default()),
+    )?;
+    writeln!(
+        out,
+        "  {} {}{}",
+        s.label("lang:  "),
+        t.language,
+        t.label
+            .as_deref()
+            .map(|l| format!(" \"{l}\""))
+            .unwrap_or_default(),
+    )?;
+    writeln!(
+        out,
+        "  {} timescale {}, {} header bytes",
+        s.label("cmaf:  "),
+        t.timescale,
+        t.config_bytes,
     )?;
     Ok(())
 }
@@ -487,6 +546,8 @@ fn friendly_codec(codec: &str) -> Option<&'static str> {
         Some("Opus")
     } else if lower == "flac" {
         Some("FLAC")
+    } else if lower == "wvtt" {
+        Some("WebVTT")
     } else {
         None
     }
@@ -620,5 +681,47 @@ impl Style {
     /// to keep call sites readable.
     fn label(&self, s: impl Display) -> String {
         self.dim(s)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::sign::test_segments;
+
+    #[test]
+    fn report_describes_text_segments() {
+        init_default_settings();
+        let (av, gop) = test_segments::first_gop("samples/fixtures/h264-opus-frag.mp4");
+        let tid = gop.tracks.keys().max().unwrap() + 1;
+        let catalog = test_segments::with_text(&av, tid);
+        let mut bytes: Vec<u8> = gop.tracks.values().flatten().copied().collect();
+        bytes.extend(test_segments::text_segment(&catalog, tid, "hello"));
+
+        let report = build_report(&bytes, Path::new("t.m4s"), InspectOptions::default()).unwrap();
+        let text_seg = report.segments.last().unwrap();
+        assert_eq!(text_seg.track_id, tid);
+        assert!(text_seg.video.is_empty() && text_seg.audio.is_empty());
+        let t = &text_seg.text[0];
+        assert_eq!(t.codec, "wvtt");
+        assert_eq!(t.friendly, Some("WebVTT"));
+        assert_eq!(t.language, "en");
+        assert_eq!(t.label.as_deref(), Some("captions"));
+        assert_eq!(t.timescale, 1000);
+        assert_eq!(t.config_bytes, "WEBVTT".len());
+        assert_eq!(text_seg.signing.state, "unsigned");
+
+        // JSON: text segments carry a `text` array; AV segments don't.
+        let json = serde_json::to_value(&report).unwrap();
+        let segs = json["segments"].as_array().unwrap();
+        assert_eq!(segs.last().unwrap()["text"][0]["language"], "en");
+        assert!(segs[0].get("text").is_none());
+
+        // Human form.
+        let mut out = Vec::new();
+        render_human(&report, &mut out, &Style { color: false }).unwrap();
+        let out = String::from_utf8(out).unwrap();
+        assert!(out.contains("text: wvtt (WebVTT)"), "got: {out}");
+        assert!(out.contains("lang:   en \"captions\""), "got: {out}");
     }
 }

@@ -4,7 +4,7 @@ This document describes the relationship between MUXL's format representations a
 
 ## Core Principle
 
-Deterministic canonicalization decouples transport, storage, and signing. The same source frames can exist in multiple container formats, all derivable from each other, because the canonicalization rules are fully deterministic. Content bytes (encoded video/audio samples) never change — only the container structure around them.
+Deterministic canonicalization decouples transport, storage, and signing. The same source frames can exist in multiple container formats, all derivable from each other, because the canonicalization rules are fully deterministic. Content bytes (encoded video/audio samples and WebVTT cue samples) never change — only the container structure around them.
 
 ## Format Representations
 
@@ -41,7 +41,7 @@ Key properties:
 - **Init data is out-of-band**: track initialization metadata (codec config, timescales) is not part of the segment; it comes from the MUXL fMP4 file header or an external source (e.g., S2PA manifest)
 - **Deterministic**: given the same source frames, any MUXL implementation produces identical segment bytes
 
-Segmentation rule: segment boundaries are driven by video sync samples (keyframes). Audio samples are grouped with the video GoP they temporally overlap. This rule is deterministic — given the same samples with the same timestamps, the segment boundaries are always identical.
+Segmentation rule: segment boundaries are driven by video sync samples (keyframes). Audio samples are grouped with the video GoP they temporally overlap. Timed-text (WebVTT) tracks never drive a boundary: each GoP gets one text segment per text track, with cues clipped at the GoP edges and gaps padded with empty-cue samples, so the segment covers the GoP exactly (`canonical-form.md § Timed Text (WebVTT)`). This rule is deterministic — given the same samples with the same timestamps, the segment boundaries are always identical.
 
 ### MUXL fMP4 — Storage Format
 
@@ -111,13 +111,16 @@ GoP 1:
   segment (track 1, video): bytes → hash_v1
   segment (track 2, audio): bytes → hash_a1
   segment (track 3, audio): bytes → hash_a2
+  segment (track 4, text):  bytes → hash_t1
 ```
+
+Text segments are hashed and signed exactly like video and audio segments: same canonical-segment boundary, same manifest, same per-track independence. Captions can be verified, dropped, or replaced without touching the media tracks.
 
 This supports:
 
 - **Subset verification**: verify only the video track without touching audio
 - **Track independence**: drop or replace a track without invalidating the others
-- **Multi-track streams**: multiple synced video and audio tracks
+- **Multi-track streams**: multiple synced video, audio, and timed-text tracks
 
 ## Dynamic Stream Changes
 

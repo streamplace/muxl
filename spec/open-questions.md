@@ -101,6 +101,15 @@ Options:
 
 Not urgent — current use case is always video+audio — but worth defining before audio-only ingest is supported.
 
+## Timed text (WebVTT)
+
+WebVTT text tracks are canonical (`canonical-form.md § Timed Text (WebVTT)`), but a few edges are not settled:
+
+1. **Sparse noncanonical fMP4 input.** The live segmenter honors every source `tfdt` and fills gaps. Source-based rewriting currently derives later decode times from sample durations; a discontinuous source text `tfdt` needs explicit gap samples before using that path. Canonical MUXL input already has continuous coverage.
+2. **Reference-track rounding.** The text boundary is `floor(t_ref * 1000 / ts_ref)`. When a reference keyframe does not fall on a whole millisecond, the text boundary sits up to 1 ms before it. Players tolerate this, but a millisecond-aligned reference grid would remove the rounding entirely.
+3. **HLS delivery.** The HLS emitter exposes text tracks as `TYPE=SUBTITLES` renditions over `wvtt` fMP4 byte ranges. hls.js and Shaka play these. Apple's native player expects plain `.vtt` subtitle segments, which would need a derived (non-canonical) presentation.
+4. **Cue timing boxes.** Clipped cues repeat in full on both sides of a GoP boundary and carry no `ctim`, so a consumer cannot recover a cue's original start time from one segment alone. If that matters, `ctim` could be made canonical (always present, or present only on clipped cues).
+
 ## Content hashing details
 
 When computing per-track content hashes for signing (by S2PA or any other system), the hash input is each track's moof+mdat bytes within a MUXL segment.

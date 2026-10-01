@@ -298,11 +298,12 @@ type TrackSamples struct {
 }
 
 // Catalog mirrors the Rust authoritative type; only the fields consumers need
-// are mirrored. A canonical segment's catalog is single-track (Video xor
-// Audio).
+// are mirrored. A canonical segment's catalog describes one video, audio, or
+// text track.
 type Catalog struct {
 	Video *CatalogVideo `cbor:"video,omitempty"`
 	Audio *CatalogAudio `cbor:"audio,omitempty"`
+	Text *CatalogText `cbor:"text,omitempty"`
 }
 
 // CatalogVideo holds the video renditions, keyed by rendition name.
@@ -314,6 +315,26 @@ type CatalogVideo struct {
 type CatalogAudio struct {
 	Renditions map[string]AudioConfig `cbor:"renditions"`
 }
+
+// CatalogText holds WebVTT renditions, keyed by rendition name.
+type CatalogText struct {
+	Renditions map[string]TextConfig `cbor:"renditions"`
+}
+
+// TextConfig is the WebVTT decoder configuration and player metadata.
+type TextConfig struct {
+	Codec string `cbor:"codec"`
+	Container Container `cbor:"container"`
+	Language string `cbor:"language"`
+	Label string `cbor:"label,omitempty"`
+	Config string `cbor:"config"`
+}
+
+// TrackID returns the configured CMAF track ID, or 0 for legacy.
+func (c TextConfig) TrackID() uint32 { return c.Container.TrackID }
+
+// Timescale returns the text timescale (canonical tracks use 1000).
+func (c TextConfig) Timescale() uint32 { return c.Container.Timescale }
 
 // VideoConfig is one video rendition's codec configuration.
 type VideoConfig struct {

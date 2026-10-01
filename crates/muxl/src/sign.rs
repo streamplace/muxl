@@ -792,4 +792,162 @@ mod tests {
         assert_eq!(out["assertions"].as_array().unwrap().len(), 1);
         assert_eq!(out["assertions"][0]["label"], "cawg.metadata");
     }
+
+    #[test]
+    fn text_segments_sign_and_verify_like_av() {
+        // A WebVTT canonical segment goes through the same per-GoP signer as
+        // the AV segments of that GoP: same manifest, same c2pa prefix size
+        // (the signer requires it to be constant across tracks), canonical
+        // bytes preserved verbatim, and the hash covers the text payload.
+        init_default_settings();
+        let (av, mut gop) = test_segments::first_gop("samples/fixtures/h264-opus-frag.mp4");
+        let tid = gop.tracks.keys().max().unwrap() + 1;
+        let catalog = test_segments::with_text(&av, tid);
+        let text = test_segments::text_segment(&catalog, tid, "hello");
+        gop.tracks.insert(tid, text.clone());
+        let unsigned = gop.tracks.clone();
+
+        let signer = test_segments::signer().build().unwrap();
+        let manifest = stamp_segment_manifest(
+            &json!({
+                "title": "text signing test",
+                "assertions": [
+                    { "label": "c2pa.actions",
+                      "data": { "actions": [{ "action": "c2pa.created" }] } }
+                ]
+            }),
+            "2020-02-29T00:00:00.000Z",
+        );
+        let prefix = sign_gop_canonical_segments_in_place(&mut gop, &manifest, &*signer).unwrap();
+        assert!(prefix > 0);
+
+        let mut stream = Vec::new();
+        for (t, signed) in &gop.tracks {
+            assert_eq!(&signed[prefix..], unsigned[t].as_slice(), "track {t} bytes verbatim");
+            stream.extend_from_slice(signed);
+        }
+
+        let v: serde_json::Value =
+            serde_json::from_str(&crate::verify::verify_segments(&stream).unwrap()).unwrap();
+        let segs = v["segments"].as_array().unwrap();
+        assert_eq!(segs.len(), unsigned.len());
+        assert_eq!(segs.last().unwrap()["track_id"], tid);
+        for seg in segs {
+            assert_ne!(seg["validation_state"].as_str(), Some("Invalid"), "{seg}");
+        }
+
+        // Tampering with the cue text (the final bytes of the stream) breaks
+        // only the text segment's signature.
+        let n = stream.len();
+        stream[n - 1] ^= 0xff;
+        let v: serde_json::Value =
+            serde_json::from_str(&crate::verify::verify_segments(&stream).unwrap()).unwrap();
+        let segs = v["segments"].as_array().unwrap();
+        assert_eq!(segs.last().unwrap()["validation_state"].as_str(), Some("Invalid"));
+        for seg in &segs[..segs.len() - 1] {
+            assert_ne!(seg["validation_state"].as_str(), Some("Invalid"), "{seg}");
+        }
+    }
+}
+
+/// Canonical segments for signing, verification, and inspection tests: a real
+/// AV GoP plus a hand-minted WebVTT segment.
+#[cfg(test)]
+pub(crate) mod test_segments {
+    use std::io::Cursor;
+    use std::path::PathBuf;
+
+    use mp4_atom::{Encode, Mfhd, Moof, Tfdt, Tfhd, Traf, Trun, TrunEntry};
+    use muxl::catalog::{Catalog, Container, TextConfig};
+
+    use super::SignerKey;
+
+    pub fn repo_path(rel: &str) -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..").join(rel)
+    }
+
+    /// The fixture's catalog and its first GoP of unsigned canonical segments.
+    pub fn first_gop(fixture: &str) -> (Catalog, muxl::GopSegment) {
+        let data = std::fs::read(repo_path(fixture)).expect("read fixture");
+        let mut first = None;
+        let catalog = muxl::segment_fmp4(&mut Cursor::new(&data), |g| {
+            if first.is_none() {
+                first = Some(g);
+            }
+            Ok(())
+        })
+        .expect("segment fixture");
+        (catalog, first.expect("fixture has a GoP"))
+    }
+
+    /// `av` plus a WebVTT rendition on `track_id`.
+    pub fn with_text(av: &Catalog, track_id: u32) -> Catalog {
+        let mut c = av.clone();
+        c.insert_text(
+            format!("text{track_id}"),
+            TextConfig {
+                codec: "wvtt".into(),
+                container: Container::cmaf(1000, track_id),
+                language: "en".into(),
+                label: Some("captions".into()),
+                config: "WEBVTT".into(),
+            },
+        );
+        c
+    }
+
+    /// An unsigned canonical WebVTT segment: the MUXL uuid (single-track text
+    /// catalog), then one canonical moof+mdat whose sample is a single cue.
+    pub fn text_segment(catalog: &Catalog, track_id: u32, cue: &str) -> Vec<u8> {
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&((16 + cue.len()) as u32).to_be_bytes());
+        payload.extend_from_slice(b"vttc");
+        payload.extend_from_slice(&((8 + cue.len()) as u32).to_be_bytes());
+        payload.extend_from_slice(b"payl");
+        payload.extend_from_slice(cue.as_bytes());
+
+        let mut moof = Moof {
+            mfhd: Mfhd { sequence_number: 1 },
+            traf: vec![Traf {
+                tfhd: Tfhd {
+                    track_id,
+                    ..Default::default()
+                },
+                tfdt: Some(Tfdt {
+                    base_media_decode_time: 0,
+                }),
+                trun: vec![Trun {
+                    data_offset: Some(0),
+                    entries: vec![TrunEntry {
+                        duration: Some(1000),
+                        size: Some(payload.len() as u32),
+                        flags: Some(0x02000000),
+                        cts: None,
+                    }],
+                }],
+                ..Default::default()
+            }],
+        };
+        let mut sized = Vec::new();
+        moof.encode(&mut sized).unwrap();
+        moof.traf[0].trun[0].data_offset = Some((sized.len() + 8) as i32);
+        let mut moof_bytes = Vec::new();
+        moof.encode(&mut moof_bytes).unwrap();
+
+        let mut out = muxl::segment::mint_canonical_segment_prefix(catalog, track_id).unwrap();
+        out.extend_from_slice(&moof_bytes);
+        out.extend_from_slice(&((8 + payload.len()) as u32).to_be_bytes());
+        out.extend_from_slice(b"mdat");
+        out.extend_from_slice(&payload);
+        out
+    }
+
+    pub fn signer() -> SignerKey {
+        SignerKey::from_pem_files(
+            repo_path("samples/test-keys/es256k-cert.pem"),
+            repo_path("samples/test-keys/es256k-key.pem"),
+            c2pa::SigningAlg::Es256K,
+        )
+        .expect("load test signer")
+    }
 }

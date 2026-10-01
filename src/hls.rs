@@ -10,12 +10,19 @@
 //! inputs can be supplied as sidecars for alternate renditions (e.g.
 //! different resolutions). Each input produces exactly one flat MP4 blob
 //! regardless of how many tracks it carries.
+//!
+//! Timed-text (WebVTT) tracks become `TYPE=SUBTITLES` renditions whose media
+//! playlists byte-range the `wvtt` fMP4 fragments in the blob, just like the
+//! audio and video playlists. Players must support WebVTT-in-fMP4 (`wvtt`) to
+//! render them (for example hls.js and Shaka; Apple's native player expects
+//! plain `.vtt` subtitle segments).
 
 use std::collections::HashSet;
 use std::fs;
 use std::io::BufWriter;
 use std::path::{Path, PathBuf};
 
+use crate::catalog::Catalog;
 use crate::cid;
 use crate::error::Result;
 use crate::flat::FlatFragment;
@@ -31,7 +38,7 @@ use crate::io::FileReadAt;
 #[serde(rename_all = "camelCase")]
 pub struct BlobTrack {
     pub track_id: u32,
-    pub track_type: String, // "video" or "audio"
+    pub track_type: String, // "video", "audio", or "text"
     pub codec: String,
     pub timescale: u32,
     pub init_cid: String,
@@ -46,6 +53,66 @@ pub struct BlobTrack {
     // audio-specific
     pub channels: u32,
     pub sample_rate: u32,
+    // text-specific: BCP 47 language tag and optional label. Absent for
+    // video and audio, so their serialized form is unchanged.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub language: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+}
+
+/// Codec summary for one track of a catalog, as carried by [`BlobTrack`].
+pub(crate) struct TrackSummary {
+    pub track_type: &'static str,
+    pub codec: String,
+    pub width: u32,
+    pub height: u32,
+    pub channels: u32,
+    pub sample_rate: u32,
+    pub language: Option<String>,
+    pub label: Option<String>,
+}
+
+/// Summarize track `tid` of `catalog` for [`BlobTrack`]. A track id missing
+/// from the catalog reports `"unknown"` with empty fields.
+pub(crate) fn track_summary(catalog: &Catalog, tid: u32) -> TrackSummary {
+    let empty = TrackSummary {
+        track_type: "unknown",
+        codec: String::new(),
+        width: 0,
+        height: 0,
+        channels: 0,
+        sample_rate: 0,
+        language: None,
+        label: None,
+    };
+    if let Some(v) = catalog.video_configs().find(|v| v.track_id() == tid) {
+        TrackSummary {
+            track_type: "video",
+            codec: v.codec.clone(),
+            width: v.coded_width,
+            height: v.coded_height,
+            ..empty
+        }
+    } else if let Some(a) = catalog.audio_configs().find(|a| a.track_id() == tid) {
+        TrackSummary {
+            track_type: "audio",
+            codec: a.codec.clone(),
+            channels: a.number_of_channels,
+            sample_rate: a.sample_rate,
+            ..empty
+        }
+    } else if let Some(t) = catalog.text_configs().find(|t| t.track_id() == tid) {
+        TrackSummary {
+            track_type: "text",
+            codec: t.codec.clone(),
+            language: Some(t.language.clone()),
+            label: t.label.clone(),
+            ..empty
+        }
+    } else {
+        empty
+    }
 }
 
 /// Byte-range segment metadata within a flat MP4 blob.
@@ -195,6 +262,8 @@ fn analyze_input(path: &Path, blobs_dir: Option<&Path>) -> Result<Vec<BlobTrack>
 
     let mut tracks: Vec<BlobTrack> = Vec::new();
     for (&tid, track_info) in &info.tracks {
+        // Text (WebVTT) samples are all sync and sparse, so they group by
+        // duration exactly like audio.
         let segments = if track_info.is_video {
             group_fragments_video(&track_info.fragments)
         } else {
@@ -210,42 +279,23 @@ fn analyze_input(path: &Path, blobs_dir: Option<&Path>) -> Result<Vec<BlobTrack>
             }
         }
 
-        let (track_type, codec, width, height, channels, sample_rate): (
-            &str,
-            String,
-            u32,
-            u32,
-            u32,
-            u32,
-        ) = if let Some(v) = catalog.video_configs().find(|v| v.track_id() == tid) {
-            ("video", v.codec.clone(), v.coded_width, v.coded_height, 0, 0)
-        } else if let Some(a) = catalog.audio_configs().find(|a| a.track_id() == tid) {
-            (
-                "audio",
-                a.codec.clone(),
-                0,
-                0,
-                a.number_of_channels,
-                a.sample_rate,
-            )
-        } else {
-            ("unknown", String::new(), 0, 0, 0, 0)
-        };
-
+        let summary = track_summary(&catalog, tid);
         tracks.push(BlobTrack {
             track_id: tid,
-            track_type: track_type.to_string(),
-            codec,
+            track_type: summary.track_type.to_string(),
+            codec: summary.codec,
             timescale: track_info.timescale,
             init_cid,
             init_data,
             blob_cid: blob_cid.clone(),
             blob_size,
             segments,
-            width,
-            height,
-            channels,
-            sample_rate,
+            width: summary.width,
+            height: summary.height,
+            channels: summary.channels,
+            sample_rate: summary.sample_rate,
+            language: summary.language,
+            label: summary.label,
         });
     }
 
@@ -295,7 +345,8 @@ fn group_fragments_video(fragments: &[FlatFragment]) -> Vec<BlobSegment> {
     segments
 }
 
-/// Group per-sample fragments into ~2-second HLS segments (for audio).
+/// Group per-sample fragments into ~2-second HLS segments (for audio and
+/// text).
 fn group_fragments_audio(fragments: &[FlatFragment], timescale: u32) -> Vec<BlobSegment> {
     let target_ticks = timescale as u64 * 2;
     let mut segments = Vec::new();
@@ -367,6 +418,24 @@ fn write_playlists(
             entry.key,
         ));
     }
+    // Subtitle renditions (WebVTT in fMP4). Only emitted when a text track
+    // exists, so AV-only master playlists are unchanged.
+    let has_subtitles = entries.iter().any(|e| e.track.track_type == "text");
+    for entry in entries {
+        if entry.track.track_type != "text" {
+            continue;
+        }
+        let t = &entry.track;
+        let language = t.language.as_deref().unwrap_or("und");
+        let name = t.label.as_deref().unwrap_or(language);
+        master.push_str(&format!(
+            "#EXT-X-MEDIA:TYPE=SUBTITLES,GROUP-ID=\"subs\",NAME=\"{}\",\
+             LANGUAGE=\"{}\",DEFAULT=NO,AUTOSELECT=YES,URI=\"{primary_blob_cid}.text-{}.m3u8\"\n",
+            hls_quoted(name),
+            hls_quoted(language),
+            entry.key,
+        ));
+    }
     master.push('\n');
 
     // CODECS string for video variants — pair with the AAC audio track when present.
@@ -376,6 +445,12 @@ fn write_playlists(
         .or_else(|| entries.iter().find(|e| e.track.track_type == "audio"))
         .map(|e| e.track.codec.as_str())
         .unwrap_or("mp4a.40.2");
+    // With subtitles, each variant names the group and lists the text codec.
+    let (subs_attr, subs_codec) = if has_subtitles {
+        (",SUBTITLES=\"subs\"", ",wvtt")
+    } else {
+        ("", "")
+    };
 
     for entry in entries {
         if entry.track.track_type != "video" {
@@ -399,8 +474,8 @@ fn write_playlists(
         };
 
         master.push_str(&format!(
-            "#EXT-X-STREAM-INF:AUDIO=\"audio\",BANDWIDTH={bandwidth},\
-             CODECS=\"{},{audio_codec}\",RESOLUTION={}x{},FRAME-RATE={frame_rate:.3}\n",
+            "#EXT-X-STREAM-INF:AUDIO=\"audio\"{subs_attr},BANDWIDTH={bandwidth},\
+             CODECS=\"{},{audio_codec}{subs_codec}\",RESOLUTION={}x{},FRAME-RATE={frame_rate:.3}\n",
             t.codec, t.width, t.height,
         ));
         master.push_str(&format!("{primary_blob_cid}.video-{}.m3u8\n", entry.key));
@@ -445,10 +520,10 @@ fn write_playlists(
         }
 
         playlist.push_str("#EXT-X-ENDLIST\n");
-        let prefix = if t.track_type == "video" {
-            "video"
-        } else {
-            "audio"
+        let prefix = match t.track_type.as_str() {
+            "video" => "video",
+            "text" => "text",
+            _ => "audio",
         };
         fs::write(
             output_dir.join(format!("{primary_blob_cid}.{prefix}-{}.m3u8", entry.key)),
@@ -493,6 +568,11 @@ fn write_metadata_json(
         if t.track_type == "video" {
             info["width"] = serde_json::json!(t.width);
             info["height"] = serde_json::json!(t.height);
+        } else if t.track_type == "text" {
+            info["language"] = serde_json::json!(t.language);
+            if let Some(label) = &t.label {
+                info["label"] = serde_json::json!(label);
+            }
         } else {
             info["channels"] = serde_json::json!(t.channels);
             info["sampleRate"] = serde_json::json!(t.sample_rate);
@@ -511,4 +591,144 @@ fn write_metadata_json(
         &metadata_str,
     )?;
     Ok(())
+}
+
+/// Make `s` safe inside an HLS quoted-string attribute, which may not contain
+/// `"`, CR, or LF (RFC 8216 § 4.2).
+fn hls_quoted(s: &str) -> String {
+    s.chars()
+        .map(|c| match c {
+            '"' => '\'',
+            '\r' | '\n' => ' ',
+            c => c,
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn track(track_id: u32, track_type: &str, codec: &str) -> BlobTrack {
+        BlobTrack {
+            track_id,
+            track_type: track_type.into(),
+            codec: codec.into(),
+            timescale: 1000,
+            init_cid: format!("init{track_id}"),
+            init_data: Vec::new(),
+            blob_cid: "blob".into(),
+            blob_size: 100,
+            segments: vec![BlobSegment {
+                offset: 0,
+                size: 10,
+                duration_ticks: 2000,
+                sample_count: 2,
+            }],
+            width: if track_type == "video" { 640 } else { 0 },
+            height: if track_type == "video" { 360 } else { 0 },
+            channels: if track_type == "audio" { 2 } else { 0 },
+            sample_rate: if track_type == "audio" { 48000 } else { 0 },
+            language: None,
+            label: None,
+        }
+    }
+
+    fn entries(with_text: bool) -> Vec<TrackEntry> {
+        let mut tracks = vec![track(1, "video", "avc1.64001f"), track(2, "audio", "opus")];
+        if with_text {
+            let mut t = track(3, "text", "wvtt");
+            t.language = Some("en-US".into());
+            t.label = Some("Live \"captions\"".into());
+            tracks.push(t);
+        }
+        tracks
+            .into_iter()
+            .map(|track| TrackEntry {
+                key: track.track_id.to_string(),
+                track,
+            })
+            .collect()
+    }
+
+    fn master(with_text: bool) -> (tempfile::TempDir, String) {
+        let dir = tempfile::tempdir().unwrap();
+        write_playlists(dir.path(), "blob", &entries(with_text)).unwrap();
+        let master = fs::read_to_string(dir.path().join("blob.m3u8")).unwrap();
+        (dir, master)
+    }
+
+    #[test]
+    fn av_master_has_no_subtitles() {
+        let (_dir, m) = master(false);
+        assert!(!m.contains("SUBTITLES"), "got: {m}");
+        assert!(m.contains("CODECS=\"avc1.64001f,opus\""), "got: {m}");
+    }
+
+    #[test]
+    fn text_track_becomes_subtitles_rendition() {
+        let (dir, m) = master(true);
+        assert!(
+            m.contains(
+                "#EXT-X-MEDIA:TYPE=SUBTITLES,GROUP-ID=\"subs\",NAME=\"Live 'captions'\",\
+                 LANGUAGE=\"en-US\",DEFAULT=NO,AUTOSELECT=YES,URI=\"blob.text-3.m3u8\""
+            ),
+            "got: {m}"
+        );
+        assert!(
+            m.contains("#EXT-X-STREAM-INF:AUDIO=\"audio\",SUBTITLES=\"subs\",BANDWIDTH="),
+            "got: {m}"
+        );
+        assert!(m.contains("CODECS=\"avc1.64001f,opus,wvtt\""), "got: {m}");
+
+        let media = fs::read_to_string(dir.path().join("blob.text-3.m3u8")).unwrap();
+        assert!(media.contains("#EXT-X-MAP:URI=\"init3.mp4\""), "got: {media}");
+        assert!(media.contains("#EXT-X-BYTERANGE:10@0"), "got: {media}");
+    }
+
+    #[test]
+    fn metadata_json_describes_text_track() {
+        let dir = tempfile::tempdir().unwrap();
+        write_metadata_json(dir.path(), "blob", 100, &entries(true)).unwrap();
+        let json: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(dir.path().join("blob.json")).unwrap())
+                .unwrap();
+        let text = &json["tracks"]["3"];
+        assert_eq!(text["type"], "text");
+        assert_eq!(text["codec"], "wvtt");
+        assert_eq!(text["language"], "en-US");
+        assert_eq!(text["label"], "Live \"captions\"");
+        assert!(text.get("channels").is_none());
+        // AV entries keep their shape.
+        assert_eq!(json["tracks"]["2"]["channels"], 2);
+        assert!(json["tracks"]["2"].get("language").is_none());
+    }
+
+    #[test]
+    fn blob_track_json_omits_text_fields_for_av() {
+        let v = serde_json::to_value(track(1, "video", "avc1.64001f")).unwrap();
+        assert!(v.get("language").is_none());
+        assert!(v.get("label").is_none());
+    }
+
+    #[test]
+    fn track_summary_covers_text() {
+        let mut c = Catalog::default();
+        c.insert_text(
+            "text3",
+            crate::catalog::TextConfig {
+                codec: "wvtt".into(),
+                container: crate::catalog::Container::cmaf(1000, 3),
+                language: "es".into(),
+                label: None,
+                config: "WEBVTT".into(),
+            },
+        );
+        let s = track_summary(&c, 3);
+        assert_eq!(s.track_type, "text");
+        assert_eq!(s.codec, "wvtt");
+        assert_eq!(s.language.as_deref(), Some("es"));
+        assert_eq!(s.label, None);
+        assert_eq!(track_summary(&c, 9).track_type, "unknown");
+    }
 }

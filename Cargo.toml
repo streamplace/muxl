@@ -6,6 +6,10 @@ members = ["crates/muxl"]
 # the one binary in the workspace — `muxl`, which lives in crates/muxl (it
 # depends on this crate + c2pa, so it can't live in the library crate).
 default-members = [".", "crates/muxl"]
+# crates/mp4-atom is a vendored path dependency (see its VENDORED.md), not a
+# workspace member: excluding it keeps its dev-dependencies and test suite out
+# of `cargo test --workspace` and out of Cargo.lock.
+exclude = ["crates/mp4-atom"]
 
 
 [package]
@@ -29,7 +33,10 @@ blake3 = "1"
 clap = { version = "4", features = ["derive"] }
 dasl = "0.2"
 hex = "0.4"
-mp4-atom = { git = "https://github.com/streamplace/mp4-atom.git", branch = "streamplace" }
+# Vendored copy of streamplace/mp4-atom@126c49b plus an `elng` box; see
+# crates/mp4-atom/VENDORED.md. A path dependency (not a [patch]) so git
+# consumers of muxl-core resolve the same vendored crate.
+mp4-atom = { path = "crates/mp4-atom" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_bytes = "0.11"

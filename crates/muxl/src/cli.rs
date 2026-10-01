@@ -99,6 +99,8 @@ enum Command {
     /// inverse of `metafile`): feed `init` + segment metafiles on stdin, get
     /// the header bytes to prepend to the canonical blob over byte ranges.
     FlatHeader(muxl_cli::FlatHeaderArgs),
+    /// Enumerate, read, or attach canonical WebVTT text tracks.
+    Text(muxl_cli::TextArgs),
 }
 
 #[derive(clap::Args)]
@@ -348,6 +350,7 @@ pub fn cli_main() {
         Command::Hls(args) => muxl_cli::cmd_hls(args).map_err(Into::into),
         Command::Metafile(args) => muxl_cli::cmd_metafile(args).map_err(Into::into),
         Command::FlatHeader(args) => muxl_cli::cmd_flat_header(args).map_err(Into::into),
+        Command::Text(args) => muxl_cli::cmd_text(args).map_err(Into::into),
     };
     if let Err(e) = result {
         eprintln!("Error: {e}");

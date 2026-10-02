@@ -42,6 +42,85 @@ All operations live behind the [`Engine`](muxl.go) interface, so the WASM
 backend can be swapped for a natively-linked Rust build later without touching
 callers.
 
+### Streaming text tracks
+
+`SignerInput.TextFn` is an optional per-GoP callback. It receives `TextRequest`
+with the reference AV GoP's absolute stream-millisecond interval `[StartMs,
+EndMs)`. The reference is the lowest-ID video track in the input catalog, or
+the lowest-ID audio track when there is no video. Return `TextAttachment`
+containing `TextTrackAttachment` entries: an
+immutable `TextTrack` configuration (`TrackID`, BCP 47 `Language`, `Label`) and
+its overlapping `TextCue`s. Reserve a text ID namespace distinct from input AV
+and downstream renditions; do not reuse another track's ID.
+
+The signer encodes WebVTT and gap-covering segments before signing, without
+changing AV bytes or playable duration. Once declared, a text track appears in
+every subsequent GoP with reference samples, even when omitted from the callback
+result or when the callback fails. Language/label changes require a new track
+ID. Callbacks may block to await source captions; callers should decouple their
+media producer.
+A nil callback preserves the pre-text signed bytes. Cue IDs should identify the
+session and remain stable across GoP boundaries so readers can coalesce them.
+
+On first declaration of any new text track, the signer emits a refreshed `init`
+event before the affected `signed-segment`. Each `init` is a complete snapshot:
+`Catalog`, `Data` (combined initialization), and `TrackInits` include every
+declared track. Consumers must process later snapshots as well as the first;
+per-track HLS initialization and archived text rendition discovery can continue
+to use these fields without parsing segment catalogs.
+
+`SignerInput.SegmentTimeFn` optionally maps each absolute media start in
+milliseconds to its signed UTC start time. Nil retains the existing signing-time
+stamp. It is independent of text and can be used for AV-only origins as well.
+
+If the reference track has no samples in a sparse GoP, neither `TextFn` nor
+`SegmentTimeFn` is invoked: there is no reference interval or start to report.
+Its AV tracks are still signed using signing time, without attaching text.
+The signer never substitutes a higher-ID track or audio for an absent video
+reference.
+
+`UnwrapEvents` preserves legacy AV numeric-wrap grouping, including sparse
+leading/trailing AV fragments in flat blobs. Text can precede its AV GoP;
+trailing text without a following AV reference remains readable rather than
+being discarded or rejected.
+
+### Signed archive text runs
+
+```go
+func (e *WASMEngine) SignTextRuns(
+    ctx context.Context,
+    req TextRequest,
+    tracks []TextTrackAttachment,
+    in SignerInput,
+) (map[uint32][]byte, error)
+```
+
+Use the `TextRequest` recorded by the live `SignSegment` callback to mint
+properly timed archive captions without sending AV bytes to the streamer-key
+signer. `SignTextRuns` implements `TextEngine`, shares the streaming signer's
+canonical text minting, and returns one independently signed `m4s` run per
+requested track. It does not invoke `in.TextFn`.
+
+The caller drops existing WebVTT runs, rejects new IDs colliding with non-text
+runs, and splices the returned runs into the completed GoP in ascending numeric
+track-ID order. Preserve every non-text run verbatim, including node-signed
+transcodes and their `parentOf` ingredient bindings.
+
+Track IDs must be nonzero and unique, and `EndMs` must exceed `StartMs`. Cues
+use absolute milliseconds and are clipped to `[StartMs, EndMs)`; gaps are
+covered, and a track without cues emits a gap-only run. An empty track list
+returns an empty map. Language defaults to `und`; labels are optional.
+Exactly one of `in.KeyPEM` and `in.Sign` is required; `in.Alg` defaults to
+`es256k`. The manifest comes from `in.TrackManifestFn` when set, otherwise
+`in.TrackManifest`, and receives the same `cawg.metadata`/`dc:date` stamp as
+live signing (`in.SegmentTimeFn(req.StartMs)`, otherwise signing time).
+
+The CLI equivalent is `muxl sign-text-runs --cert cert.pem --key key.pem
+--track-manifest manifest.json` (or `--host-sign`/`--host-manifest`).
+It reads `{"startMs":0,"endMs":1000,"tracks":[{"trackId":100,"language":"en","cues":[]}]}` JSON
+on stdin and writes a DRISL map of decimal track-ID strings to signed byte
+strings on stdout. The Go API converts those keys to `uint32`.
+
 ### Transcode provenance
 
 `SignTranscode` signs a transcoded output segment so its C2PA manifest names the

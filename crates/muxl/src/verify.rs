@@ -26,7 +26,10 @@ use crate::sign::init_default_settings;
 /// fast-forwards over the framing and splits on segment boundaries, keeping
 /// each segment's leading c2pa-uuid box attached.
 ///
-/// Returns a JSON document, one entry per track, each mirroring the old
+/// Video, audio, and timed-text (WebVTT) segments are all verified the same
+/// way: each is a standalone canonical segment with its own manifest.
+///
+/// Returns a JSON document, one entry per canonical segment, each mirroring the old
 /// `get_manifest_and_cert` shape so the host's assertion- and cert-parsing
 /// applies unchanged:
 ///

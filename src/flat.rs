@@ -13,7 +13,9 @@
 //!
 //! Time-slice interleaved: each GoP's bytes for all tracks are contiguous
 //! before the next GoP. GoP boundaries follow the canonical segmentation
-//! rule (video keyframes; 1-second buckets if audio-only).
+//! rule (video keyframes; 1-second buckets if audio-only). Timed-text
+//! (WebVTT) tracks ride along like audio but never drive a boundary; see
+//! `compute_gop_partition`.
 //!
 //! Two views of the same bytes:
 //!
@@ -41,6 +43,7 @@
 //!
 //! Spec: canonical-form.md § MUXL Flat MP4
 
+use std::collections::BTreeMap;
 use std::io::Write;
 
 use mp4_atom::{
@@ -52,7 +55,8 @@ use crate::catalog::Catalog;
 use crate::error::{Error, Result};
 use crate::fragment::extract_flat_track_info;
 use crate::init::{
-    MOVIE_TIMESCALE, build_audio_trak, build_video_trak, read_moov, start_offset_from_trak,
+    MOVIE_TIMESCALE, build_audio_trak, build_text_trak, build_video_trak, read_moov,
+    start_offset_from_trak,
 };
 use crate::io::{ReadAt, ReadAtCursor};
 
@@ -152,6 +156,7 @@ pub struct SegmentMetadata {
 pub(crate) struct CanonicalBodyPlan {
     /// Per-track canonical-segment uuid prefix (uuid box + DRISL catalog).
     pub per_track_uuid: Vec<Vec<u8>>,
+    pub text_tracks: Vec<bool>,
     /// Per-track per-sample measured moof sizes, in decode order.
     pub per_sample_moof_sizes: Vec<Vec<u32>>,
     /// `gop_partition[ti][gop]` = sample-index range of track `ti`'s
@@ -198,7 +203,9 @@ pub(crate) fn plan_canonical_body(
         per_sample_moof_sizes.push(sizes);
     }
 
-    let gop_partition = compute_gop_partition(ordered);
+    let text_ids: std::collections::HashSet<u32> =
+        catalog.text_configs().map(|t| t.track_id()).collect();
+    let gop_partition = compute_gop_partition(ordered, &text_ids);
     let gop_count = gop_partition.first().map(|v| v.len()).unwrap_or(0);
 
     // Per-GoP SegmentMetadata. track_byte_sizes includes the leading uuid
@@ -251,6 +258,7 @@ pub(crate) fn plan_canonical_body(
 
     Ok(CanonicalBodyPlan {
         per_track_uuid,
+        text_tracks: ordered.iter().map(|p| catalog.text_configs().any(|t| t.track_id() == p.track_id)).collect(),
         per_sample_moof_sizes,
         gop_partition,
         per_gop_metadata,
@@ -323,6 +331,9 @@ where
                 continue;
             }
 
+            if plan.text_tracks[ti] {
+                per_track_progress[ti].restart_sequence();
+            }
             let seg_start = absolute_offset;
             if per_track_first_offset[ti].is_none() {
                 per_track_first_offset[ti] = Some(seg_start);
@@ -462,16 +473,8 @@ pub fn build_synth_flat_header(
     let first_seg = &segments[0];
     let mut plans: Vec<TrackPlan> = Vec::with_capacity(track_ids.len());
     for &tid in &track_ids {
-        let timescale = catalog
-            .video_configs()
-            .find(|v| v.track_id() == tid)
-            .map(|v| v.timescale())
-            .or_else(|| {
-                catalog
-                    .audio_configs()
-                    .find(|a| a.track_id() == tid)
-                    .map(|a| a.timescale())
-            })
+        let timescale = crate::reader::catalog_track(catalog, tid)
+            .map(|t| t.timescale)
             .ok_or_else(|| {
                 Error::InvalidMp4(format!(
                     "build_synth_flat_header: track {tid} not in catalog"
@@ -489,6 +492,7 @@ pub fn build_synth_flat_header(
             timescale,
             start_offset_ticks,
             samples: per_track_samples.remove(&tid).unwrap(),
+            decode_time_overrides: BTreeMap::new(),
         });
     }
 
@@ -753,10 +757,12 @@ pub fn plan_from_fmp4<R: ReadAt + ?Sized>(
                 timescale: trak.mdia.mdhd.timescale,
                 samples: Vec::new(),
                 start_offset_ticks: 0,
+                decode_time_overrides: BTreeMap::new(),
             },
         );
     }
 
+    let mut text_next_decode: BTreeMap<u32, u64> = BTreeMap::new();
     // Walk top-level boxes. For each moof, parse its trun entries and
     // compute each sample's absolute byte offset in the input.
     cursor.seek(SeekFrom::Start(0)).map_err(Error::Io)?;
@@ -790,11 +796,9 @@ pub fn plan_from_fmp4<R: ReadAt + ?Sized>(
                 let track_id = traf.tfhd.track_id;
                 let trex = crate::fragment::trex_defaults(&moov, track_id);
 
-                // First tfdt seen on a track carries the presentation-start
-                // offset (MUXL fMP4 canonical form has no elst, so the
-                // offset lives here). Subsequent samples' decode times are
-                // recovered implicitly from per-sample durations during
-                // re-emission, so we only pick up the first one.
+                // Recover the track's presentation start from its first tfdt.
+                // Text also retains later discontinuities; normalization turns
+                // them into explicit gap samples before either wrapper writes.
                 if let Some(tfdt) = traf.tfdt.as_ref() {
                     if let Some(plan) = track_plans.get_mut(&track_id) {
                         if plan.samples.is_empty() {
@@ -802,6 +806,10 @@ pub fn plan_from_fmp4<R: ReadAt + ?Sized>(
                         }
                     }
                 }
+                let mut text_decode_time = catalog.text_configs()
+                    .any(|t| t.track_id() == track_id)
+                    .then(|| traf.tfdt.as_ref().map(|t| t.base_media_decode_time)
+                        .unwrap_or_else(|| text_next_decode.get(&track_id).copied().unwrap_or(0)));
 
                 for trun in &traf.trun {
                     // With default-base-is-moof (MUXL fMP4 files), data_offset
@@ -828,6 +836,16 @@ pub fn plan_from_fmp4<R: ReadAt + ?Sized>(
                                     track_id
                                 ))
                             })?;
+                        if let Some(dt) = text_decode_time.as_mut() {
+                            let expected = text_next_decode.get(&track_id).copied()
+                                .unwrap_or(plan.start_offset_ticks);
+                            if *dt != expected {
+                                plan.decode_time_overrides.insert(plan.samples.len(), *dt);
+                            }
+                            *dt = dt.checked_add(frame.duration as u64)
+                                .ok_or_else(|| Error::InvalidMp4("text timestamp overflow".into()))?;
+                            text_next_decode.insert(track_id, *dt);
+                        }
                         plan.samples.push(Sample {
                             duration: frame.duration,
                             size: frame.size,
@@ -914,6 +932,7 @@ pub fn plan_from_flat_mp4<R: ReadAt + ?Sized>(
             timescale: trak.mdia.mdhd.timescale,
             samples,
             start_offset_ticks,
+            decode_time_overrides: BTreeMap::new(),
         });
     }
     plans.sort_by_key(|p| p.track_id);
@@ -929,13 +948,30 @@ pub fn plan_from_flat_mp4<R: ReadAt + ?Sized>(
 /// - If any track is video, GoPs start at each video sync sample.
 /// - If audio-only, GoPs are 1-second wall-clock buckets in the first
 ///   track's timescale.
-pub(crate) fn compute_gop_partition(plans: &[&TrackPlan]) -> Vec<Vec<std::ops::Range<usize>>> {
+///
+/// Tracks whose id is in `text_ids` are timed text. They never act as the
+/// reference track while a non-text track exists. Their samples are assigned
+/// in their own timescale, against the GoP start converted as
+/// `floor(ref_decode_ticks * text_timescale / ref_timescale)`. That is the
+/// boundary canonical text samples are clipped at (`canonical-form.md §
+/// Timed Text (WebVTT)`), so a clipped sample that starts on the boundary
+/// lands in the GoP it opens rather than in the previous one because of
+/// microsecond rounding.
+pub(crate) fn compute_gop_partition(
+    plans: &[&TrackPlan],
+    text_ids: &std::collections::HashSet<u32>,
+) -> Vec<Vec<std::ops::Range<usize>>> {
     if plans.is_empty() {
         return Vec::new();
     }
 
-    // Reference track: first video track if present, else first track.
-    let ref_idx = plans.iter().position(|p| p.is_video).unwrap_or(0);
+    // Reference track: first video track if present, else the first non-text
+    // track, else (text-only) the first track.
+    let ref_idx = plans
+        .iter()
+        .position(|p| p.is_video)
+        .or_else(|| plans.iter().position(|p| !text_ids.contains(&p.track_id)))
+        .unwrap_or(0);
     let ref_track = plans[ref_idx];
     let ref_ts = ref_track.timescale.max(1) as u64;
 
@@ -971,14 +1007,17 @@ pub(crate) fn compute_gop_partition(plans: &[&TrackPlan]) -> Vec<Vec<std::ops::R
     let gop_count = gop_start_indices.len().max(1);
 
     // Absolute decode times of GoP starts, in microseconds (for cross-track
-    // comparison across differing media timescales).
+    // comparison across differing media timescales), and in reference-track
+    // ticks (for the exact text-track conversion).
     let mut gop_start_us: Vec<u128> = Vec::with_capacity(gop_count);
+    let mut gop_start_ref_ticks: Vec<Option<u64>> = Vec::with_capacity(gop_count);
     {
         let mut dt: u64 = ref_track.start_offset_ticks;
         let mut next_gop = 0usize;
         for (i, s) in ref_track.samples.iter().enumerate() {
             if next_gop < gop_start_indices.len() && i == gop_start_indices[next_gop] {
                 gop_start_us.push((dt as u128) * 1_000_000 / ref_ts as u128);
+                gop_start_ref_ticks.push(Some(dt));
                 next_gop += 1;
             }
             dt += s.duration as u64;
@@ -986,6 +1025,7 @@ pub(crate) fn compute_gop_partition(plans: &[&TrackPlan]) -> Vec<Vec<std::ops::R
         // Pad with sentinels if reference was shorter than expected.
         while gop_start_us.len() < gop_count {
             gop_start_us.push(u128::MAX);
+            gop_start_ref_ticks.push(None);
         }
     }
 
@@ -993,13 +1033,28 @@ pub(crate) fn compute_gop_partition(plans: &[&TrackPlan]) -> Vec<Vec<std::ops::R
         Vec::with_capacity(plans.len());
     for plan in plans {
         let ts = plan.timescale.max(1) as u64;
+        let is_text = text_ids.contains(&plan.track_id);
+        // Whether a sample starting at `dt` (this track's ticks) belongs to
+        // GoP `g` or later.
+        let starts_gop = |dt: u64, g: usize| -> bool {
+            if is_text {
+                match gop_start_ref_ticks[g] {
+                    Some(ref_ticks) => {
+                        let boundary = (ref_ticks as u128) * ts as u128 / ref_ts as u128;
+                        dt as u128 >= boundary
+                    }
+                    None => false,
+                }
+            } else {
+                (dt as u128) * 1_000_000 / ts as u128 >= gop_start_us[g]
+            }
+        };
         let mut ranges = vec![0..0usize; gop_count];
         let mut gi = 0usize;
         let mut dt: u64 = plan.start_offset_ticks;
         let mut gop_start_sample = 0usize;
         for (si, s) in plan.samples.iter().enumerate() {
-            let sample_us = (dt as u128) * 1_000_000 / ts as u128;
-            while gi + 1 < gop_count && sample_us >= gop_start_us[gi + 1] {
+            while gi + 1 < gop_count && starts_gop(dt, gi + 1) {
                 ranges[gi] = gop_start_sample..si;
                 gi += 1;
                 gop_start_sample = si;
@@ -1024,6 +1079,17 @@ pub fn write_flat_mp4<R: ReadAt + ?Sized, W: Write>(
     input: &R,
     output: &mut W,
 ) -> Result<FlatMp4Info> {
+    if catalog.text.is_some() {
+        let source = Source { catalog: catalog.clone(), plan: crate::source::Plan::new(plans.to_vec()) };
+        let (normalized, text_input) = crate::source::normalize_text(&source, input)?;
+        return write_flat_prepared(&normalized.catalog, &normalized.plan.tracks, &text_input, output);
+    }
+    write_flat_prepared(catalog, plans, input, output)
+}
+
+fn write_flat_prepared<R: ReadAt + ?Sized, W: Write>(
+    catalog: &Catalog, plans: &[TrackPlan], input: &R, output: &mut W,
+) -> Result<FlatMp4Info> {
     let mut ordered: Vec<&TrackPlan> = plans.iter().collect();
     ordered.sort_by_key(|p| p.track_id);
 
@@ -1046,16 +1112,8 @@ pub fn write_flat_mp4<R: ReadAt + ?Sized, W: Write>(
     let mut track_info: std::collections::BTreeMap<u32, FlatTrackInfo> =
         std::collections::BTreeMap::new();
     for (ti, trk) in ordered.iter().enumerate() {
-        let timescale = catalog
-            .video_configs()
-            .find(|v| v.track_id() == trk.track_id)
-            .map(|v| v.timescale())
-            .or_else(|| {
-                catalog
-                    .audio_configs()
-                    .find(|a| a.track_id() == trk.track_id)
-                    .map(|a| a.timescale())
-            })
+        let timescale = crate::reader::catalog_track(catalog, trk.track_id)
+            .map(|t| t.timescale)
             .ok_or_else(|| {
                 Error::InvalidMp4(format!("track {} not in catalog", trk.track_id))
             })?;
@@ -1084,6 +1142,9 @@ fn build_base_trak(catalog: &Catalog, track_id: u32) -> Result<(Trak, u32)> {
     }
     if let Some(a) = catalog.audio_configs().find(|a| a.track_id() == track_id) {
         return Ok((build_audio_trak(a)?, a.timescale()));
+    }
+    if let Some(t) = catalog.text_configs().find(|t| t.track_id() == track_id) {
+        return Ok((build_text_trak(t)?, t.timescale()));
     }
     Err(Error::InvalidMp4(format!(
         "no track config for track_id {}",
@@ -1882,5 +1943,111 @@ mod tests {
         let audio_tfdt = find_first_tfdt_for_track(&out, audio_track_id).unwrap();
         assert_eq!(video_tfdt, video_offset);
         assert_eq!(audio_tfdt, audio_offset);
+    }
+
+    fn plan(track_id: u32, is_video: bool, timescale: u32, samples: &[(u32, bool)]) -> TrackPlan {
+        TrackPlan {
+            track_id,
+            is_video,
+            timescale,
+            start_offset_ticks: 0,
+            decode_time_overrides: BTreeMap::new(),
+            samples: samples
+                .iter()
+                .map(|&(duration, is_sync)| Sample {
+                    duration,
+                    size: 8,
+                    is_sync,
+                    cts_offset: 0,
+                    input_offset: 0,
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn gop_partition_assigns_clipped_text_by_floored_boundary() {
+        // Video at 30000 Hz with a keyframe at tick 30001 (1.0000333 s). The
+        // text boundary is floor(30001 * 1000 / 30000) = 1000 ms. A text
+        // sample clipped to start at 1000 ms is 33 us *before* the video
+        // keyframe in microseconds, so the plain microsecond rule would leave
+        // it in GoP 0. The floored text rule puts it in GoP 1.
+        let video = plan(1, true, 30000, &[(30001, true), (30000, true)]);
+        let audio = plan(2, false, 48000, &[(48000, true), (48000, true)]);
+        let text = plan(3, false, 1000, &[(600, true), (400, true), (1000, true)]);
+        let plans = [&video, &audio, &text];
+
+        let text_ids: std::collections::HashSet<u32> = [3].into_iter().collect();
+        let parts = compute_gop_partition(&plans, &text_ids);
+        assert_eq!(parts[2], vec![0..2, 2..3], "text split on the floored boundary");
+        // Video and audio partitions are unaffected by the text rule.
+        let no_text = compute_gop_partition(&plans, &Default::default());
+        assert_eq!(parts[0], no_text[0]);
+        assert_eq!(parts[1], no_text[1]);
+        // Without the text rule the boundary sample falls into GoP 0.
+        assert_eq!(no_text[2], vec![0..3, 0..0]);
+    }
+
+    #[test]
+    fn gop_partition_never_uses_text_as_reference() {
+        // Audio + text, with the text track id lowest. The 1-second buckets
+        // must come from the audio track, not from the sparse text track.
+        let text = plan(1, false, 1000, &[(2500, true)]);
+        let audio = plan(2, false, 1000, &[(500, true); 6]);
+        let plans = [&text, &audio];
+        let text_ids: std::collections::HashSet<u32> = [1].into_iter().collect();
+        let parts = compute_gop_partition(&plans, &text_ids);
+        assert_eq!(parts[1], vec![0..2, 2..4, 4..6], "audio drives 1 s buckets");
+        assert_eq!(parts[0], vec![0..1, 0..0, 0..0]);
+    }
+
+    #[test]
+    fn flat_mp4_carries_text_track_and_round_trips() {
+        use mp4_atom::{Codec, FourCC};
+        let ts = crate::reader::text_fixture::av_with_text("h264-opus-frag.mp4", 0);
+        let tid = ts.text_track_id;
+        let slices: Vec<&[u8]> = ts.ordered.iter().map(|(_, s)| s.as_slice()).collect();
+        let mut flat = Vec::new();
+        crate::present::write_flat_from_m4s(&ts.catalog, &slices, &mut flat).unwrap();
+
+        // The synthesized moov has a canonical WebVTT trak with populated
+        // tables whose co64 entries point at the verbatim text payloads.
+        let moov = read_moov(&mut Cursor::new(&flat)).unwrap();
+        assert_eq!(moov.trak.len(), 3);
+        assert_eq!(moov.mvhd.next_track_id, tid + 1);
+        let trak = moov
+            .trak
+            .iter()
+            .find(|t| t.tkhd.track_id == tid)
+            .expect("text trak missing");
+        assert_eq!(trak.mdia.hdlr.handler, FourCC::new(b"text"));
+        assert!(trak.mdia.minf.nmhd.is_some());
+        assert!(matches!(trak.mdia.minf.stbl.stsd.codecs[..], [Codec::Wvtt(_)]));
+        assert_eq!(trak.mdia.mdhd.timescale, 1000);
+        assert_eq!(trak.mdia.mdhd.language, "eng");
+        let total_ms: u64 = ts.text_durations.iter().map(|&d| d as u64).sum();
+        assert_eq!(trak.mdia.mdhd.duration, total_ms);
+        assert!(trak.mdia.minf.stbl.stss.is_none(), "text samples are all sync");
+        let co64 = &trak.mdia.minf.stbl.co64.as_ref().unwrap().entries;
+        assert_eq!(co64.len(), ts.text_payloads.len());
+        for (off, payload) in co64.iter().zip(&ts.text_payloads) {
+            let off = *off as usize;
+            assert_eq!(&flat[off..off + payload.len()], payload.as_slice());
+        }
+
+        // The envelope is the verbatim segment stream, text included.
+        let segs = crate::reader::unwrap(&flat).unwrap();
+        let joined: Vec<u8> = segs.iter().flat_map(|s| s.data.iter().copied()).collect();
+        assert_eq!(joined, ts.concat());
+
+        // Reading the flat MP4 back recovers the text rendition, and
+        // re-flattening reproduces the same bytes. That only holds if the
+        // re-derived GoP partition puts every clipped text sample back in
+        // the segment it came from.
+        let source = crate::read(&flat).unwrap();
+        assert_eq!(source.catalog.text, ts.catalog.text);
+        let mut again = Vec::new();
+        write(&source, &flat, &mut again).unwrap();
+        assert!(again == flat, "re-flattening a text-bearing flat MP4 must be byte-identical");
     }
 }

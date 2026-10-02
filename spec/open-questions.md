@@ -101,6 +101,14 @@ Options:
 
 Not urgent — current use case is always video+audio — but worth defining before audio-only ingest is supported.
 
+## Timed text (WebVTT)
+
+WebVTT text tracks are canonical (`canonical-form.md § Timed Text (WebVTT)`), but a few edges are not settled:
+
+1. **Reference-track rounding.** The text boundary is `floor(t_ref * 1000 / ts_ref)`. When a reference keyframe does not fall on a whole millisecond, the text boundary sits up to 1 ms before it. Players tolerate this, but a millisecond-aligned reference grid would remove the rounding entirely.
+2. **HLS delivery.** The native HLS emitter exposes text track metadata but does not generate subtitle playlists. Applications can serve plain `.vtt` renditions separately; generating those segments is a derived (non-canonical) presentation.
+3. **Cue timing boxes.** Clipped cues repeat in full on both sides of a GoP boundary and carry no `ctim`, so a consumer cannot recover a cue's original start time from one segment alone. If that matters, `ctim` could be made canonical (always present, or present only on clipped cues).
+
 ## Content hashing details
 
 When computing per-track content hashes for signing (by S2PA or any other system), the hash input is each track's moof+mdat bytes within a MUXL segment.

@@ -21,7 +21,7 @@
 //! }
 //! ```
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap};
 use std::io::Cursor;
 
 use mp4_atom::{Header, Moof, Moov, ReadAtom, ReadFrom};
@@ -30,7 +30,7 @@ use crate::catalog::Catalog;
 use crate::error::{Error, Result};
 use crate::fragment::{self, Frame};
 use crate::init::{build_init_segment, catalog_from_moov};
-use crate::segment::{GopSegment, TrackSamples, audio_only_boundary, flush_track_bufs, record_frame};
+use crate::segment::{GopSegment, StreamSegmenter};
 
 /// Events emitted by the push-based segmenter.
 pub enum SegmenterEvent {
@@ -67,21 +67,8 @@ enum State {
 
 struct StreamingState {
     moov: Moov,
-    catalog: Catalog,
-    video_track_ids: HashSet<u32>,
-    /// Per-track media timescale, used to compute segment duration_us.
-    track_timescales: BTreeMap<u32, u32>,
+    assembler: StreamSegmenter,
     track_state: HashMap<u32, fragment::TrackProgress>,
-    /// Per-track segment buffers, ordered by track_id.
-    track_bufs: BTreeMap<u32, Vec<u8>>,
-    /// Per-track accumulated duration in timescale ticks.
-    track_durations: BTreeMap<u32, u64>,
-    /// Per-track accumulated sample count.
-    track_sample_counts: BTreeMap<u32, u32>,
-    /// Per-track per-sample metadata (parallel arrays).
-    track_samples: BTreeMap<u32, TrackSamples>,
-    segment_number: u32,
-    seen_first_keyframe: bool,
     /// A parsed moof waiting for its following mdat.
     pending_moof: Option<PendingMoof>,
     /// Track-id remap (input id → output id), copied from the Segmenter.
@@ -146,19 +133,9 @@ impl Segmenter {
                         if !self.remap.is_empty() {
                             catalog.remap_track_ids(&self.remap);
                         }
+                        let assembler = StreamSegmenter::new(&catalog);
+                        let catalog = assembler.catalog().clone();
                         let init_data = build_init_segment(&catalog)?;
-
-                        let video_track_ids: HashSet<u32> =
-                            catalog.video_configs().map(|v| v.track_id()).collect();
-                        let track_timescales: BTreeMap<u32, u32> = catalog
-                            .video_configs()
-                            .map(|v| (v.track_id(), v.timescale()))
-                            .chain(
-                                catalog
-                                    .audio_configs()
-                                    .map(|a| (a.track_id(), a.timescale())),
-                            )
-                            .collect();
 
                         events.push(SegmenterEvent::InitSegment {
                             catalog: catalog.clone(),
@@ -167,16 +144,8 @@ impl Segmenter {
 
                         self.state = State::Streaming(StreamingState {
                             moov,
-                            catalog,
-                            video_track_ids,
-                            track_timescales,
+                            assembler,
                             track_state: HashMap::new(),
-                            track_bufs: BTreeMap::new(),
-                            track_durations: BTreeMap::new(),
-                            track_sample_counts: BTreeMap::new(),
-                            track_samples: BTreeMap::new(),
-                            segment_number: 0,
-                            seen_first_keyframe: false,
                             pending_moof: None,
                             remap: self.remap.clone(),
                         });
@@ -219,46 +188,10 @@ impl Segmenter {
                                 },
                             )?;
 
-                            // Accumulate into per-track buffers, splitting at video keyframes
                             for frame in frames {
-                                let is_video_keyframe =
-                                    ss.video_track_ids.contains(&frame.track_id) && frame.is_sync;
-
-                                // New segment at a video keyframe (after the
-                                // first), or a 1s span for audio-only streams.
-                                let boundary = if ss.video_track_ids.is_empty() {
-                                    audio_only_boundary(&ss.track_durations, &ss.track_timescales)
-                                } else {
-                                    is_video_keyframe && ss.seen_first_keyframe
-                                };
-
-                                if boundary {
-                                    ss.segment_number += 1;
-                                    if let Some(gop) = flush_track_bufs(
-                                        &mut ss.track_bufs,
-                                        &mut ss.track_durations,
-                                        &mut ss.track_sample_counts,
-                                        &mut ss.track_samples,
-                                        &ss.track_timescales,
-                                        &ss.video_track_ids,
-                                        &ss.catalog,
-                                        ss.segment_number,
-                                    )? {
-                                        events.push(SegmenterEvent::Segment(gop));
-                                    }
+                                for gop in ss.assembler.push_frame(&frame)? {
+                                    events.push(SegmenterEvent::Segment(gop));
                                 }
-
-                                if is_video_keyframe {
-                                    ss.seen_first_keyframe = true;
-                                }
-
-                                record_frame(
-                                    &frame,
-                                    &mut ss.track_bufs,
-                                    &mut ss.track_durations,
-                                    &mut ss.track_sample_counts,
-                                    &mut ss.track_samples,
-                                );
                             }
                         }
                         // Orphan mdat without moof — skip
@@ -278,17 +211,7 @@ impl Segmenter {
     pub fn flush(&mut self) -> Result<Vec<SegmenterEvent>> {
         let mut events = Vec::new();
         if let State::Streaming(ss) = &mut self.state {
-            ss.segment_number += 1;
-            if let Some(gop) = flush_track_bufs(
-                &mut ss.track_bufs,
-                &mut ss.track_durations,
-                &mut ss.track_sample_counts,
-                &mut ss.track_samples,
-                &ss.track_timescales,
-                &ss.video_track_ids,
-                &ss.catalog,
-                ss.segment_number,
-            )? {
+            for gop in ss.assembler.finish()? {
                 events.push(SegmenterEvent::Segment(gop));
             }
         }

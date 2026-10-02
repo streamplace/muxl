@@ -17,6 +17,7 @@ package muxl
 import (
 	"context"
 	"io"
+	"time"
 )
 
 // Engine is the MUXL/S2PA backend: canonical segmentation, S2PA signing and
@@ -182,7 +183,18 @@ type SignerInput struct {
 	TrackManifestFn   func() ([]byte, error)
 	WrapperManifest   []byte
 	WrapperManifestFn func() ([]byte, error)
-	Alg               string
+	// TextFn is called before each GoP with reference samples is signed and
+	// may block to wait for final captions. The reference is the lowest-ID
+	// catalog video track, or lowest-ID audio track if there is no video.
+	// Nil preserves the no-text path. Errors are nonfatal: previously declared
+	// tracks receive gap-only segments. Track IDs and language/label must
+	// remain fixed for the session. A GoP with no reference samples skips
+	// TextFn and SegmentTimeFn and attaches no text.
+	TextFn func(context.Context, TextRequest) (*TextAttachment, error)
+	// SegmentTimeFn supplies the media-start wall clock stamped into dc:date.
+	// Nil retains the ordinary signing-time stamp, byte-identically.
+	SegmentTimeFn func(startMs uint64) time.Time
+	Alg           string
 }
 
 // TranscodeInput is the signing bundle for [Engine.SignTranscode]. Exactly one
@@ -237,6 +249,8 @@ const TranscodeIngredientLabel = "muxl.source"
 // Event is one event from the muxl wasm's DRISL output stream. The wire format
 // is the Rust side's tagged union; fields not relevant to a given Type are
 // left zero. Type is "init", "segment", or "signed-segment".
+// SignSegment re-emits a complete Init snapshot before a newly declared text
+// track's first GoP; consumers must process subsequent Init updates.
 type Event struct {
 	Type   string `cbor:"type"`
 	Number uint32 `cbor:"number,omitempty"`
@@ -298,11 +312,12 @@ type TrackSamples struct {
 }
 
 // Catalog mirrors the Rust authoritative type; only the fields consumers need
-// are mirrored. A canonical segment's catalog is single-track (Video xor
-// Audio).
+// are mirrored. A canonical segment's catalog describes one video, audio, or
+// text track.
 type Catalog struct {
 	Video *CatalogVideo `cbor:"video,omitempty"`
 	Audio *CatalogAudio `cbor:"audio,omitempty"`
+	Text  *CatalogText  `cbor:"text,omitempty"`
 }
 
 // CatalogVideo holds the video renditions, keyed by rendition name.
@@ -314,6 +329,26 @@ type CatalogVideo struct {
 type CatalogAudio struct {
 	Renditions map[string]AudioConfig `cbor:"renditions"`
 }
+
+// CatalogText holds WebVTT renditions, keyed by rendition name.
+type CatalogText struct {
+	Renditions map[string]TextConfig `cbor:"renditions"`
+}
+
+// TextConfig is the WebVTT decoder configuration and player metadata.
+type TextConfig struct {
+	Codec     string    `cbor:"codec"`
+	Container Container `cbor:"container"`
+	Language  string    `cbor:"language"`
+	Label     string    `cbor:"label,omitempty"`
+	Config    string    `cbor:"config"`
+}
+
+// TrackID returns the configured CMAF track ID, or 0 for legacy.
+func (c TextConfig) TrackID() uint32 { return c.Container.TrackID }
+
+// Timescale returns the text timescale (canonical tracks use 1000).
+func (c TextConfig) Timescale() uint32 { return c.Container.Timescale }
 
 // VideoConfig is one video rendition's codec configuration.
 type VideoConfig struct {

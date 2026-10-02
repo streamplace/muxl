@@ -29,7 +29,9 @@ blake3 = "1"
 clap = { version = "4", features = ["derive"] }
 dasl = "0.2"
 hex = "0.4"
-mp4-atom = { git = "https://github.com/streamplace/mp4-atom.git", branch = "streamplace" }
+# streamplace/mp4-atom's `streamplace` branch plus the `elng` box (BCP 47
+# track languages); switch back to `branch = "streamplace"` once it merges.
+mp4-atom = { git = "https://github.com/streamplace/mp4-atom.git", rev = "2310bbe4224ecf395b99618e3368964fd4b2d409" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_bytes = "0.11"

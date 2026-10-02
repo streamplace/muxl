@@ -247,6 +247,12 @@ unsafe extern "C" {
     /// streaming signer reflects mid-stream manifest updates (e.g. a
     /// livestream-record transition from pre-live to live).
     fn host_get_manifest(kind: u32, out_ptr: u32, out_max: u32) -> u32;
+    /// JSON TextAttachment for this media span. Zero means no new text;
+    /// u32::MAX means failure (continue with empty declared tracks).
+    /// Size probes must return the same cached attachment on retry.
+    fn host_get_text(start_ms: u64, end_ms: u64, out_ptr: u32, out_max: u32) -> u32;
+    /// UTC Unix milliseconds for the media start, or i64::MIN for signing time.
+    fn host_get_segment_time(start_ms: u64) -> i64;
 }
 
 #[cfg(not(target_family = "wasm"))]
@@ -257,6 +263,21 @@ unsafe fn host_sign(_: u32, _: u32, _: u32, _: u32) -> u32 {
 #[cfg(not(target_family = "wasm"))]
 unsafe fn host_get_manifest(_: u32, _: u32, _: u32) -> u32 {
     u32::MAX
+}
+
+#[cfg(not(target_family = "wasm"))]
+unsafe fn host_get_text(_: u64, _: u64, _: u32, _: u32) -> u32 { 0 }
+
+#[cfg(not(target_family = "wasm"))]
+unsafe fn host_get_segment_time(_: u64) -> i64 { i64::MIN }
+
+fn host_text(req: muxl::text::TextRequest) -> muxl::text::TextAttachment {
+    let n = unsafe { host_get_text(req.start_ms, req.end_ms, 0, 0) };
+    if n == 0 || n == u32::MAX || n as usize > HOST_MANIFEST_MAX_LEN { return Default::default(); }
+    let mut buf = vec![0; n as usize];
+    let n = unsafe { host_get_text(req.start_ms, req.end_ms, buf.as_mut_ptr() as u32, buf.len() as u32) };
+    if n == u32::MAX || n as usize > buf.len() { return Default::default(); }
+    serde_json::from_slice(&buf[..n as usize]).unwrap_or_default()
 }
 
 /// Pre-allocated buffer for the host's signature. Sized for the largest
@@ -351,7 +372,7 @@ pub fn sign_segment_stream<R: Read, W: Write>(
     let mut fetch_track = move || -> Result<serde_json::Value> { Ok(segment_base.clone()) };
     let wrapper = wrapper_manifest.to_owned();
     let mut fetch_wrapper = move || -> Result<String> { Ok(wrapper.clone()) };
-    sign_segment_stream_with(input, output, signer, &mut fetch_track, &mut fetch_wrapper)
+    sign_segment_stream_with(input, output, signer, &mut fetch_track, &mut fetch_wrapper, None)
 }
 
 /// Stream-sign an fMP4 source like [`sign_segment_stream`], but fetch a fresh
@@ -379,7 +400,7 @@ pub fn sign_segment_stream_host<R: Read, W: Write>(
             Error::C2pa(c2pa::Error::BadParam(format!("host wrapper manifest: {e}")))
         })
     };
-    sign_segment_stream_with(input, output, signer, &mut fetch_track, &mut fetch_wrapper)
+    sign_segment_stream_with(input, output, signer, &mut fetch_track, &mut fetch_wrapper, Some(&mut host_text))
 }
 
 /// Shared streaming-sign loop. `next_track` and `next_wrapper` are invoked
@@ -391,11 +412,14 @@ fn sign_segment_stream_with<R: Read, W: Write>(
     signer: &SignerKey,
     next_track: &mut dyn FnMut() -> Result<serde_json::Value>,
     next_wrapper: &mut dyn FnMut() -> Result<String>,
+    mut text_fn: Option<&mut dyn FnMut(muxl::text::TextRequest) -> muxl::text::TextAttachment>,
 ) -> Result<()> {
     init_default_settings();
     let c2pa_signer = signer.build()?;
     let mut segmenter = Segmenter::new();
     let mut init_seen = false;
+    let mut catalog = muxl::catalog::Catalog::default();
+    let mut text = muxl::text::StreamingText::default();
     let mut buf = [0u8; 64 * 1024];
 
     loop {
@@ -410,6 +434,9 @@ fn sign_segment_stream_with<R: Read, W: Write>(
                 signer,
                 next_track,
                 next_wrapper,
+                &mut catalog,
+                &mut text,
+                &mut text_fn,
                 output,
                 &*c2pa_signer,
             )?;
@@ -422,6 +449,9 @@ fn sign_segment_stream_with<R: Read, W: Write>(
             signer,
             next_track,
             next_wrapper,
+            &mut catalog,
+            &mut text,
+            &mut text_fn,
             output,
             &*c2pa_signer,
         )?;
@@ -505,43 +535,48 @@ fn civil_from_days(z: i64) -> (i64, u32, u32) {
     (if m <= 2 { y + 1 } else { y }, m, d)
 }
 
+/// Emit the complete initialization snapshot, including late text tracks.
+/// Per-track init segments are best-effort, as before: a catalog they can't
+/// be built from leaves them out rather than stopping a live signer.
+fn write_init_event<W: Write>(
+    output: &mut W,
+    catalog: &muxl::catalog::Catalog,
+    data: Vec<u8>,
+) -> Result<()> {
+    let track_inits = muxl::init::build_track_init_segments(catalog)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|(tid, bytes)| (tid.to_string(), muxl::cbor::ByteString(bytes)))
+        .collect();
+    let event = SignedEvent::Init {
+        data,
+        catalog: Some(catalog.clone()),
+        track_inits,
+    };
+    dasl::drisl::to_writer(&mut *output, &event).map_err(|e| {
+        Error::Io(std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))
+    })?;
+    output.flush()?;
+    Ok(())
+}
+
 fn handle_event<W: Write>(
     event: SegmenterEvent,
     init_seen: &mut bool,
     _signer: &SignerKey,
     next_track: &mut dyn FnMut() -> Result<serde_json::Value>,
     _next_wrapper: &mut dyn FnMut() -> Result<String>,
+    catalog_state: &mut muxl::catalog::Catalog,
+    text: &mut muxl::text::StreamingText,
+    text_fn: &mut Option<&mut dyn FnMut(muxl::text::TextRequest) -> muxl::text::TextAttachment>,
     output: &mut W,
     c2pa_signer: &dyn C2paSigner,
 ) -> Result<()> {
-    use muxl::cbor::{ByteString, CborEvent};
     match event {
         SegmenterEvent::InitSegment { catalog, data } => {
             *init_seen = true;
-            // Build an Init event with the catalog + per-track init segments
-            // so downstream consumers (Streamplace) have everything they need
-            // to derive HLS playback artifacts without re-parsing.
-            let track_inits: std::collections::BTreeMap<String, ByteString> =
-                muxl::init::build_track_init_segments(&catalog)
-                    .unwrap_or_default()
-                    .into_iter()
-                    .map(|(tid, bytes)| (tid.to_string(), ByteString(bytes)))
-                    .collect();
-            let event = SignedEvent::Init {
-                data,
-                catalog: Some(catalog),
-                track_inits,
-            };
-            // Drop the auto-generated `Init` case from CborEvent — we re-emit
-            // through SignedEvent ourselves so the wire type tag matches.
-            let _ = CborEvent::from_event;
-            dasl::drisl::to_writer(&mut *output, &event).map_err(|e| {
-                Error::Io(std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    e.to_string(),
-                ))
-            })?;
-            output.flush()?;
+            *catalog_state = catalog;
+            write_init_event(output, catalog_state, data)?;
         }
         SegmenterEvent::Segment(mut gop) => {
             if !*init_seen {
@@ -559,7 +594,22 @@ fn handle_event<W: Write>(
             // bytes and shifts per-sample offsets past the leading c2pa-uuid
             // prefix.
             let segment_base = next_track()?;
-            let segment_manifest = stamp_segment_manifest(&segment_base, &now_rfc3339_utc());
+            let mut segment_when = None;
+            if let Some(fetch) = text_fn.as_deref_mut() {
+                if let Some(req) = muxl::text::StreamingText::request(catalog_state, &gop)? {
+                    text.attach(&mut gop, req, fetch(req))?;
+                    if text.update_catalog(catalog_state) {
+                        if let Ok(data) = muxl::init::build_init_segment(catalog_state) {
+                            write_init_event(output, catalog_state, data)?;
+                        }
+                    }
+                    let millis = unsafe { host_get_segment_time(req.start_ms) };
+                    if millis != i64::MIN {
+                        segment_when = Some(rfc3339_from_unix(millis.div_euclid(1000), millis.rem_euclid(1000) as u32));
+                    }
+                }
+            }
+            let segment_manifest = stamp_segment_manifest(&segment_base, &segment_when.unwrap_or_else(now_rfc3339_utc));
             let prefix_size = sign_gop_canonical_segments_in_place(
                 &mut gop,
                 &segment_manifest,
@@ -627,6 +677,60 @@ fn sign_gop_canonical_segments_in_place(
     }
     gop.body_size += (prefix_size as u64) * (gop.tracks.len() as u64);
     Ok(prefix_size)
+}
+
+/// Mint and sign standalone WebVTT runs for a known GoP span, without AV bytes.
+pub(crate) fn sign_text_runs(
+    req: muxl::text::TextRequest,
+    tracks: Vec<muxl::text::TextTrackAttachment>,
+    signer: &SignerKey,
+    manifest: Option<&str>,
+) -> Result<std::collections::BTreeMap<u32, Vec<u8>>> {
+    use std::collections::BTreeMap;
+    let invalid = |message: &str| Error::Muxl(muxl::Error::InvalidMp4(message.into()));
+    if req.end_ms <= req.start_ms {
+        return Err(invalid("text range must have positive duration"));
+    }
+    let mut configs = BTreeMap::new();
+    for track in tracks {
+        let id = track.track_id;
+        if id == 0 || configs.contains_key(&id) {
+            return Err(invalid("text track id must be nonzero and unique"));
+        }
+        configs.insert(id, track.into_config_and_cues());
+    }
+    let mut signed_text = BTreeMap::new();
+    if configs.is_empty() {
+        return Ok(signed_text);
+    }
+    let host_manifest;
+    let base = match manifest {
+        Some(json) => json,
+        None => {
+            host_manifest = host_get_manifest_callback(0)
+                .map_err(|e| invalid(&format!("host track manifest: {e}")))?;
+            &host_manifest
+        }
+    };
+    let base: serde_json::Value = serde_json::from_str(base)
+        .map_err(|e| invalid(&format!("segment manifest JSON: {e}")))?;
+    let millis = unsafe { host_get_segment_time(req.start_ms) };
+    let when = if millis == i64::MIN {
+        now_rfc3339_utc()
+    } else {
+        rfc3339_from_unix(
+            millis.div_euclid(1000),
+            millis.rem_euclid(1000) as u32,
+        )
+    };
+    let manifest = stamp_segment_manifest(&base, &when);
+    init_default_settings();
+    let signer = signer.build()?;
+    for (id, (config, cues)) in configs {
+        let (run, _) = muxl::text::mint_track(&config, &cues, req)?;
+        signed_text.insert(id, sign_buf_as(&run, &manifest, &*signer, "m4s")?);
+    }
+    Ok(signed_text)
 }
 
 /// Sign a single in-memory MP4 buffer with a given manifest.
@@ -791,5 +895,129 @@ mod tests {
             serde_json::from_str(&stamp_segment_manifest(&base, "1970-01-01T00:00:00.000Z")).unwrap();
         assert_eq!(out["assertions"].as_array().unwrap().len(), 1);
         assert_eq!(out["assertions"][0]["label"], "cawg.metadata");
+    }
+
+    #[test]
+    fn text_segments_sign_and_verify_like_av() {
+        // A WebVTT canonical segment goes through the same per-GoP signer as
+        // the AV segments of that GoP: same manifest, same c2pa prefix size
+        // (the signer requires it to be constant across tracks), canonical
+        // bytes preserved verbatim, and the hash covers the text payload.
+        init_default_settings();
+        let (av, mut gop) = test_segments::first_gop("samples/fixtures/h264-opus-frag.mp4");
+        let tid = gop.tracks.keys().max().unwrap() + 1;
+        let catalog = test_segments::with_text(&av, tid);
+        let text = test_segments::text_segment(&catalog, tid, "hello");
+        gop.tracks.insert(tid, text.clone());
+        let unsigned = gop.tracks.clone();
+
+        let signer = test_segments::signer().build().unwrap();
+        let manifest = stamp_segment_manifest(
+            &json!({
+                "title": "text signing test",
+                "assertions": [
+                    { "label": "c2pa.actions",
+                      "data": { "actions": [{ "action": "c2pa.created" }] } }
+                ]
+            }),
+            "2020-02-29T00:00:00.000Z",
+        );
+        let prefix = sign_gop_canonical_segments_in_place(&mut gop, &manifest, &*signer).unwrap();
+        assert!(prefix > 0);
+
+        let mut stream = Vec::new();
+        for (t, signed) in &gop.tracks {
+            assert_eq!(&signed[prefix..], unsigned[t].as_slice(), "track {t} bytes verbatim");
+            stream.extend_from_slice(signed);
+        }
+
+        let v: serde_json::Value =
+            serde_json::from_str(&crate::verify::verify_segments(&stream).unwrap()).unwrap();
+        let segs = v["segments"].as_array().unwrap();
+        assert_eq!(segs.len(), unsigned.len());
+        assert_eq!(segs.last().unwrap()["track_id"], tid);
+        for seg in segs {
+            assert_ne!(seg["validation_state"].as_str(), Some("Invalid"), "{seg}");
+        }
+
+        // Tampering with the cue text (the final bytes of the stream) breaks
+        // only the text segment's signature.
+        let n = stream.len();
+        stream[n - 1] ^= 0xff;
+        let v: serde_json::Value =
+            serde_json::from_str(&crate::verify::verify_segments(&stream).unwrap()).unwrap();
+        let segs = v["segments"].as_array().unwrap();
+        assert_eq!(segs.last().unwrap()["validation_state"].as_str(), Some("Invalid"));
+        for seg in &segs[..segs.len() - 1] {
+            assert_ne!(seg["validation_state"].as_str(), Some("Invalid"), "{seg}");
+        }
+    }
+}
+
+/// Canonical segments for signing, verification, and inspection tests: a real
+/// AV GoP plus a canonical WebVTT segment.
+#[cfg(test)]
+pub(crate) mod test_segments {
+    use std::io::Cursor;
+    use std::path::PathBuf;
+
+    use muxl::catalog::{Catalog, Container, TextConfig};
+
+    use super::SignerKey;
+
+    pub fn repo_path(rel: &str) -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..").join(rel)
+    }
+
+    /// The fixture's catalog and its first GoP of unsigned canonical segments.
+    pub fn first_gop(fixture: &str) -> (Catalog, muxl::GopSegment) {
+        let data = std::fs::read(repo_path(fixture)).expect("read fixture");
+        let mut first = None;
+        let catalog = muxl::segment_fmp4(&mut Cursor::new(&data), |g| {
+            if first.is_none() {
+                first = Some(g);
+            }
+            Ok(())
+        })
+        .expect("segment fixture");
+        (catalog, first.expect("fixture has a GoP"))
+    }
+
+    /// `av` plus a WebVTT rendition on `track_id`.
+    pub fn with_text(av: &Catalog, track_id: u32) -> Catalog {
+        let mut c = av.clone();
+        c.insert_text(
+            format!("text{track_id}"),
+            TextConfig {
+                codec: "wvtt".into(),
+                container: Container::cmaf(1000, track_id),
+                language: "en".into(),
+                label: Some("captions".into()),
+                config: "WEBVTT".into(),
+            },
+        );
+        c
+    }
+
+    /// An unsigned canonical WebVTT segment: the MUXL uuid (single-track text
+    /// catalog), then one canonical moof+mdat whose sample is a single cue.
+    pub fn text_segment(catalog: &Catalog, track_id: u32, cue: &str) -> Vec<u8> {
+        let config = catalog.text_configs().find(|c| c.track_id() == track_id).unwrap();
+        muxl::text::build_track(config, &[muxl::text::Cue {
+            start: 0,
+            end: 1000,
+            text: cue.into(),
+            id: None,
+            settings: None,
+        }], 0, 1000).unwrap()
+    }
+
+    pub fn signer() -> SignerKey {
+        SignerKey::from_pem_files(
+            repo_path("samples/test-keys/es256k-cert.pem"),
+            repo_path("samples/test-keys/es256k-key.pem"),
+            c2pa::SigningAlg::Es256K,
+        )
+        .expect("load test signer")
     }
 }

@@ -26,19 +26,20 @@ test: build
     cargo test --workspace
 
 # Generate synthetic test fixtures (requires ffmpeg)
+# Fixtures are checked in; regeneration is explicit, not a test prerequisite.
 fixtures:
     bash scripts/generate-test-fixtures.sh
 
 # Canonicalize a single file
 canonicalize input output:
-    cargo run --quiet -- canonicalize {{input}} {{output}}
+    cargo run --quiet -- segment {{input}} --flat {{output}}
 
 # Fragment a file into per-frame CMAF
 fragment input output_dir:
     cargo run --quiet -- fragment {{input}} {{output_dir}}
 
 # Test canonicalization on all fixture files that we expect to work
-test-canon: build fixtures
+test-canon: build
     #!/usr/bin/env bash
     set -euo pipefail
     pass=0; fail=0; skip=0
@@ -54,7 +55,7 @@ test-canon: build fixtures
                 continue
                 ;;
         esac
-        if cargo run --quiet -- canonicalize "$f" "$tmpdir/$name" 2>/dev/null; then
+        if cargo run --quiet -- segment "$f" --flat "$tmpdir/$name" 2>/dev/null; then
             echo "OK   $name"
             pass=$((pass + 1))
         else
@@ -67,7 +68,7 @@ test-canon: build fixtures
     [ "$fail" -eq 0 ]
 
 # Test that canonicalization is idempotent (running twice gives identical bytes)
-test-idempotent: build fixtures
+test-idempotent: build
     #!/usr/bin/env bash
     set -euo pipefail
     pass=0; fail=0; skip=0
@@ -81,10 +82,10 @@ test-idempotent: build fixtures
                 continue
                 ;;
         esac
-        if ! cargo run --quiet -- canonicalize "$f" "$tmpdir/pass1-$name" 2>/dev/null; then
+        if ! cargo run --quiet -- segment "$f" --flat "$tmpdir/pass1-$name" 2>/dev/null; then
             continue
         fi
-        if ! cargo run --quiet -- canonicalize "$tmpdir/pass1-$name" "$tmpdir/pass2-$name" 2>/dev/null; then
+        if ! cargo run --quiet -- segment "$tmpdir/pass1-$name" --flat "$tmpdir/pass2-$name" 2>/dev/null; then
             echo "FAIL $name (2nd pass errored)"
             fail=$((fail + 1))
             continue
@@ -109,8 +110,8 @@ test-sample: build
     set -euo pipefail
     tmpdir=$(mktemp -d)
     trap "rm -rf $tmpdir" EXIT
-    cargo run --quiet -- canonicalize samples/file.mp4 "$tmpdir/pass1.mp4"
-    cargo run --quiet -- canonicalize "$tmpdir/pass1.mp4" "$tmpdir/pass2.mp4"
+    cargo run --quiet -- segment samples/file.mp4 --flat "$tmpdir/pass1.mp4"
+    cargo run --quiet -- segment "$tmpdir/pass1.mp4" --flat "$tmpdir/pass2.mp4"
     h1=$(sha256sum "$tmpdir/pass1.mp4" | cut -d' ' -f1)
     h2=$(sha256sum "$tmpdir/pass2.mp4" | cut -d' ' -f1)
     if [ "$h1" = "$h2" ]; then

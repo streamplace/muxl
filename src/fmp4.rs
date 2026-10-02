@@ -82,6 +82,16 @@ pub fn write<R: ReadAt + ?Sized, W: Write>(
     input: &R,
     output: &mut W,
 ) -> Result<Vec<crate::hls::BlobTrack>> {
+    if source.catalog.text.is_some() {
+        let (normalized, text_input) = crate::source::normalize_text(source, input)?;
+        return write_prepared(&normalized, &text_input, output);
+    }
+    write_prepared(source, input, output)
+}
+
+fn write_prepared<R: ReadAt + ?Sized, W: Write>(
+    source: &Source, input: &R, output: &mut W,
+) -> Result<Vec<crate::hls::BlobTrack>> {
     use crate::cid;
     use crate::flat::{plan_canonical_body, write_canonical_body};
     use crate::hls::BlobTrack;
@@ -110,35 +120,23 @@ pub fn write<R: ReadAt + ?Sized, W: Write>(
         let init_data = track_inits.get(&tid).cloned().unwrap_or_default();
         let init_cid = cid::from_bytes(&init_data);
 
-        let (track_type, codec, width, height, channels, sample_rate): (
-            &str,
-            String,
-            u32,
-            u32,
-            u32,
-            u32,
-        ) = if let Some(v) = catalog.video_configs().find(|v| v.track_id() == tid) {
-            ("video", v.codec.clone(), v.coded_width, v.coded_height, 0, 0)
-        } else if let Some(a) = catalog.audio_configs().find(|a| a.track_id() == tid) {
-            ("audio", a.codec.clone(), 0, 0, a.number_of_channels, a.sample_rate)
-        } else {
-            ("unknown", String::new(), 0, 0, 0, 0)
-        };
-
+        let summary = crate::hls::track_summary(&catalog, tid);
         tracks.push(BlobTrack {
             track_id: tid,
-            track_type: track_type.to_string(),
-            codec,
+            track_type: summary.track_type.to_string(),
+            codec: summary.codec,
             timescale: ts,
             init_cid,
             init_data,
             blob_cid: String::new(), // HLS caller fills after hashing
             blob_size: 0,
             segments,
-            width,
-            height,
-            channels,
-            sample_rate,
+            width: summary.width,
+            height: summary.height,
+            channels: summary.channels,
+            sample_rate: summary.sample_rate,
+            language: summary.language,
+            label: summary.label,
         });
     }
 

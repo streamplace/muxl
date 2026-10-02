@@ -5,14 +5,19 @@
 //! track_id ascending. This enables per-track byte-range addressing in
 //! MUXL fMP4 files (for HLS playlists) and per-track content hashing.
 //!
-//! Spec: architecture.md § MUXL Segment
+//! Timed-text (WebVTT) tracks never open a segment. Each GoP carries one
+//! canonical text segment per text track, re-minted from the cues active in
+//! the GoP's span (see [`StreamSegmenter`]).
+//!
+//! Spec: architecture.md § MUXL Segment, canonical-form.md § Timed Text
+//! (WebVTT) → Segmentation
 
 use std::collections::{BTreeMap, HashSet};
 use std::io::Read;
 
-use crate::catalog::{Catalog, to_drisl};
-use crate::error::Result;
-use crate::fragment::FMP4Reader;
+use crate::catalog::{Catalog, Container, to_drisl};
+use crate::error::{Error, Result};
+use crate::fragment::{FMP4Reader, Frame, FrameInfo, TrackProgress, write_frame_fragment};
 
 /// The MUXL canonical-segment UUID identifier
 /// (`e6404ea2-8f01-4305-98da-7bec3c2a9173`). Every canonical segment
@@ -75,6 +80,9 @@ pub struct GopSegment {
     /// segment range begins mid-stream; carried so downstream consumers can
     /// re-anchor any sub-range to presentation zero.
     pub first_decode_times: BTreeMap<u32, u64>,
+    /// Actual reference cut boundary in milliseconds (next keyframe, or
+    /// final reference sample end on flush), including decode-time gaps.
+    pub reference_end_ms: Option<u64>,
     /// Total body bytes this segment contributes when concatenated into a
     /// flat MP4 (sum of `tracks` values' lengths). Used by downstream
     /// consumers to compute cumulative byte offsets in the synth flat MP4
@@ -131,86 +139,438 @@ pub fn segment_fmp4_with_remap<R: Read>(
     mut on_gop: impl FnMut(GopSegment) -> Result<()>,
 ) -> Result<Catalog> {
     let mut fmp4 = FMP4Reader::with_remap(reader, remap)?;
-    let catalog = fmp4.catalog().clone();
-
-    // Determine which track IDs are video (for keyframe detection)
-    let video_track_ids: HashSet<u32> = catalog.video_configs().map(|v| v.track_id()).collect();
-    // Per-track timescales, used to compute segment duration_us.
-    let track_timescales: BTreeMap<u32, u32> = catalog
-        .video_configs()
-        .map(|v| (v.track_id(), v.timescale()))
-        .chain(
-            catalog
-                .audio_configs()
-                .map(|a| (a.track_id(), a.timescale())),
-        )
-        .collect();
-
-    // Per-track buffers, ordered by track_id
-    let mut track_bufs: BTreeMap<u32, Vec<u8>> = BTreeMap::new();
-    let mut track_durations: BTreeMap<u32, u64> = BTreeMap::new();
-    let mut track_sample_counts: BTreeMap<u32, u32> = BTreeMap::new();
-    let mut track_samples: BTreeMap<u32, TrackSamples> = BTreeMap::new();
-    let has_video = !video_track_ids.is_empty();
-    let mut segment_number: u32 = 0;
-    let mut seen_first_keyframe = false;
+    let mut segmenter = StreamSegmenter::new(fmp4.catalog());
 
     while let Some(frame) = fmp4.next_frame()? {
-        let is_video_keyframe = video_track_ids.contains(&frame.track_id) && frame.is_sync;
+        for gop in segmenter.push_frame(&frame)? {
+            on_gop(gop)?;
+        }
+    }
+    for gop in segmenter.finish()? {
+        on_gop(gop)?;
+    }
+
+    Ok(segmenter.catalog().clone())
+}
+
+// ---------------------------------------------------------------------------
+// Timed text (WebVTT)
+// ---------------------------------------------------------------------------
+
+/// Media timescale of every canonical timed-text track: 1000 Hz, so one
+/// tick is one millisecond, the precision of WebVTT cue times. Spec:
+/// `canonical-form.md § Timed Text (WebVTT) → Catalog`.
+pub const TEXT_TIMESCALE: u32 = 1000;
+
+/// Text-only streams (no video or audio track) are cut into GoPs of this
+/// many milliseconds, measured from the first text track's first sample.
+/// Mirrors the 1-second audio-only rule. Spec: `open-questions.md § Timed
+/// text (WebVTT)` (text-only streams).
+pub(crate) const TEXT_ONLY_GOP_MS: u64 = 1000;
+
+/// Whether a canonical text segment numbers its fragments from 1 in every
+/// GoP (`true`) or continues its track's fragment count across GoPs like
+/// video and audio (`false`). Per-GoP numbering makes a text segment a pure
+/// function of its cues and its GoP span, so a producer can mint it with no
+/// stream context (`text::build_track`). Every text minting path (the
+/// streaming segmenter here and `flat::write_canonical_body`) reads this one
+/// switch so they always agree.
+pub(crate) const TEXT_SEQUENCE_RESETS_PER_GOP: bool = true;
+
+/// Rewrite every text rendition to the canonical [`TEXT_TIMESCALE`]. Input
+/// text tracks may use any timescale; their samples are rescaled to
+/// milliseconds when they are normalized.
+pub(crate) fn normalize_text_catalog(catalog: &mut Catalog) {
+    for t in catalog.text_configs_mut() {
+        if let Container::Cmaf { track_id, .. } = t.container {
+            t.container = Container::cmaf(TEXT_TIMESCALE, track_id);
+        }
+    }
+}
+
+/// `floor(ticks * 1000 / timescale)`: a time in `timescale` ticks as whole
+/// milliseconds. This is the canonical conversion for text boundaries
+/// (`floor(t_ref * 1000 / ts_ref)`) and for rescaling input text samples.
+/// A zero timescale (a Legacy container) is taken to already be in ms.
+pub(crate) fn ticks_to_ms(ticks: u64, timescale: u32) -> u64 {
+    if timescale == 0 {
+        return ticks;
+    }
+    ((ticks as u128) * TEXT_TIMESCALE as u128 / timescale as u128) as u64
+}
+
+/// Canonical text samples for one GoP span `[start, end)` (ms): the cues
+/// in `cues` clipped to the span, split into disjoint samples, and padded
+/// with `vtte`. `cues` may hold cues that do not overlap the span; they
+/// contribute nothing. Verifies the samples tile the span exactly, which
+/// every downstream table (tfdt, stts, co64) relies on.
+pub(crate) fn text_span_samples(
+    cues: &[crate::text::Cue],
+    start: u64,
+    end: u64,
+) -> Result<Vec<crate::text::TextSample>> {
+    if end <= start {
+        return Ok(Vec::new());
+    }
+    let samples = crate::text::canonical_samples(cues, start, end)?;
+    let mut t = start;
+    for s in &samples {
+        if s.start != t || s.duration == 0 {
+            return Err(Error::InvalidMp4(format!(
+                "text samples for [{start}, {end}) do not tile: sample at {} (+{}) expected at {t}",
+                s.start, s.duration
+            )));
+        }
+        t += s.duration as u64;
+    }
+    if t != end {
+        return Err(Error::InvalidMp4(format!(
+            "text samples for [{start}, {end}) end at {t}"
+        )));
+    }
+    Ok(samples)
+}
+
+/// Mint one canonical text segment: the track's uuid prefix followed by one
+/// sync `moof+mdat` per sample (`trun` flags `0x02000000`, no composition
+/// offset). `samples` must tile the GoP span (see [`text_span_samples`]);
+/// the first sample's start becomes the first `tfdt`. Returns the segment
+/// bytes and its per-sample metadata, with offsets relative to the segment
+/// start (uuid prefix included), matching [`GopSegment::samples`].
+pub(crate) fn mint_text_segment(
+    catalog: &Catalog,
+    track_id: u32,
+    progress: &mut TrackProgress,
+    samples: &[crate::text::TextSample],
+) -> Result<(Vec<u8>, TrackSamples)> {
+    let mut out = mint_canonical_segment_prefix(catalog, track_id)?;
+    let mut meta = TrackSamples::default();
+    if TEXT_SEQUENCE_RESETS_PER_GOP {
+        progress.restart_sequence();
+    }
+    if let Some(first) = samples.first() {
+        progress.set_decode_time(first.start);
+    }
+    for (i, sample) in samples.iter().enumerate() {
+        let frame = FrameInfo {
+            duration: sample.duration,
+            size: sample.data.len() as u32,
+            is_sync: true,
+            cts_offset: 0,
+        };
+        write_frame_fragment(&mut out, track_id, progress, &frame, &sample.data)?;
+        meta.durations.push(sample.duration);
+        meta.sizes.push(frame.size);
+        meta.cts_offsets.push(0);
+        meta.sync_indices.push(i as u32 + 1);
+        meta.offsets_in_track.push((out.len() - sample.data.len()) as u64);
+    }
+    Ok((out, meta))
+}
+
+/// Per-text-track state of the streaming segmenter.
+struct TextTrackState {
+    /// Timescale of the input track. Samples are rescaled to ms on ingest.
+    input_timescale: u32,
+    /// Cues received but not yet fully emitted. A cue stays here until a
+    /// flushed GoP ends at or after its end, so a cue that crosses one or
+    /// more GoP boundaries is clipped into every GoP it overlaps.
+    pending: Vec<crate::text::Cue>,
+    /// Decode clock + fragment counter for minting.
+    progress: TrackProgress,
+    /// End (ms) of the latest input sample seen on this track.
+    input_end_ms: Option<u64>,
+}
+
+/// Streaming GoP assembler shared by [`segment_fmp4`] and
+/// [`crate::push::Segmenter`]: feed it per-frame fragments in stream order
+/// and it returns each GoP as soon as the next one opens.
+///
+/// Video and audio frames are buffered verbatim and cut exactly as before
+/// text support: at video keyframes, or at 1-second spans for audio-only
+/// streams. Text never drives a cut and never contributes to
+/// `duration_us` while the GoP has a video or audio track.
+///
+/// Text frames are decoded into cues. When a GoP closes at reference time
+/// `t_ref` the text span ends at `floor(t_ref * 1000 / ts_ref)` (ms), and each
+/// text track gets one canonical segment covering the span exactly. It uses
+/// the cues received so far, clipped to the span and padded with `vtte`.
+/// Cues that run past the span stay pending for the next GoP. A cue that
+/// arrives after its GoP has already been emitted only contributes the part
+/// that is still in the future. Canonical interleaving (every track's GoP
+/// `n` segment before any GoP `n + 1` keyframe) never hits that case, so
+/// re-segmenting canonical output reproduces its text segments
+/// byte-for-byte.
+///
+/// The first GoP's text span starts at the reference track's first
+/// sample. The reference track is the first video track, else the first
+/// audio track. The final GoP's span ends where the reference track ends.
+/// Text-only streams are cut every [`TEXT_ONLY_GOP_MS`] from the first text
+/// track's first sample, and end where that track's samples end.
+pub(crate) struct StreamSegmenter {
+    /// Output catalog: the input catalog with text tracks at 1000 Hz.
+    catalog: Catalog,
+    video_track_ids: HashSet<u32>,
+    /// Video/audio track timescales. Text is deliberately absent so it can
+    /// never drive the audio-only boundary or `duration_us`.
+    av_timescales: BTreeMap<u32, u32>,
+    /// Video/audio reference track that anchors the text timeline.
+    reference: Option<u32>,
+    /// Text tracks by id.
+    text: BTreeMap<u32, TextTrackState>,
+    /// Text-only stream: the text track that anchors the 1-second GoPs.
+    text_reference: Option<u32>,
+    track_bufs: BTreeMap<u32, Vec<u8>>,
+    track_durations: BTreeMap<u32, u64>,
+    track_sample_counts: BTreeMap<u32, u32>,
+    track_samples: BTreeMap<u32, TrackSamples>,
+    /// Per video/audio track: decode time just past the last recorded frame.
+    av_next_decode: BTreeMap<u32, u64>,
+    /// Start (ms) of the open GoP's text span; `None` until known.
+    text_gop_start: Option<u64>,
+    segment_number: u32,
+    seen_first_keyframe: bool,
+}
+
+impl StreamSegmenter {
+    /// Build from the catalog the input's init segment describes (after any
+    /// track-id remap). Text renditions keep their input timescale there;
+    /// [`StreamSegmenter::catalog`] reports them at 1000 Hz.
+    pub(crate) fn new(input_catalog: &Catalog) -> Self {
+        let mut catalog = input_catalog.clone();
+        normalize_text_catalog(&mut catalog);
+
+        let video_track_ids: HashSet<u32> =
+            catalog.video_configs().map(|v| v.track_id()).collect();
+        let av_timescales: BTreeMap<u32, u32> = catalog
+            .video_configs()
+            .map(|v| (v.track_id(), v.timescale()))
+            .chain(catalog.audio_configs().map(|a| (a.track_id(), a.timescale())))
+            .collect();
+        let reference = catalog
+            .video_configs()
+            .map(|v| v.track_id())
+            .min()
+            .or_else(|| catalog.audio_configs().map(|a| a.track_id()).min());
+        let text: BTreeMap<u32, TextTrackState> = input_catalog
+            .text_configs()
+            .map(|t| {
+                (
+                    t.track_id(),
+                    TextTrackState {
+                        input_timescale: t.timescale(),
+                        pending: Vec::new(),
+                        progress: TrackProgress::default(),
+                        input_end_ms: None,
+                    },
+                )
+            })
+            .collect();
+        let text_reference = if av_timescales.is_empty() {
+            text.keys().next().copied()
+        } else {
+            None
+        };
+
+        StreamSegmenter {
+            catalog,
+            video_track_ids,
+            av_timescales,
+            reference,
+            text,
+            text_reference,
+            track_bufs: BTreeMap::new(),
+            track_durations: BTreeMap::new(),
+            track_sample_counts: BTreeMap::new(),
+            track_samples: BTreeMap::new(),
+            av_next_decode: BTreeMap::new(),
+            text_gop_start: None,
+            segment_number: 0,
+            seen_first_keyframe: false,
+        }
+    }
+
+    /// The output catalog (text renditions at [`TEXT_TIMESCALE`]).
+    pub(crate) fn catalog(&self) -> &Catalog {
+        &self.catalog
+    }
+
+    /// Feed one per-frame fragment. Returns the GoPs it closes (usually
+    /// none or one; a text-only stream can close several at once).
+    pub(crate) fn push_frame(&mut self, frame: &Frame) -> Result<Vec<GopSegment>> {
+        if self.text.contains_key(&frame.track_id) {
+            return self.push_text_frame(frame);
+        }
+
+        let mut out = Vec::new();
+        let is_video_keyframe = self.video_track_ids.contains(&frame.track_id) && frame.is_sync;
 
         // A new segment opens at each video keyframe (after the first), or —
         // for audio-only streams — at each 1-second wall-clock span.
-        let boundary = if has_video {
-            is_video_keyframe && seen_first_keyframe
+        let boundary = if !self.video_track_ids.is_empty() {
+            is_video_keyframe && self.seen_first_keyframe
         } else {
-            audio_only_boundary(&track_durations, &track_timescales)
+            audio_only_boundary(&self.track_durations, &self.av_timescales)
         };
 
         if boundary {
-            segment_number += 1;
-            if let Some(gop) = flush_track_bufs(
-                &mut track_bufs,
-                &mut track_durations,
-                &mut track_sample_counts,
-                &mut track_samples,
-                &track_timescales,
-                &video_track_ids,
-                &catalog,
-                segment_number,
-            )? {
-                on_gop(gop)?;
+            // A non-reference keyframe still cuts AV, but text must end on
+            // the reference track's clock, not the triggering track's.
+            let cut_ms = self.reference.and_then(|tid| {
+                let end = if tid == frame.track_id {
+                    Some(frame.decode_time)
+                } else {
+                    self.av_next_decode.get(&tid).copied()
+                };
+                end.map(|t| ticks_to_ms(t, self.timescale_of(tid)))
+            });
+            if let Some(gop) = self.flush_gop(cut_ms)? {
+                out.push(gop);
             }
         }
 
         if is_video_keyframe {
-            seen_first_keyframe = true;
+            self.seen_first_keyframe = true;
+        }
+        if self.text_gop_start.is_none() && self.reference == Some(frame.track_id) {
+            self.text_gop_start =
+                Some(ticks_to_ms(frame.decode_time, self.timescale_of(frame.track_id)));
+        }
+        if self.av_timescales.contains_key(&frame.track_id) {
+            self.av_next_decode
+                .insert(frame.track_id, frame.decode_time + frame.duration as u64);
         }
 
         record_frame(
-            &frame,
-            &mut track_bufs,
-            &mut track_durations,
-            &mut track_sample_counts,
-            &mut track_samples,
+            frame,
+            &mut self.track_bufs,
+            &mut self.track_durations,
+            &mut self.track_sample_counts,
+            &mut self.track_samples,
         );
+        Ok(out)
     }
 
-    // Flush remaining data
-    segment_number += 1;
-    if let Some(gop) = flush_track_bufs(
-        &mut track_bufs,
-        &mut track_durations,
-        &mut track_sample_counts,
-        &mut track_samples,
-        &track_timescales,
-        &video_track_ids,
-        &catalog,
-        segment_number,
-    )? {
-        on_gop(gop)?;
+    /// End of stream: emit the final GoP(s).
+    pub(crate) fn finish(&mut self) -> Result<Vec<GopSegment>> {
+        let end_ms = match self.text_reference {
+            Some(tid) => self.text.get(&tid).and_then(|t| t.input_end_ms),
+            None => self.reference.and_then(|tid| {
+                self.av_next_decode
+                    .get(&tid)
+                    .map(|&t| ticks_to_ms(t, self.timescale_of(tid)))
+            }),
+        };
+        Ok(self.flush_gop(end_ms)?.into_iter().collect())
     }
 
-    Ok(catalog)
+    fn timescale_of(&self, track_id: u32) -> u32 {
+        self.av_timescales.get(&track_id).copied().unwrap_or(0)
+    }
+
+    /// Decode a text frame's cues into the track's pending set. In a
+    /// text-only stream, a frame on the anchoring text track may close one
+    /// or more 1-second GoPs.
+    fn push_text_frame(&mut self, frame: &Frame) -> Result<Vec<GopSegment>> {
+        let tid = frame.track_id;
+        let st = self.text.get_mut(&tid).expect("text track state");
+        let start = ticks_to_ms(frame.decode_time, st.input_timescale);
+        let end = ticks_to_ms(
+            frame.decode_time + frame.duration as u64,
+            st.input_timescale,
+        );
+        st.input_end_ms = Some(st.input_end_ms.map_or(end, |e| e.max(end)));
+        let payload = frame.payload();
+        if end > start && !payload.is_empty() {
+            let cues = crate::text::cues_from_sample(payload, start, end)?;
+            st.pending.extend(cues.into_iter().filter(|c| c.end > c.start));
+        }
+
+        let mut out = Vec::new();
+        if self.text_reference == Some(tid) {
+            let gop_start = *self.text_gop_start.get_or_insert(start);
+            let mut gop_end = gop_start + TEXT_ONLY_GOP_MS;
+            let input_end = self.text[&tid].input_end_ms.unwrap_or(0);
+            // Once the anchoring track has reached a cut, every cue that
+            // starts before it is known (assuming in-order text).
+            while input_end >= gop_end {
+                if let Some(gop) = self.flush_gop(Some(gop_end))? {
+                    out.push(gop);
+                }
+                gop_end += TEXT_ONLY_GOP_MS;
+            }
+        }
+        Ok(out)
+    }
+
+    /// Close the open GoP. `text_end` is where its text span ends (ms);
+    /// `None` means the span is unknown and no text segment is emitted.
+    fn flush_gop(&mut self, text_end: Option<u64>) -> Result<Option<GopSegment>> {
+        self.segment_number += 1;
+        let number = self.segment_number;
+        let mut av = flush_track_bufs(
+            &mut self.track_bufs,
+            &mut self.track_durations,
+            &mut self.track_sample_counts,
+            &mut self.track_samples,
+            &self.av_timescales,
+            &self.video_track_ids,
+            &self.catalog,
+            number,
+        )?;
+        if let Some(gop) = av.as_mut() { gop.reference_end_ms = text_end; }
+
+        let mut text_parts = Vec::new();
+        if let Some(end) = text_end {
+            let start = self.text_gop_start.unwrap_or(end);
+            self.text_gop_start = self.text_reference.map(|_| end);
+            for (&tid, st) in self.text.iter_mut() {
+                // Drop cues that ended before this span; what's left with a
+                // start before `end` overlaps the span.
+                st.pending.retain(|c| c.end > start);
+                st.pending.sort_by_key(|c| c.start);
+                if end > start {
+                    let overlapping = st.pending.partition_point(|c| c.start < end);
+                    let samples = text_span_samples(&st.pending[..overlapping], start, end)?;
+                    let (bytes, meta) =
+                        mint_text_segment(&self.catalog, tid, &mut st.progress, &samples)?;
+                    text_parts.push((tid, start, end - start, bytes, meta));
+                }
+                st.pending.retain(|c| c.end > end);
+            }
+        }
+
+        if text_parts.is_empty() {
+            return Ok(av);
+        }
+        let mut gop = av.unwrap_or_else(|| GopSegment {
+            number,
+            tracks: BTreeMap::new(),
+            durations: BTreeMap::new(),
+            sample_counts: BTreeMap::new(),
+            samples: BTreeMap::new(),
+            first_decode_times: BTreeMap::new(),
+            reference_end_ms: text_end,
+            body_size: 0,
+            duration_us: 0,
+        });
+        let has_av = !gop.tracks.is_empty();
+        let mut text_span_ms = 0u64;
+        for (tid, start, span, bytes, meta) in text_parts {
+            gop.body_size += bytes.len() as u64;
+            gop.sample_counts.insert(tid, meta.durations.len() as u32);
+            gop.durations.insert(tid, span);
+            gop.first_decode_times.insert(tid, start);
+            gop.samples.insert(tid, meta);
+            gop.tracks.insert(tid, bytes);
+            text_span_ms = text_span_ms.max(span);
+        }
+        // Text never stretches a GoP that has video or audio.
+        if !has_av {
+            gop.duration_us = text_span_ms * 1000;
+        }
+        Ok(Some(gop))
+    }
 }
 
 /// Append a frame's bytes + metadata to the per-track buffers, recording
@@ -303,6 +663,7 @@ pub(crate) fn flush_track_bufs(
             sample_counts,
             samples,
             first_decode_times,
+            reference_end_ms: None,
             body_size,
             duration_us,
         }))
@@ -672,6 +1033,50 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn review_nonreference_keyframe_uses_reference_text_span() {
+        let input = read_fixture("h264-opus-frag.mp4");
+        let mut catalog = crate::init::catalog_from_mp4(Cursor::new(&input)).unwrap();
+        let mut reference = catalog.video_configs().next().unwrap().clone();
+        reference.container = Container::cmaf(1000, 1);
+        catalog.video.as_mut().unwrap().renditions.clear();
+        catalog.insert_video("video1", reference.clone());
+        reference.container = Container::cmaf(2000, 3);
+        catalog.insert_video("video3", reference);
+        let text = crate::catalog::TextConfig { codec: "wvtt".into(), container: Container::cmaf(1000, 100),
+            language: "en".into(), label: None, config: "WEBVTT".into() };
+        catalog.insert_text("text100", text);
+        let mut segmenter = StreamSegmenter::new(&catalog);
+        let wanted = crate::text::Cue { start: 0, end: 300, text: "continuous".into(), id: None, settings: None };
+        let text_samples = crate::text::canonical_samples(&[wanted.clone()], 0, 300).unwrap();
+        let make_frame = |tid, dt, duration, sync, payload: &[u8]| {
+            let info = FrameInfo { duration, size: payload.len() as u32, is_sync: sync, cts_offset: 0 };
+            let mut data = Vec::new();
+            let mut progress = TrackProgress::starting_at(dt);
+            write_frame_fragment(&mut data, tid, &mut progress, &info, payload).unwrap();
+            let moof_size = u32::from_be_bytes(data[..4].try_into().unwrap());
+            Frame { track_id: tid, is_sync: sync, duration, size: info.size, cts_offset: 0,
+                decode_time: dt, moof_size, data }
+        };
+        segmenter.push_frame(&make_frame(100, 0, 300, true, &text_samples[0].data)).unwrap();
+        segmenter.push_frame(&make_frame(1, 0, 100, true, &[1])).unwrap();
+        segmenter.push_frame(&make_frame(1, 100, 100, false, &[2])).unwrap();
+        let first = segmenter.push_frame(&make_frame(3, 1800, 200, true, &[3])).unwrap().pop().unwrap();
+        assert_eq!(first.reference_end_ms, Some(200), "other track's 900 ms cut must not move the reference");
+        assert_eq!(first.first_decode_times[&100], 0);
+        assert_eq!(first.durations[&100], 200);
+        let mut clipped = wanted.clone();
+        clipped.end = 200;
+        assert_eq!(crate::text::cues_from_fragments(&first.tracks[&100], 1000).unwrap(), vec![clipped]);
+        segmenter.push_frame(&make_frame(1, 200, 100, false, &[4])).unwrap();
+        let second = segmenter.finish().unwrap().pop().unwrap();
+        assert_eq!(second.first_decode_times[&100], 200);
+        assert_eq!(second.durations[&100], 100);
+        let mut tail = wanted;
+        tail.start = 200;
+        assert_eq!(crate::text::cues_from_fragments(&second.tracks[&100], 1000).unwrap(), vec![tail]);
     }
 
     #[test]

@@ -66,6 +66,19 @@ impl TrackProgress {
     pub fn set_decode_time(&mut self, t: u64) {
         self.decode_time = t;
     }
+
+    /// Decode time (`tfdt`) the next minted fragment will carry.
+    pub fn decode_time(&self) -> u64 {
+        self.decode_time
+    }
+
+    /// Restart the fragment counter so the next minted fragment carries
+    /// `sequence_number = 1`. The decode clock is unchanged. Used for
+    /// timed-text tracks, whose canonical segments number their fragments
+    /// from 1 in every GoP (see `segment::TEXT_SEQUENCE_RESETS_PER_GOP`).
+    pub fn restart_sequence(&mut self) {
+        self.fragments_emitted = 0;
+    }
 }
 
 /// Mint a single-sample canonical moof+mdat fragment, writing it to `writer`
@@ -264,6 +277,11 @@ pub struct Frame {
     pub size: u32,
     /// Composition-time offset of this sample (signed) in timescale ticks.
     pub cts_offset: i32,
+    /// Decode time (`tfdt`) of this sample in the track's *input* media
+    /// timescale — the `tfdt` the minted fragment in `data` carries. Lets
+    /// consumers place samples on the timeline (timed text needs this to
+    /// honour gaps between source fragments).
+    pub decode_time: u64,
     /// Size of the encoded moof box at the head of `data`. Combined with
     /// the 8-byte mdat header, the sample bytes start at
     /// `data[moof_size + 8 ..]`. Lets downstream callers compute
@@ -272,6 +290,15 @@ pub struct Frame {
     pub moof_size: u32,
     /// Encoded moof+mdat bytes for this single frame.
     pub data: Vec<u8>,
+}
+
+impl Frame {
+    /// The sample payload: the mdat body inside `data`, past the minted moof
+    /// and the 8-byte mdat header.
+    pub fn payload(&self) -> &[u8] {
+        let start = (self.moof_size as usize + 8).min(self.data.len());
+        &self.data[start..]
+    }
 }
 
 /// Streaming fMP4 reader that parses the init segment upfront, then
@@ -499,6 +526,7 @@ pub(crate) fn process_moof_mdat(
                     )));
                 }
                 let sample_data = &mdat_data[offset..sample_end];
+                let decode_time = progress.decode_time();
 
                 let mut frag_buf = Vec::new();
                 write_frame_fragment(
@@ -520,6 +548,7 @@ pub(crate) fn process_moof_mdat(
                     duration: frame.duration,
                     size: frame.size,
                     cts_offset: frame.cts_offset,
+                    decode_time,
                     moof_size,
                     data: frag_buf,
                 })?;

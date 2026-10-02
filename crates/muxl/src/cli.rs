@@ -41,6 +41,9 @@ enum Command {
     /// MUXL segmenter, produce one signed flat MP4 (per-track + wrapper)
     /// as a CBOR `signed-segment` event on stdout.
     SignSegment(SignSegmentArgs),
+    /// Mint and sign standalone WebVTT runs from JSON on stdin.
+    /// Emits a DRISL map of decimal track IDs to signed m4s bytes.
+    SignTextRuns(SignTextRunsArgs),
     /// Sign a transcoded canonical MUXL segment read from stdin, declaring
     /// the segment it was transcoded from (`--source`) as a `parentOf`
     /// ingredient. The output's C2PA manifest (`--manifest`) should carry a
@@ -99,6 +102,8 @@ enum Command {
     /// inverse of `metafile`): feed `init` + segment metafiles on stdin, get
     /// the header bytes to prepend to the canonical blob over byte ranges.
     FlatHeader(muxl_cli::FlatHeaderArgs),
+    /// Enumerate, read, or attach canonical WebVTT text tracks.
+    Text(muxl_cli::TextArgs),
 }
 
 #[derive(clap::Args)]
@@ -224,6 +229,12 @@ struct SignSegmentArgs {
 }
 
 #[derive(clap::Args)]
+struct SignTextRunsArgs {
+    #[command(flatten)]
+    signing: SigningArgs,
+}
+
+#[derive(clap::Args)]
 #[command(group(
     ArgGroup::new("transcode-signing-key")
         .required(true)
@@ -332,6 +343,7 @@ pub fn cli_main() {
     let cli = Cli::parse();
     let result = match cli.command {
         Command::SignSegment(args) => cmd_sign_segment(args),
+        Command::SignTextRuns(args) => cmd_sign_text_runs(args),
         Command::SignTranscode(args) => cmd_sign_transcode(args),
         Command::Verify => cmd_verify(),
         Command::Inspect(args) => cmd_inspect(args),
@@ -348,6 +360,7 @@ pub fn cli_main() {
         Command::Hls(args) => muxl_cli::cmd_hls(args).map_err(Into::into),
         Command::Metafile(args) => muxl_cli::cmd_metafile(args).map_err(Into::into),
         Command::FlatHeader(args) => muxl_cli::cmd_flat_header(args).map_err(Into::into),
+        Command::Text(args) => muxl_cli::cmd_text(args).map_err(Into::into),
     };
     if let Err(e) = result {
         eprintln!("Error: {e}");
@@ -365,6 +378,37 @@ fn cmd_sign_segment(args: SignSegmentArgs) -> Result<()> {
         }
         ManifestSource::Host => sign_segment_stream_host(&mut stdin, &mut stdout, &signer),
     }
+}
+
+fn cmd_sign_text_runs(mut args: SignTextRunsArgs) -> Result<()> {
+    // Standalone runs have no wrapper. Reuse the signing options, supplying
+    // the track path for the unused wrapper-manifest slot.
+    if args.signing.wrapper_manifest.is_none() {
+        args.signing.wrapper_manifest = args.signing.track_manifest.clone();
+    }
+    let (signer, manifests) = args.signing.into_signer_and_manifests()?;
+    #[derive(serde::Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct Input {
+        #[serde(flatten)]
+        req: muxl::text::TextRequest,
+        #[serde(default)]
+        tracks: Vec<muxl::text::TextTrackAttachment>,
+    }
+    let input: Input = serde_json::from_reader(io::stdin().lock())
+        .map_err(|e| crate::Error::Muxl(muxl::Error::InvalidMp4(e.to_string())))?;
+    let manifest = match &manifests {
+        ManifestSource::Static { track, .. } => Some(track.as_str()),
+        ManifestSource::Host => None,
+    };
+    let runs = crate::sign::sign_text_runs(input.req, input.tracks, &signer, manifest)?;
+    let runs: std::collections::BTreeMap<String, muxl::cbor::ByteString> = runs
+        .into_iter()
+        .map(|(id, data)| (id.to_string(), muxl::cbor::ByteString(data)))
+        .collect();
+    dasl::drisl::to_writer(io::stdout().lock(), &runs)
+        .map_err(|e| crate::Error::Io(io::Error::other(e.to_string())))?;
+    Ok(())
 }
 
 fn cmd_sign_transcode(args: SignTranscodeArgs) -> Result<()> {

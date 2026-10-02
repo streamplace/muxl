@@ -16,6 +16,7 @@ pub mod push;
 pub mod reader;
 pub mod segment;
 pub mod source;
+pub mod text;
 #[cfg(feature = "wasm")]
 mod wasm;
 #[cfg(feature = "wasm")]

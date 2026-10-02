@@ -27,6 +27,12 @@ fMP4 stream ──► MUXL ──► init segment + MUXL segments
 
 The same source frames always produce the same segment bytes, regardless of which muxer originally packaged them. This means you can compute a CID over a segment and it will be stable — the same content always gets the same hash.
 
+### Tracks
+
+MUXL handles video (H.264, AV1), audio (AAC, Opus), and WebVTT timed text (ISO/IEC 14496-30 `wvtt`) tracks. Every track gets its own canonical segment per GoP, so captions are hashed, signed, verified, and stored exactly like the media tracks, and can be dropped or replaced independently.
+
+Text tracks appear in the catalog under a `text` group (`codec`, `language`, optional `label`, and the WebVTT header as `config`, on a 1000 Hz timescale). Their samples are canonicalized so that the same captions always produce the same bytes. Cues active at the same time are sorted, overlapping cues are split into disjoint samples, gaps are explicit empty-cue (`vtte`) samples, and each GoP's text segment is clipped and padded to cover exactly that GoP. Flat MP4s carry the text track as a normal `text`-handler track. The native HLS emitter retains text metadata but emits only audio/video playlists; applications can serve plain WebVTT subtitles separately. See [`spec/canonical-form.md` § Timed Text (WebVTT)](spec/canonical-form.md#timed-text-webvtt).
+
 ## Install
 
 ```bash
@@ -164,6 +170,48 @@ decoder.Decode(&event) // {"type": "init", "data": <bytes>}
 ```
 
 See [`examples/go-wasi/`](examples/go-wasi/) for a complete working example.
+
+The embedded Go engine's streaming calls terminate on context cancellation even
+when the caller has stopped consuming its event channel. Cancelling one call
+does not close the engine or affect other operations.
+
+The embedded Go module exposes WebVTT through `TextEngine` (implemented by
+`WASMEngine`, without changing the existing `Engine` interface):
+
+```go
+tracks, err := engine.TextTracks(ctx, vodReader)
+cues, err := engine.ReadTextCues(ctx, vodReader, tracks[0].TrackID)
+segment, err := engine.AddTextTrack(ctx, unsignedGoP, muxl.TextTrack{
+    TrackID: 3, Language: "en-US", Label: "English",
+}, []muxl.TextCue{
+    {Start: 100, End: 400, Text: "Hello"},
+    {Start: 600, End: 900, Text: "World", ID: "cue-2"},
+})
+```
+
+Cue timestamps are absolute stream milliseconds (exclusive end). Adding text
+preserves existing unsigned AV track bytes; it rejects signed input and track-id
+collisions. Wrap the result as fMP4 before `SignSegment`. Enumeration and cue
+reading accept canonical segments, concatenated VOD segments, and MP4 files.
+Adjacent identical cue pieces merge on read; distinct adjacent cues should have
+distinct IDs. Text fragments restart sequence numbers at 1 for each GoP so their
+CID depends only on the GoP span, cue content, and track configuration.
+The small `samples/text-track.mp4` fixture contains video, audio, and two English
+WebVTT cues, including empty timeline intervals.
+
+For signed archive copies, `TextEngine.SignTextRuns(ctx, req, tracks, in)`
+mints and streamer-signs only standalone WebVTT runs for the recorded live
+`TextRequest`. It never receives or re-signs AV bytes and does not call
+`in.TextFn`. The archive caller replaces existing text runs, checks for
+non-text track-ID collisions, and concatenates all runs in ascending numeric
+track-ID order. Non-text runs, including separately signed transcodes, stay
+byte-identical. See [the Go API](go/README.md#signed-archive-text-runs) for the
+span, manifest, timestamp, and signer rules and the `sign-text-runs` CLI format.
+
+To keep normal pre-commit WASM rebuilding inside a builder container, install
+the repo hooks with `just install-hooks` and set `MUXL_BUILD_CONTAINER` to its
+name when committing.
+
 
 ## Status
 

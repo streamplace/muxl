@@ -29,9 +29,11 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::{Error, Result};
 
-/// Top-level catalog. Carries both track-type groups. Missing groups
-/// serialize as absent fields (not as empty objects), so an audio-only
-/// stream produces `{"audio": {...}}` with no `video` key.
+/// Top-level catalog. Carries one group per track type (video, audio,
+/// text). Missing groups serialize as absent fields, not as empty objects. An
+/// audio-only stream produces `{"audio": {...}}` with no `video` key, and a
+/// catalog without text tracks encodes to the same bytes it did before the
+/// `text` group existed.
 ///
 /// Hang's top-level catalog also carries `location`, `user`, `chat`,
 /// `capabilities`, `preview` etc. MUXL doesn't emit or interpret those
@@ -44,6 +46,9 @@ pub struct Catalog {
     pub video: Option<Video>,
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub audio: Option<Audio>,
+    /// Timed-text (WebVTT) tracks. A MUXL extension; Hang has no text group.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub text: Option<Text>,
 }
 
 /// Video group. `renditions` is a name→config map (not an array) so
@@ -67,6 +72,12 @@ pub struct Video {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Audio {
     pub renditions: BTreeMap<String, AudioConfig>,
+}
+
+/// Text group. Same shape rule as `Video` and `Audio`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Text {
+    pub renditions: BTreeMap<String, TextConfig>,
 }
 
 /// Render target for a video track, independent of the coded pixel
@@ -125,6 +136,28 @@ pub struct AudioConfig {
     pub bitrate: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub jitter: Option<u64>,
+}
+
+/// Per-rendition timed-text configuration. Today this covers WebVTT carried
+/// in ISOBMFF (ISO/IEC 14496-30, sample entry `wvtt`).
+///
+/// Maps onto the init segment as follows (see [`crate::init`]):
+///
+/// - `codec`: the sample entry four-character code. Only `"wvtt"` is supported.
+/// - `language`: a BCP 47 tag. It is written to `elng`, and to `mdhd` as the
+///   closest ISO-639-2/T code (`und` when no code can be derived).
+/// - `label`: the optional `vlab` (WebVTTSourceLabelBox) string.
+/// - `config`: the `vttC` (WebVTTConfigurationBox) body, which is the WebVTT
+///   file header. It starts with `WEBVTT`; the minimal value is `"WEBVTT"`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TextConfig {
+    pub codec: String,
+    pub container: Container,
+    pub language: String,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub label: Option<String>,
+    pub config: String,
 }
 
 /// Container / transport framing. MUXL only produces CMAF, but the
@@ -209,6 +242,22 @@ impl AudioConfig {
     }
 }
 
+impl TextConfig {
+    pub fn track_id(&self) -> u32 {
+        match self.container {
+            Container::Cmaf { track_id, .. } => track_id,
+            Container::Legacy => 0,
+        }
+    }
+
+    pub fn timescale(&self) -> u32 {
+        match self.container {
+            Container::Cmaf { timescale, .. } => timescale,
+            Container::Legacy => 0,
+        }
+    }
+}
+
 impl Catalog {
     /// Iterate all video rendition configs, regardless of rendition name.
     pub fn video_configs(&self) -> impl Iterator<Item = &VideoConfig> {
@@ -220,6 +269,11 @@ impl Catalog {
         self.audio.iter().flat_map(|a| a.renditions.values())
     }
 
+    /// Iterate all text rendition configs.
+    pub fn text_configs(&self) -> impl Iterator<Item = &TextConfig> {
+        self.text.iter().flat_map(|t| t.renditions.values())
+    }
+
     /// Mutable iterator over video rendition configs.
     pub fn video_configs_mut(&mut self) -> impl Iterator<Item = &mut VideoConfig> {
         self.video.iter_mut().flat_map(|v| v.renditions.values_mut())
@@ -228,6 +282,11 @@ impl Catalog {
     /// Mutable iterator over audio rendition configs.
     pub fn audio_configs_mut(&mut self) -> impl Iterator<Item = &mut AudioConfig> {
         self.audio.iter_mut().flat_map(|a| a.renditions.values_mut())
+    }
+
+    /// Mutable iterator over text rendition configs.
+    pub fn text_configs_mut(&mut self) -> impl Iterator<Item = &mut TextConfig> {
+        self.text.iter_mut().flat_map(|t| t.renditions.values_mut())
     }
 
     /// Insert a video rendition, creating the `Video` wrapper if missing.
@@ -249,9 +308,17 @@ impl Catalog {
         audio.renditions.insert(name.into(), config);
     }
 
+    /// Insert a text rendition, creating the `Text` wrapper if missing.
+    pub fn insert_text(&mut self, name: impl Into<String>, config: TextConfig) {
+        let text = self.text.get_or_insert_with(|| Text {
+            renditions: BTreeMap::new(),
+        });
+        text.renditions.insert(name.into(), config);
+    }
+
     /// Remap CMAF track IDs in place. Every rendition whose container
     /// `track_id` is a key in `map` is reassigned to the mapped value, and
-    /// its rendition-map key is renamed to `video{N}` / `audio{N}` so the
+    /// its rendition-map key is renamed to `video{N}` / `audio{N}` / `text{N}` so the
     /// `{type}{track_id}` naming invariant — relied on by
     /// [`crate::reader::aggregate_catalog`] (which keys by rendition name)
     /// and per-track init naming — is preserved. Renditions whose track_id
@@ -288,13 +355,26 @@ impl Catalog {
                 })
                 .collect();
         }
+        if let Some(text) = self.text.as_mut() {
+            let old = std::mem::take(&mut text.renditions);
+            text.renditions = old
+                .into_iter()
+                .map(|(name, mut cfg)| match map.get(&cfg.track_id()) {
+                    Some(&new) => {
+                        cfg.container = cfg.container.with_track_id(new);
+                        (format!("text{new}"), cfg)
+                    }
+                    None => (name, cfg),
+                })
+                .collect();
+        }
     }
 
     /// Return a new catalog containing only the rendition whose `track_id`
-    /// matches. The matching rendition's wrapping `Video` or `Audio` is
-    /// retained (with its other-rendition entries stripped); the opposite
-    /// track-type wrapper is dropped entirely. If no rendition matches,
-    /// both wrappers are `None`.
+    /// matches. The matching rendition's wrapping `Video`, `Audio`, or `Text`
+    /// is retained (with its other-rendition entries stripped); the other
+    /// track-type wrappers are dropped entirely. If no rendition matches,
+    /// all wrappers are `None`.
     pub fn filter_to_track(&self, track_id: u32) -> Catalog {
         let video = self.video.as_ref().and_then(|v| {
             let renditions: BTreeMap<String, VideoConfig> = v
@@ -327,7 +407,20 @@ impl Catalog {
                 Some(Audio { renditions })
             }
         });
-        Catalog { video, audio }
+        let text = self.text.as_ref().and_then(|t| {
+            let renditions: BTreeMap<String, TextConfig> = t
+                .renditions
+                .iter()
+                .filter(|(_, c)| c.track_id() == track_id)
+                .map(|(k, c)| (k.clone(), c.clone()))
+                .collect();
+            if renditions.is_empty() {
+                None
+            } else {
+                Some(Text { renditions })
+            }
+        });
+        Catalog { video, audio, text }
     }
 }
 
@@ -687,6 +780,162 @@ mod tests {
         // A plain moof box (no uuid) yields a clear error, not a panic.
         let bytes = b"\x00\x00\x00\x08moof".to_vec();
         assert!(from_segment(&bytes).is_err());
+    }
+
+    fn sample_text_config(track_id: u32, label: Option<&str>) -> TextConfig {
+        TextConfig {
+            codec: "wvtt".into(),
+            container: Container::cmaf(1000, track_id),
+            language: "en-US".into(),
+            label: label.map(Into::into),
+            config: "WEBVTT".into(),
+        }
+    }
+
+    /// `sample_catalog()` plus a WebVTT text rendition on track 3.
+    fn sample_catalog_with_text() -> Catalog {
+        let mut c = sample_catalog();
+        c.insert_text("text3", sample_text_config(3, Some("captions")));
+        c
+    }
+
+    #[test]
+    fn av_catalog_bytes_unchanged_by_text_group() {
+        // The `text` group must not alter the encoding of catalogs that lack
+        // it: catalog CIDs for existing AV streams stay stable. Compare
+        // against a serializer that only knows the pre-text shape.
+        #[derive(Serialize)]
+        struct AvOnly<'a> {
+            #[serde(skip_serializing_if = "Option::is_none")]
+            video: Option<&'a Video>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            audio: Option<&'a Audio>,
+        }
+        let c = sample_catalog();
+        assert!(c.text.is_none());
+        let legacy = AvOnly {
+            video: c.video.as_ref(),
+            audio: c.audio.as_ref(),
+        };
+        let mut want = Vec::new();
+        dasl::drisl::to_writer(&mut want, &legacy).unwrap();
+        assert_eq!(to_drisl(&c).unwrap(), want, "DRISL bytes changed");
+        assert_eq!(
+            to_hang_json(&c).unwrap(),
+            serde_json::to_string_pretty(&legacy).unwrap(),
+            "Hang JSON changed"
+        );
+    }
+
+    #[test]
+    fn text_catalog_round_trips_both_formats() {
+        let mut c = sample_catalog_with_text();
+        // One labelled and one unlabelled rendition.
+        c.insert_text("text4", sample_text_config(4, None));
+
+        let drisl = to_drisl(&c).unwrap();
+        assert_eq!(from_drisl(&drisl).unwrap(), c);
+        assert_eq!(to_drisl(&c).unwrap(), drisl, "DRISL must be deterministic");
+
+        let json = to_hang_json(&c).unwrap();
+        assert_eq!(from_hang_json(&json).unwrap(), c);
+    }
+
+    #[test]
+    fn text_hang_json_shape() {
+        let mut c = Catalog::default();
+        c.insert_text("text3", sample_text_config(3, None));
+        let json = to_hang_json(&c).unwrap();
+        assert!(json.contains("\"text\""), "got: {json}");
+        assert!(json.contains("\"text3\""));
+        assert!(json.contains("\"codec\": \"wvtt\""));
+        assert!(json.contains("\"language\": \"en-US\""));
+        assert!(json.contains("\"config\": \"WEBVTT\""));
+        assert!(json.contains("\"trackId\": 3"));
+        // Absent label is elided, not null.
+        assert!(!json.contains("\"label\""), "got: {json}");
+        assert!(!json.contains("\"video\""));
+        assert!(!json.contains("\"audio\""));
+
+        c.insert_text("text3", sample_text_config(3, Some("captions")));
+        let json = to_hang_json(&c).unwrap();
+        assert!(json.contains("\"label\": \"captions\""), "got: {json}");
+    }
+
+    #[test]
+    fn text_json_without_label_parses() {
+        let json = r#"{
+            "text": { "renditions": { "text3": {
+                "codec": "wvtt",
+                "container": { "kind": "cmaf", "timescale": 1000, "trackId": 3 },
+                "language": "es",
+                "config": "WEBVTT"
+            } } }
+        }"#;
+        let c = from_hang_json(json).unwrap();
+        let t = c.text_configs().next().unwrap();
+        assert_eq!(t.codec, "wvtt");
+        assert_eq!(t.language, "es");
+        assert_eq!(t.label, None);
+        assert_eq!(t.config, "WEBVTT");
+        assert_eq!(t.track_id(), 3);
+        assert_eq!(t.timescale(), 1000);
+    }
+
+    #[test]
+    fn text_accessors() {
+        let mut c = sample_catalog_with_text();
+        assert_eq!(c.text_configs().count(), 1);
+        assert_eq!(c.video_configs().count(), 1);
+        assert_eq!(c.audio_configs().count(), 1);
+        for t in c.text_configs_mut() {
+            t.language = "fr".into();
+        }
+        assert_eq!(c.text_configs().next().unwrap().language, "fr");
+        assert!(Catalog::default().text_configs().next().is_none());
+    }
+
+    #[test]
+    fn filter_to_track_selects_text() {
+        let c = sample_catalog_with_text();
+        let only_text = c.filter_to_track(3);
+        assert!(only_text.video.is_none());
+        assert!(only_text.audio.is_none());
+        assert_eq!(only_text.text, c.text);
+
+        // Filtering to an AV track drops the text group entirely.
+        let only_video = c.filter_to_track(1);
+        assert!(only_video.text.is_none());
+        assert!(only_video.audio.is_none());
+        assert!(only_video.video.is_some());
+
+        assert_eq!(c.filter_to_track(99), Catalog::default());
+    }
+
+    #[test]
+    fn remap_track_ids_renames_text() {
+        let mut c = sample_catalog_with_text();
+        let map: BTreeMap<u32, u32> = [(3u32, 7u32)].into_iter().collect();
+        c.remap_track_ids(&map);
+        let text = c.text.as_ref().unwrap();
+        assert!(text.renditions.contains_key("text7"));
+        assert!(!text.renditions.contains_key("text3"));
+        let t = &text.renditions["text7"];
+        assert_eq!(t.track_id(), 7);
+        assert_eq!(t.timescale(), 1000, "timescale preserved");
+        assert_eq!(t.label.as_deref(), Some("captions"));
+        // AV renditions untouched.
+        assert!(c.video.as_ref().unwrap().renditions.contains_key("video1"));
+        assert!(c.audio.as_ref().unwrap().renditions.contains_key("audio1"));
+    }
+
+    #[test]
+    fn from_segment_recovers_text_track_catalog() {
+        let c = sample_catalog_with_text();
+        let prefix = crate::segment::mint_canonical_segment_prefix(&c, 3).unwrap();
+        let recovered = from_segment(&prefix).unwrap();
+        assert_eq!(recovered, c.filter_to_track(3));
+        assert!(recovered.text.is_some());
     }
 
     #[test]

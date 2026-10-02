@@ -249,6 +249,11 @@ pub fn cmd_catalog(args: CatalogArgs) -> crate::Result<()> {
             );
         }
     }
+    if let Some(text) = &catalog.text {
+        for (name, t) in &text.renditions {
+            eprintln!("text \"{name}\": {} {} {:?} (track {})", t.codec, t.language, t.label, t.track_id());
+        }
+    }
 
     let _ = input;
     Ok(())
@@ -841,5 +846,89 @@ fn cmd_segment_fmp4_stream(
         track_ids.len()
     );
 
+    Ok(())
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+pub enum TextOperation { Tracks, Cues, Add }
+
+/// JSON-facing primitives used by the Go text API.
+#[derive(Args)]
+pub struct TextArgs {
+    #[arg(value_enum)]
+    pub operation: TextOperation,
+    #[arg(long, default_value_t = 0)]
+    pub track_id: u32,
+    #[arg(long, default_value = "und")]
+    pub language: String,
+    #[arg(long)]
+    pub label: Option<String>,
+    #[arg(long)]
+    pub cues: Option<PathBuf>,
+}
+
+pub fn cmd_text(args: TextArgs) -> crate::Result<()> {
+    let mut bytes=Vec::new();
+    io::stdin().lock().read_to_end(&mut bytes)?;
+    if matches!(args.operation,TextOperation::Add) {
+        let segments=crate::reader::unwrap(&bytes)?;
+        if args.track_id==0 || segments.iter().any(|s|s.track_id==args.track_id) {
+            return Err(crate::Error::InvalidMp4("text track id must be nonzero and unused".into()));
+        }
+        let mut by_id=std::collections::BTreeMap::new();
+        for s in &segments {
+            if s.data.get(8..24) != Some(&crate::segment::MUXL_UUID[..]) {
+                return Err(crate::Error::InvalidMp4("add text before signing, not to signed segments".into()));
+            }
+            if by_id.insert(s.track_id,s.data).is_some() {
+                return Err(crate::Error::InvalidMp4("add text expects exactly one GoP".into()));
+            }
+        }
+        let catalog=crate::reader::aggregate_catalog(&segments);
+        let reference=catalog.video_configs().min_by_key(|c|c.track_id()).map(|c|(c.track_id(),c.timescale()))
+            .or_else(||catalog.audio_configs().min_by_key(|c|c.track_id()).map(|c|(c.track_id(),c.timescale())))
+            .ok_or_else(||crate::Error::InvalidMp4("add text requires an AV reference track".into()))?;
+        let (_,samples,dt)=crate::present::segment_index(by_id[&reference.0])?;
+        let duration:u64=samples.durations.iter().map(|&d|d as u64).sum();
+        let start=crate::segment::ticks_to_ms(dt,reference.1);
+        let end=crate::segment::ticks_to_ms(dt+duration,reference.1);
+        let path=args.cues.ok_or_else(||crate::Error::InvalidMp4("add requires --cues JSON".into()))?;
+        let cues:Vec<crate::text::Cue>=serde_json::from_slice(&fs::read(path)?).map_err(|e|crate::Error::InvalidMp4(e.to_string()))?;
+        let config=crate::catalog::TextConfig{codec:"wvtt".into(),container:crate::catalog::Container::cmaf(1000,args.track_id),language:args.language,label:args.label,config:"WEBVTT".into()};
+        let text=crate::text::build_track(&config,&cues,start,end)?;
+        by_id.insert(args.track_id,&text);
+        for data in by_id.values() {io::stdout().lock().write_all(data)?;}
+        return Ok(());
+    }
+    let segments=crate::reader::unwrap(&bytes);
+    let catalog=match &segments { Ok(s)=>crate::reader::aggregate_catalog(s),Err(_)=>crate::read(&bytes)?.catalog };
+    let json=match args.operation {
+        TextOperation::Tracks => serde_json::to_vec(&catalog.text_configs().map(|t|serde_json::json!({"trackId":t.track_id(),"language":t.language,"label":t.label})).collect::<Vec<_>>()),
+        TextOperation::Cues => {
+            let config=catalog.text_configs().find(|t|t.track_id()==args.track_id)
+                .ok_or_else(||crate::Error::InvalidMp4("text track not found".into()))?;
+            let mut cues=Vec::new();
+            match segments {
+                Ok(segments)=>for s in segments.iter().filter(|s|s.track_id==args.track_id) {cues.extend(crate::text::cues_from_fragments(s.data,config.timescale())?);},
+                Err(_)=>{
+                    let source=crate::read(&bytes)?;
+                    let plan=source.plan.track(args.track_id).ok_or_else(||crate::Error::InvalidMp4("text plan not found".into()))?;
+                    let mut dt=plan.start_offset_ticks;
+                    for (i, sample) in plan.samples.iter().enumerate() {
+                        dt=plan.decode_time_overrides.get(&i).copied().unwrap_or(dt);
+                        let start=crate::segment::ticks_to_ms(dt,plan.timescale);
+                        dt+=sample.duration as u64;
+                        let end=crate::segment::ticks_to_ms(dt,plan.timescale);
+                        let offset=sample.input_offset as usize;
+                        let payload=bytes.get(offset..offset+sample.size as usize).ok_or_else(||crate::Error::InvalidMp4("text sample out of bounds".into()))?;
+                        cues.extend(crate::text::cues_from_sample(payload,start,end)?);
+                    }
+                }
+            }
+            serde_json::to_vec(&crate::text::merge_cues(cues))
+        }
+        TextOperation::Add=>unreachable!(),
+    }.map_err(|e|crate::Error::InvalidMp4(e.to_string()))?;
+    io::stdout().lock().write_all(&json)?;
     Ok(())
 }

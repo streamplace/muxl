@@ -536,12 +536,15 @@ fn civil_from_days(z: i64) -> (i64, u32, u32) {
 }
 
 /// Emit the complete initialization snapshot, including late text tracks.
+/// Per-track init segments are best-effort, as before: a catalog they can't
+/// be built from leaves them out rather than stopping a live signer.
 fn write_init_event<W: Write>(
     output: &mut W,
     catalog: &muxl::catalog::Catalog,
     data: Vec<u8>,
 ) -> Result<()> {
-    let track_inits = muxl::init::build_track_init_segments(catalog)?
+    let track_inits = muxl::init::build_track_init_segments(catalog)
+        .unwrap_or_default()
         .into_iter()
         .map(|(tid, bytes)| (tid.to_string(), muxl::cbor::ByteString(bytes)))
         .collect();
@@ -596,8 +599,9 @@ fn handle_event<W: Write>(
                 if let Some(req) = muxl::text::StreamingText::request(catalog_state, &gop)? {
                     text.attach(&mut gop, req, fetch(req))?;
                     if text.update_catalog(catalog_state) {
-                        let data = muxl::init::build_init_segment(catalog_state)?;
-                        write_init_event(output, catalog_state, data)?;
+                        if let Ok(data) = muxl::init::build_init_segment(catalog_state) {
+                            write_init_event(output, catalog_state, data)?;
+                        }
                     }
                     let millis = unsafe { host_get_segment_time(req.start_ms) };
                     if millis != i64::MIN {

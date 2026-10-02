@@ -150,14 +150,36 @@ pub fn cues_from_fragments(data: &[u8], timescale: u32) -> Result<Vec<Cue>> {
 }
 
 pub fn build_track(config: &TextConfig, cues: &[Cue], start: u64, end: u64) -> Result<Vec<u8>> {
-    let mut config=config.clone();
-    config.container=crate::catalog::Container::cmaf(1000,config.track_id());
-    let mut catalog=Catalog::default();
-    catalog.insert_text(format!("text{}",config.track_id()),config.clone());
-    let samples=crate::segment::text_span_samples(cues,start,end)?;
-    let mut progress=TrackProgress::starting_at(start);
-    let (out, _)=crate::segment::mint_text_segment(&catalog,config.track_id(),&mut progress,&samples)?;
-    Ok(out)
+    let mut config = config.clone();
+    config.container = crate::catalog::Container::cmaf(1000, config.track_id());
+    Ok(mint_track(
+        &config,
+        cues,
+        TextRequest {
+            start_ms: start,
+            end_ms: end,
+        },
+    )?
+    .0)
+}
+
+/// Mint one canonical text run, including gap samples and sample metadata.
+/// Shared by streaming attachment and standalone text-run signing.
+pub fn mint_track(
+    config: &TextConfig,
+    cues: &[Cue],
+    req: TextRequest,
+) -> Result<(Vec<u8>, crate::segment::TrackSamples)> {
+    let mut catalog = Catalog::default();
+    catalog.insert_text(format!("text{}", config.track_id()), config.clone());
+    let samples = crate::segment::text_span_samples(cues, req.start_ms, req.end_ms)?;
+    let mut progress = TrackProgress::starting_at(req.start_ms);
+    crate::segment::mint_text_segment(
+        &catalog,
+        config.track_id(),
+        &mut progress,
+        &samples,
+    )
 }
 
 /// Span requested by the streaming signer, on the absolute media timeline.
@@ -182,6 +204,25 @@ pub struct TextTrackAttachment {
     pub label: Option<String>,
     #[serde(default)]
     pub cues: Vec<Cue>,
+}
+
+impl TextTrackAttachment {
+    pub fn into_config_and_cues(self) -> (TextConfig, Vec<Cue>) {
+        (
+            TextConfig {
+                codec: "wvtt".into(),
+                container: crate::catalog::Container::cmaf(1000, self.track_id),
+                language: if self.language.is_empty() {
+                    "und".into()
+                } else {
+                    self.language
+                },
+                label: self.label.filter(|s| !s.is_empty()),
+                config: "WEBVTT".into(),
+            },
+            self.cues,
+        )
+    }
 }
 
 /// Session state: declared tracks remain continuous even if a host call fails.
@@ -210,29 +251,26 @@ impl StreamingText {
             if track.track_id == 0 || gop.tracks.contains_key(&track.track_id) {
                 return Err(invalid("streaming text track id must be nonzero and unused"));
             }
-            let config = TextConfig {
-                codec: "wvtt".into(), container: crate::catalog::Container::cmaf(1000, track.track_id),
-                language: if track.language.is_empty() { "und".into() } else { track.language },
-                label: track.label.filter(|s| !s.is_empty()), config: "WEBVTT".into(),
-            };
-            if let Some(previous) = self.tracks.get(&track.track_id) {
+            let id = track.track_id;
+            let (config, track_cues) = track.into_config_and_cues();
+            if let Some(previous) = self.tracks.get(&id) {
                 if previous != &config { return Err(invalid("streaming text track configuration changed")); }
             } else {
-                self.tracks.insert(track.track_id, config);
+                self.tracks.insert(id, config);
             }
-            if cues.insert(track.track_id, track.cues).is_some() {
+            if cues.insert(id, track_cues).is_some() {
                 return Err(invalid("duplicate streaming text track"));
             }
         }
         for (&id, config) in &self.tracks {
-            let mut catalog = Catalog::default();
-            catalog.insert_text(format!("text{id}"), config.clone());
-            let samples = crate::segment::text_span_samples(cues.get(&id).map(Vec::as_slice).unwrap_or(&[]), req.start_ms, req.end_ms)?;
-            let mut progress = TrackProgress::starting_at(req.start_ms);
-            let (data, meta) = crate::segment::mint_text_segment(&catalog, id, &mut progress, &samples)?;
+            let (data, meta) = mint_track(
+                config,
+                cues.get(&id).map(Vec::as_slice).unwrap_or(&[]),
+                req,
+            )?;
             gop.body_size += data.len() as u64;
             gop.durations.insert(id, req.end_ms - req.start_ms);
-            gop.sample_counts.insert(id, samples.len() as u32);
+            gop.sample_counts.insert(id, meta.durations.len() as u32);
             gop.first_decode_times.insert(id, req.start_ms);
             gop.samples.insert(id, meta);
             gop.tracks.insert(id, data);

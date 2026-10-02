@@ -672,6 +672,60 @@ fn sign_gop_canonical_segments_in_place(
     Ok(prefix_size)
 }
 
+/// Mint and sign standalone WebVTT runs for a known GoP span, without AV bytes.
+pub(crate) fn sign_text_runs(
+    req: muxl::text::TextRequest,
+    tracks: Vec<muxl::text::TextTrackAttachment>,
+    signer: &SignerKey,
+    manifest: Option<&str>,
+) -> Result<std::collections::BTreeMap<u32, Vec<u8>>> {
+    use std::collections::BTreeMap;
+    let invalid = |message: &str| Error::Muxl(muxl::Error::InvalidMp4(message.into()));
+    if req.end_ms <= req.start_ms {
+        return Err(invalid("text range must have positive duration"));
+    }
+    let mut configs = BTreeMap::new();
+    for track in tracks {
+        let id = track.track_id;
+        if id == 0 || configs.contains_key(&id) {
+            return Err(invalid("text track id must be nonzero and unique"));
+        }
+        configs.insert(id, track.into_config_and_cues());
+    }
+    let mut signed_text = BTreeMap::new();
+    if configs.is_empty() {
+        return Ok(signed_text);
+    }
+    let host_manifest;
+    let base = match manifest {
+        Some(json) => json,
+        None => {
+            host_manifest = host_get_manifest_callback(0)
+                .map_err(|e| invalid(&format!("host track manifest: {e}")))?;
+            &host_manifest
+        }
+    };
+    let base: serde_json::Value = serde_json::from_str(base)
+        .map_err(|e| invalid(&format!("segment manifest JSON: {e}")))?;
+    let millis = unsafe { host_get_segment_time(req.start_ms) };
+    let when = if millis == i64::MIN {
+        now_rfc3339_utc()
+    } else {
+        rfc3339_from_unix(
+            millis.div_euclid(1000),
+            millis.rem_euclid(1000) as u32,
+        )
+    };
+    let manifest = stamp_segment_manifest(&base, &when);
+    init_default_settings();
+    let signer = signer.build()?;
+    for (id, (config, cues)) in configs {
+        let (run, _) = muxl::text::mint_track(&config, &cues, req)?;
+        signed_text.insert(id, sign_buf_as(&run, &manifest, &*signer, "m4s")?);
+    }
+    Ok(signed_text)
+}
+
 /// Sign a single in-memory MP4 buffer with a given manifest.
 ///
 /// Helper for the per-track step. Wraps [`Builder::sign`] over

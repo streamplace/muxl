@@ -68,6 +68,43 @@ leading/trailing AV fragments in flat blobs. Text can precede its AV GoP;
 trailing text without a following AV reference remains readable rather than
 being discarded or rejected.
 
+### Signed archive text runs
+
+```go
+func (e *WASMEngine) SignTextRuns(
+    ctx context.Context,
+    req TextRequest,
+    tracks []TextTrackAttachment,
+    in SignerInput,
+) (map[uint32][]byte, error)
+```
+
+Use the `TextRequest` recorded by the live `SignSegment` callback to mint
+properly timed archive captions without sending AV bytes to the streamer-key
+signer. `SignTextRuns` implements `TextEngine`, shares the streaming signer's
+canonical text minting, and returns one independently signed `m4s` run per
+requested track. It does not invoke `in.TextFn`.
+
+The caller drops existing WebVTT runs, rejects new IDs colliding with non-text
+runs, and splices the returned runs into the completed GoP in ascending numeric
+track-ID order. Preserve every non-text run verbatim, including node-signed
+transcodes and their `parentOf` ingredient bindings.
+
+Track IDs must be nonzero and unique, and `EndMs` must exceed `StartMs`. Cues
+use absolute milliseconds and are clipped to `[StartMs, EndMs)`; gaps are
+covered, and a track without cues emits a gap-only run. An empty track list
+returns an empty map. Language defaults to `und`; labels are optional.
+Exactly one of `in.KeyPEM` and `in.Sign` is required; `in.Alg` defaults to
+`es256k`. The manifest comes from `in.TrackManifestFn` when set, otherwise
+`in.TrackManifest`, and receives the same `cawg.metadata`/`dc:date` stamp as
+live signing (`in.SegmentTimeFn(req.StartMs)`, otherwise signing time).
+
+The CLI equivalent is `muxl sign-text-runs --cert cert.pem --key key.pem
+--track-manifest manifest.json` (or `--host-sign`/`--host-manifest`).
+It reads `{"startMs":0,"endMs":1000,"tracks":[{"trackId":100,"language":"en","cues":[]}]}` JSON
+on stdin and writes a DRISL map of decimal track-ID strings to signed byte
+strings on stdout. The Go API converts those keys to `uint32`.
+
 ### Transcode provenance
 
 `SignTranscode` signs a transcoded output segment so its C2PA manifest names the

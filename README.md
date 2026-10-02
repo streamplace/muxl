@@ -199,6 +199,15 @@ CID depends only on the GoP span, cue content, and track configuration.
 The small `samples/text-track.mp4` fixture contains video, audio, and two English
 WebVTT cues, including empty timeline intervals.
 
+For signed archive copies, `TextEngine.SignTextRuns(ctx, req, tracks, in)`
+mints and streamer-signs only standalone WebVTT runs for the recorded live
+`TextRequest`. It never receives or re-signs AV bytes and does not call
+`in.TextFn`. The archive caller replaces existing text runs, checks for
+non-text track-ID collisions, and concatenates all runs in ascending numeric
+track-ID order. Non-text runs, including separately signed transcodes, stay
+byte-identical. See [the Go API](go/README.md#signed-archive-text-runs) for the
+span, manifest, timestamp, and signer rules and the `sign-text-runs` CLI format.
+
 To keep normal pre-commit WASM rebuilding inside a builder container, install
 the repo hooks with `just install-hooks` and set `MUXL_BUILD_CONTAINER` to its
 name when committing.

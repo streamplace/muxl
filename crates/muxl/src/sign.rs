@@ -535,6 +535,28 @@ fn civil_from_days(z: i64) -> (i64, u32, u32) {
     (if m <= 2 { y + 1 } else { y }, m, d)
 }
 
+/// Emit the complete initialization snapshot, including late text tracks.
+fn write_init_event<W: Write>(
+    output: &mut W,
+    catalog: &muxl::catalog::Catalog,
+    data: Vec<u8>,
+) -> Result<()> {
+    let track_inits = muxl::init::build_track_init_segments(catalog)?
+        .into_iter()
+        .map(|(tid, bytes)| (tid.to_string(), muxl::cbor::ByteString(bytes)))
+        .collect();
+    let event = SignedEvent::Init {
+        data,
+        catalog: Some(catalog.clone()),
+        track_inits,
+    };
+    dasl::drisl::to_writer(&mut *output, &event).map_err(|e| {
+        Error::Io(std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))
+    })?;
+    output.flush()?;
+    Ok(())
+}
+
 fn handle_event<W: Write>(
     event: SegmenterEvent,
     init_seen: &mut bool,
@@ -547,35 +569,11 @@ fn handle_event<W: Write>(
     output: &mut W,
     c2pa_signer: &dyn C2paSigner,
 ) -> Result<()> {
-    use muxl::cbor::{ByteString, CborEvent};
     match event {
         SegmenterEvent::InitSegment { catalog, data } => {
             *init_seen = true;
-            *catalog_state = catalog.clone();
-            // Build an Init event with the catalog + per-track init segments
-            // so downstream consumers (Streamplace) have everything they need
-            // to derive HLS playback artifacts without re-parsing.
-            let track_inits: std::collections::BTreeMap<String, ByteString> =
-                muxl::init::build_track_init_segments(&catalog)
-                    .unwrap_or_default()
-                    .into_iter()
-                    .map(|(tid, bytes)| (tid.to_string(), ByteString(bytes)))
-                    .collect();
-            let event = SignedEvent::Init {
-                data,
-                catalog: Some(catalog),
-                track_inits,
-            };
-            // Drop the auto-generated `Init` case from CborEvent — we re-emit
-            // through SignedEvent ourselves so the wire type tag matches.
-            let _ = CborEvent::from_event;
-            dasl::drisl::to_writer(&mut *output, &event).map_err(|e| {
-                Error::Io(std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    e.to_string(),
-                ))
-            })?;
-            output.flush()?;
+            *catalog_state = catalog;
+            write_init_event(output, catalog_state, data)?;
         }
         SegmenterEvent::Segment(mut gop) => {
             if !*init_seen {
@@ -595,11 +593,16 @@ fn handle_event<W: Write>(
             let segment_base = next_track()?;
             let mut segment_when = None;
             if let Some(fetch) = text_fn.as_deref_mut() {
-                let req = muxl::text::StreamingText::request(catalog_state, &gop)?;
-                text.attach(&mut gop, req, fetch(req))?;
-                let millis = unsafe { host_get_segment_time(req.start_ms) };
-                if millis != i64::MIN {
-                    segment_when = Some(rfc3339_from_unix(millis.div_euclid(1000), millis.rem_euclid(1000) as u32));
+                if let Some(req) = muxl::text::StreamingText::request(catalog_state, &gop)? {
+                    text.attach(&mut gop, req, fetch(req))?;
+                    if text.update_catalog(catalog_state) {
+                        let data = muxl::init::build_init_segment(catalog_state)?;
+                        write_init_event(output, catalog_state, data)?;
+                    }
+                    let millis = unsafe { host_get_segment_time(req.start_ms) };
+                    if millis != i64::MIN {
+                        segment_when = Some(rfc3339_from_unix(millis.div_euclid(1000), millis.rem_euclid(1000) as u32));
+                    }
                 }
             }
             let segment_manifest = stamp_segment_manifest(&segment_base, &segment_when.unwrap_or_else(now_rfc3339_utc));

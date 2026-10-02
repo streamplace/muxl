@@ -43,6 +43,7 @@
 //!
 //! Spec: canonical-form.md § MUXL Flat MP4
 
+use std::collections::BTreeMap;
 use std::io::Write;
 
 use mp4_atom::{
@@ -491,6 +492,7 @@ pub fn build_synth_flat_header(
             timescale,
             start_offset_ticks,
             samples: per_track_samples.remove(&tid).unwrap(),
+            decode_time_overrides: BTreeMap::new(),
         });
     }
 
@@ -755,10 +757,12 @@ pub fn plan_from_fmp4<R: ReadAt + ?Sized>(
                 timescale: trak.mdia.mdhd.timescale,
                 samples: Vec::new(),
                 start_offset_ticks: 0,
+                decode_time_overrides: BTreeMap::new(),
             },
         );
     }
 
+    let mut text_next_decode: BTreeMap<u32, u64> = BTreeMap::new();
     // Walk top-level boxes. For each moof, parse its trun entries and
     // compute each sample's absolute byte offset in the input.
     cursor.seek(SeekFrom::Start(0)).map_err(Error::Io)?;
@@ -792,11 +796,9 @@ pub fn plan_from_fmp4<R: ReadAt + ?Sized>(
                 let track_id = traf.tfhd.track_id;
                 let trex = crate::fragment::trex_defaults(&moov, track_id);
 
-                // First tfdt seen on a track carries the presentation-start
-                // offset (MUXL fMP4 canonical form has no elst, so the
-                // offset lives here). Subsequent samples' decode times are
-                // recovered implicitly from per-sample durations during
-                // re-emission, so we only pick up the first one.
+                // Recover the track's presentation start from its first tfdt.
+                // Text also retains later discontinuities; normalization turns
+                // them into explicit gap samples before either wrapper writes.
                 if let Some(tfdt) = traf.tfdt.as_ref() {
                     if let Some(plan) = track_plans.get_mut(&track_id) {
                         if plan.samples.is_empty() {
@@ -804,6 +806,10 @@ pub fn plan_from_fmp4<R: ReadAt + ?Sized>(
                         }
                     }
                 }
+                let mut text_decode_time = catalog.text_configs()
+                    .any(|t| t.track_id() == track_id)
+                    .then(|| traf.tfdt.as_ref().map(|t| t.base_media_decode_time)
+                        .unwrap_or_else(|| text_next_decode.get(&track_id).copied().unwrap_or(0)));
 
                 for trun in &traf.trun {
                     // With default-base-is-moof (MUXL fMP4 files), data_offset
@@ -830,6 +836,16 @@ pub fn plan_from_fmp4<R: ReadAt + ?Sized>(
                                     track_id
                                 ))
                             })?;
+                        if let Some(dt) = text_decode_time.as_mut() {
+                            let expected = text_next_decode.get(&track_id).copied()
+                                .unwrap_or(plan.start_offset_ticks);
+                            if *dt != expected {
+                                plan.decode_time_overrides.insert(plan.samples.len(), *dt);
+                            }
+                            *dt = dt.checked_add(frame.duration as u64)
+                                .ok_or_else(|| Error::InvalidMp4("text timestamp overflow".into()))?;
+                            text_next_decode.insert(track_id, *dt);
+                        }
                         plan.samples.push(Sample {
                             duration: frame.duration,
                             size: frame.size,
@@ -916,6 +932,7 @@ pub fn plan_from_flat_mp4<R: ReadAt + ?Sized>(
             timescale: trak.mdia.mdhd.timescale,
             samples,
             start_offset_ticks,
+            decode_time_overrides: BTreeMap::new(),
         });
     }
     plans.sort_by_key(|p| p.track_id);
@@ -1934,6 +1951,7 @@ mod tests {
             is_video,
             timescale,
             start_offset_ticks: 0,
+            decode_time_overrides: BTreeMap::new(),
             samples: samples
                 .iter()
                 .map(|&(duration, is_sync)| Sample {

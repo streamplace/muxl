@@ -37,6 +37,7 @@ fn box_bytes(kind: &[u8; 4], body: &[u8], out: &mut Vec<u8>) -> Result<()> {
 
 /// Canonical active-cue intervals, including empty intervals. Input order does
 /// not matter. Adjacent equivalent active sets are coalesced.
+/// See `spec/canonical-form.md` § Timed Text (WebVTT) → Samples.
 pub fn canonical_samples(cues: &[Cue], start: u64, end: u64) -> Result<Vec<TextSample>> {
     if end <= start { return Err(invalid("text range must have positive duration")); }
     let mut points = BTreeSet::from([start, end]);
@@ -110,7 +111,9 @@ pub fn merge_cues(cues: Vec<Cue>) -> Vec<Cue> {
         pieces.sort_by_key(|c| (c.start,c.end));
         let mut merged: Vec<Cue> = Vec::new();
         for c in pieces {
-            if let Some(p) = merged.iter_mut().rev().find(|p| p.end == c.start) { p.end=c.end; }
+            // Continue the oldest matching cue so a nested identical cue
+            // ends before the outer cue, rather than extending past it.
+            if let Some(p) = merged.iter_mut().find(|p| p.end == c.start) { p.end=c.end; }
             else { merged.push(c); }
         }
         out.extend(merged);
@@ -139,7 +142,7 @@ pub fn cues_from_fragments(data: &[u8], timescale: u32) -> Result<Vec<Cue>> {
                     let size=entry.size.or(traf.tfhd.default_sample_size).ok_or_else(|| invalid("missing text size"))? as usize;
                     let end=dt.checked_add(duration as u64).ok_or_else(|| invalid("text timestamp overflow"))?;
                     let bytes=data.get(payload..payload.checked_add(size).ok_or_else(|| invalid("text size overflow"))?).ok_or_else(|| invalid("text sample out of bounds"))?;
-                    cues.extend(cues_from_sample(bytes, dt*1000/timescale as u64,end*1000/timescale as u64)?);
+                    cues.extend(cues_from_sample(bytes, crate::segment::ticks_to_ms(dt, timescale), crate::segment::ticks_to_ms(end, timescale))?);
                     dt=end;payload+=size;
                 }
             }
@@ -150,10 +153,8 @@ pub fn cues_from_fragments(data: &[u8], timescale: u32) -> Result<Vec<Cue>> {
 }
 
 pub fn build_track(config: &TextConfig, cues: &[Cue], start: u64, end: u64) -> Result<Vec<u8>> {
-    let mut config = config.clone();
-    config.container = crate::catalog::Container::cmaf(1000, config.track_id());
     Ok(mint_track(
-        &config,
+        config,
         cues,
         TextRequest {
             start_ms: start,
@@ -170,13 +171,16 @@ pub fn mint_track(
     cues: &[Cue],
     req: TextRequest,
 ) -> Result<(Vec<u8>, crate::segment::TrackSamples)> {
+    let mut config = config.clone();
+    let track_id = config.track_id();
+    config.container = crate::catalog::Container::cmaf(1000, track_id);
     let mut catalog = Catalog::default();
-    catalog.insert_text(format!("text{}", config.track_id()), config.clone());
+    catalog.insert_text(format!("text{track_id}"), config);
     let samples = crate::segment::text_span_samples(cues, req.start_ms, req.end_ms)?;
     let mut progress = TrackProgress::starting_at(req.start_ms);
     crate::segment::mint_text_segment(
         &catalog,
-        config.track_id(),
+        track_id,
         &mut progress,
         &samples,
     )
@@ -232,17 +236,26 @@ pub struct StreamingText {
 }
 
 impl StreamingText {
-    pub fn request(catalog: &Catalog, gop: &crate::GopSegment) -> Result<TextRequest> {
+    /// No span exists when the catalog's reference track has no samples.
+    pub fn request(catalog: &Catalog, gop: &crate::GopSegment) -> Result<Option<TextRequest>> {
         let reference = catalog.video_configs().min_by_key(|c| c.track_id())
             .map(|c| (c.track_id(), c.timescale()))
             .or_else(|| catalog.audio_configs().min_by_key(|c| c.track_id())
                 .map(|c| (c.track_id(), c.timescale())))
             .ok_or_else(|| invalid("streaming text requires an AV reference track"))?;
-        let start = gop.first_decode_times[&reference.0];
-        Ok(TextRequest {
+        let Some(&start) = gop.first_decode_times.get(&reference.0) else { return Ok(None); };
+        let end_ms = match gop.reference_end_ms {
+            Some(end) => end,
+            None => {
+                let duration = gop.durations.get(&reference.0).ok_or_else(|| invalid("reference track missing duration"))?;
+                let end = start.checked_add(*duration).ok_or_else(|| invalid("reference timestamp overflow"))?;
+                crate::segment::ticks_to_ms(end, reference.1)
+            }
+        };
+        Ok(Some(TextRequest {
             start_ms: crate::segment::ticks_to_ms(start, reference.1),
-            end_ms: gop.reference_end_ms.unwrap_or_else(|| crate::segment::ticks_to_ms(start + gop.durations[&reference.0], reference.1)),
-        })
+            end_ms,
+        }))
     }
 
     pub fn attach(&mut self, gop: &mut crate::GopSegment, req: TextRequest, attachment: TextAttachment) -> Result<()> {
@@ -277,12 +290,88 @@ impl StreamingText {
         }
         Ok(())
     }
+
+    /// Publish newly declared tracks without changing existing AV metadata.
+    pub fn update_catalog(&self, catalog: &mut Catalog) -> bool {
+        let mut changed = false;
+        for (&id, config) in &self.tracks {
+            if !catalog.text_configs().any(|c| c.track_id() == id) {
+                catalog.insert_text(format!("text{id}"), config.clone());
+                changed = true;
+            }
+        }
+        changed
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     fn cue(start:u64,end:u64,text:&str)->Cue { Cue{start,end,text:text.into(),id:None,settings:None} }
+
+    fn review_config(timescale: u32) -> TextConfig {
+        TextConfig { codec: "wvtt".into(), container: crate::catalog::Container::cmaf(timescale, 100),
+            language: "en".into(), label: None, config: "WEBVTT".into() }
+    }
+
+    #[test]
+    fn review_identical_nested_overlaps_retain_intervals() {
+        let config = review_config(1000);
+        let mut wanted = vec![cue(0, 10, "same"), cue(5, 7, "same")];
+        for c in &mut wanted {
+            c.id = Some("same-id".into());
+            c.settings = Some("align:start".into());
+        }
+        let data = build_track(&config, &wanted, 0, 10).unwrap();
+        assert_eq!(cues_from_fragments(&data, 1000).unwrap(), wanted);
+    }
+
+    #[test]
+    fn review_large_text_decode_time_does_not_overflow() {
+        let start = u64::MAX / 1000 + 1;
+        let wanted = vec![cue(start, start + 10, "late")];
+        let data = build_track(&review_config(1000), &wanted, start, start + 10).unwrap();
+        assert_eq!(cues_from_fragments(&data, 1000).unwrap(), wanted);
+    }
+
+    #[test]
+    fn review_mint_normalizes_extracted_text_timescale() {
+        let config = review_config(90_000);
+        let wanted = vec![cue(1200, 1300, "milliseconds")];
+        let (data, meta) = mint_track(&config, &wanted, TextRequest { start_ms: 1000, end_ms: 2000 }).unwrap();
+        let catalog = crate::catalog::from_segment(&data).unwrap();
+        let output = catalog.text_configs().next().unwrap();
+        assert_eq!(output.timescale(), 1000);
+        assert_eq!(cues_from_fragments(&data, output.timescale()).unwrap(), wanted);
+        assert_eq!(meta.durations, vec![200, 100, 700]);
+        assert_eq!(config.timescale(), 90_000);
+    }
+
+    #[test]
+    fn review_source_rewrites_preserve_text_fragment_gaps() {
+        let config = review_config(1000);
+        let wanted = vec![cue(0, 100, "first"), cue(500, 600, "after gap")];
+        let mut catalog = Catalog::default();
+        catalog.insert_text("text100", config.clone());
+        let mut input = crate::init::build_init_segment(&catalog).unwrap();
+        input.extend(build_track(&config, &wanted[..1], 0, 100).unwrap());
+        input.extend(build_track(&config, &wanted[1..], 500, 600).unwrap());
+        let source = crate::read(&input).unwrap();
+        for flat in [false, true] {
+            let mut output = Vec::new();
+            if flat {
+                crate::flat::write(&source, &input, &mut output).unwrap();
+            } else {
+                crate::fmp4::write(&source, &input, &mut output).unwrap();
+            }
+            let segments = crate::reader::unwrap(&output).unwrap();
+            let mut recovered = Vec::new();
+            for segment in segments {
+                recovered.extend(cues_from_fragments(segment.data, 1000).unwrap());
+            }
+            assert_eq!(merge_cues(recovered), wanted, "flat={flat}");
+        }
+    }
     #[test]
     fn deterministic_overlaps_gaps_and_clipping() {
         let cues=vec![cue(100,700,"first"),cue(400,1200,"second")];
@@ -348,12 +437,12 @@ mod tests {
         let mut gops = Vec::new();
         let catalog = crate::segment_fmp4(&mut Cursor::new(input), |g| { gops.push(g); Ok(()) }).unwrap();
         let mut state = StreamingText::default();
-        let first = StreamingText::request(&catalog, &gops[0]).unwrap();
+        let first = StreamingText::request(&catalog, &gops[0]).unwrap().unwrap();
         let wanted = cue(first.end_ms - 100, first.end_ms + 100, "boundary");
         let id = 100;
         let mut recovered = Vec::new();
         for (i, gop) in gops.iter_mut().enumerate() {
-            let req = StreamingText::request(&catalog, gop).unwrap();
+            let req = StreamingText::request(&catalog, gop).unwrap().unwrap();
             let av = gop.tracks.clone();
             let duration = gop.duration_us;
             let attachment = if i < 2 { TextAttachment { tracks: vec![TextTrackAttachment {
@@ -378,7 +467,7 @@ mod tests {
         let catalog = crate::segment_fmp4(&mut Cursor::new(input), |g| { gops.push(g); Ok(()) }).unwrap();
         let mut state = StreamingText::default();
         for gop in &mut gops {
-            let req = StreamingText::request(&catalog, gop).unwrap();
+            let req = StreamingText::request(&catalog, gop).unwrap().unwrap();
             let before = gop.tracks.clone();
             let body = gop.body_size;
             state.attach(gop, req, TextAttachment::default()).unwrap();
@@ -405,8 +494,8 @@ mod tests {
         }
         let mut gops = Vec::new();
         let catalog = crate::segment_fmp4(&mut Cursor::new(input), |g| { gops.push(g); Ok(()) }).unwrap();
-        let first = StreamingText::request(&catalog,&gops[0]).unwrap();
-        let second = StreamingText::request(&catalog,&gops[1]).unwrap();
+        let first = StreamingText::request(&catalog,&gops[0]).unwrap().unwrap();
+        let second = StreamingText::request(&catalog,&gops[1]).unwrap().unwrap();
         assert_eq!(first.end_ms,second.start_ms,"text must tile the actual keyframe boundary, including decode gaps");
         let mut state = StreamingText::default();
         let id = 100;

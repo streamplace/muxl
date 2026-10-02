@@ -183,10 +183,13 @@ type SignerInput struct {
 	TrackManifestFn   func() ([]byte, error)
 	WrapperManifest   []byte
 	WrapperManifestFn func() ([]byte, error)
-	// TextFn is called before each GoP is signed and may block to wait for
-	// final captions. Nil preserves the no-text path. Errors are nonfatal:
-	// previously declared tracks receive gap-only segments. Track IDs and
-	// language/label must remain fixed for the session.
+	// TextFn is called before each GoP with reference samples is signed and
+	// may block to wait for final captions. The reference is the lowest-ID
+	// catalog video track, or lowest-ID audio track if there is no video.
+	// Nil preserves the no-text path. Errors are nonfatal: previously declared
+	// tracks receive gap-only segments. Track IDs and language/label must
+	// remain fixed for the session. A GoP with no reference samples skips
+	// TextFn and SegmentTimeFn and attaches no text.
 	TextFn func(context.Context, TextRequest) (*TextAttachment, error)
 	// SegmentTimeFn supplies the media-start wall clock stamped into dc:date.
 	// Nil retains the ordinary signing-time stamp, byte-identically.
@@ -246,6 +249,8 @@ const TranscodeIngredientLabel = "muxl.source"
 // Event is one event from the muxl wasm's DRISL output stream. The wire format
 // is the Rust side's tagged union; fields not relevant to a given Type are
 // left zero. Type is "init", "segment", or "signed-segment".
+// SignSegment re-emits a complete Init snapshot before a newly declared text
+// track's first GoP; consumers must process subsequent Init updates.
 type Event struct {
 	Type   string `cbor:"type"`
 	Number uint32 `cbor:"number,omitempty"`

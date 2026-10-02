@@ -209,6 +209,13 @@ The text `trak` follows the common rules (§ Init Segment moov), with:
 
 On extraction, the `text`, `subt`, and `sbtl` handlers are all accepted, but only a `wvtt` sample entry yields a rendition. `language` comes from `elng` when it is present and non-empty. Otherwise it comes from `mdhd`, shortened to ISO 639-1 where a two-letter code exists (`eng` → `en`), so ordinary muxer output yields a BCP 47 tag. An empty `vttC` is read as `"WEBVTT"`, and an empty `vlab` as no label.
 
+The streaming signer's event protocol emits a complete `init` snapshot again
+when a host first declares a new text track, before that track's first signed
+GoP. The combined init, catalog, and per-track inits all include the grown track
+set. This is an event-stream update, not an inline `moov` appended to a storage
+file. Canonical segments still carry their own single-track catalogs, so unwrap
+and presentation synthesis discover late tracks independently of these events.
+
 ### Samples
 
 A WebVTT sample covers a time interval and holds the complete set of cues active for the whole interval:
@@ -222,21 +229,26 @@ Determinism rules:
 - **Overlaps split into disjoint samples.** The timeline is cut at every cue start and every cue end. Each resulting interval becomes one sample containing every cue active over it. Overlapping cues therefore never produce overlapping samples: two cues that overlap by 500 ms yield three samples (first cue alone, both cues, second cue alone).
 - **No per-sample timing boxes.** A sample's time is its decode time and duration, so `ctim` (CueTimeBox), `vsid` (CueSourceIDBox), and `vtta` (VTTAdditionalTextBox) are not emitted.
 - **Sync and timing.** Every text sample is a sync sample (`trun` flags `0x02000000`) with zero composition offset. Its duration is the length of its interval. Zero-length intervals are never emitted.
-- **Equivalent intervals.** Adjacent intervals with identical encoded active cue sets coalesce within a GoP. Identical contiguous pieces merge when reading cues; distinct adjacent cues need distinct IDs if their boundary must survive.
+- **Equivalent intervals.** Adjacent intervals with identical encoded active cue sets coalesce within a GoP. Identical contiguous pieces merge when reading cues; distinct adjacent cues need distinct IDs if their boundary must survive. When indistinguishable overlapping cues change multiplicity, reading continues the oldest matching cue first, preserving nested identical cues. The samples cannot distinguish nested from crossing intervals with the same active multisets; use distinct IDs when those identities must survive.
 
 ### Segmentation
 
-Text tracks follow the GoP structure that the reference track defines. The reference track is the first video track, otherwise the first audio track. A text track is never the reference while any video or audio track exists.
+Text tracks follow the GoP span of the reference track: the lowest-ID video track in the catalog, otherwise the lowest-ID audio track. A text track is never the reference while any video or audio track exists.
 
 - **Boundary in text ticks.** A GoP that starts at reference decode time `t_ref` (reference timescale `ts_ref`) starts at `floor(t_ref * 1000 / ts_ref)` on the text track. Flooring is part of the canonical form. The flat-MP4 writer assigns text samples to GoPs with the same floored boundary, so a sample that starts exactly on a boundary lands in the GoP it opens rather than being pulled into the previous GoP by microsecond rounding.
+- **Reference clock at a cut.** AV retains its existing keyframe-driven cuts. If the incoming frame belongs to the reference track, its decode time closes the text span; a cut triggered by another track uses the end of the last recorded reference sample instead. The next span begins at the reference track's first sample in that GoP. The final span ends at the reference track's sample end.
 - **Clipping.** A cue that spans a GoP boundary is cut at the boundary. The cue appears, complete and unchanged, in a sample on each side.
-- **Padding.** Each GoP's text segment covers its GoP span exactly, from the GoP's text start to the next GoP's text start. Time with no active cue at the start, middle, or end of the span is filled with `vtte` samples. A text track therefore has a segment in every GoP, even a GoP with no captions, and the text segments of consecutive GoPs tile the stream timeline.
+- **Padding.** Each GoP with reference samples gets a text segment spanning its reference start through its reference-clock cut. Time with no active cue at the start, middle, or end is filled with `vtte` samples. Consecutive reference spans tile the stream when reference samples are continuous. A sparse GoP with no reference samples has no text span: the signer skips both text and media-time callbacks, signs the available AV at signing time, and attaches no text.
 - **GoP duration.** A text segment never extends a GoP's playable duration (`duration_us`). That duration comes from the GoP's video and audio tracks. It falls back to the text span only for a GoP that has no video or audio track.
 - **Text-only streams.** The smallest-id text track defines 1-second spans anchored at its first sample, with a shorter final span. Input text samples must arrive before the boundary that closes their span; live segmentation cannot retroactively modify an emitted GoP.
 
 ### Storage formats and hashing
 
 Text canonical segments are interleaved, unwrapped, and recovered byte-for-byte exactly like video and audio segments (§ Interleaving Order, § Round-Trip Property). In the flat MP4, the text `trak` has populated `stts`/`stsz`/`stsc`/`co64` like any track, with no `stss` (every sample is sync) and no `ctts`. Its `co64` entries point at the `vttc`/`vtte` payloads inside the inner mdats.
+
+Source-based rewriting retains discontinuous input text `tfdt` values and
+canonicalizes their gaps into explicit `vtte` samples before writing fMP4 or
+flat MP4, using the same millisecond conversion as live text ingestion.
 
 A text segment is a canonical segment. Its content address and any signature cover its whole byte range (uuid catalog plus every `moof+mdat`), with the same per-track hashing and signing as video and audio. Dropping, replacing, or verifying a text track never affects the other tracks.
 

@@ -1689,7 +1689,7 @@ mod tests {
         let catalog = crate::segment_fmp4(&mut std::io::Cursor::new(input),|g| { gops.push(g);Ok(()) }).unwrap();
         let mut bytes = Vec::new();
         for (epoch,index) in [0usize,1,0].into_iter().enumerate() {
-            let req = crate::text::StreamingText::request(&catalog,&gops[index]).unwrap();
+            let req = crate::text::StreamingText::request(&catalog,&gops[index]).unwrap().unwrap();
             let config = crate::catalog::TextConfig {
                 codec:"wvtt".into(),container:crate::catalog::Container::cmaf(1000,10),
                 language:if epoch==2 {"es"} else {"en"}.into(),

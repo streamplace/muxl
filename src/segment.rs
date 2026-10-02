@@ -414,18 +414,16 @@ impl StreamSegmenter {
         };
 
         if boundary {
-            // The text span ends at the reference time of the cut: the
-            // keyframe's decode time, or (audio-only) where the clock track
-            // that triggered the cut has reached.
-            let cut_ms = if is_video_keyframe {
-                Some(ticks_to_ms(frame.decode_time, self.timescale_of(frame.track_id)))
-            } else {
-                self.track_durations.keys().next().and_then(|tid| {
-                    self.av_next_decode
-                        .get(tid)
-                        .map(|&t| ticks_to_ms(t, self.timescale_of(*tid)))
-                })
-            };
+            // A non-reference keyframe still cuts AV, but text must end on
+            // the reference track's clock, not the triggering track's.
+            let cut_ms = self.reference.and_then(|tid| {
+                let end = if tid == frame.track_id {
+                    Some(frame.decode_time)
+                } else {
+                    self.av_next_decode.get(&tid).copied()
+                };
+                end.map(|t| ticks_to_ms(t, self.timescale_of(tid)))
+            });
             if let Some(gop) = self.flush_gop(cut_ms)? {
                 out.push(gop);
             }
@@ -525,7 +523,7 @@ impl StreamSegmenter {
         let mut text_parts = Vec::new();
         if let Some(end) = text_end {
             let start = self.text_gop_start.unwrap_or(end);
-            self.text_gop_start = Some(end);
+            self.text_gop_start = self.text_reference.map(|_| end);
             for (&tid, st) in self.text.iter_mut() {
                 // Drop cues that ended before this span; what's left with a
                 // start before `end` overlaps the span.
@@ -1035,6 +1033,50 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn review_nonreference_keyframe_uses_reference_text_span() {
+        let input = read_fixture("h264-opus-frag.mp4");
+        let mut catalog = crate::init::catalog_from_mp4(Cursor::new(&input)).unwrap();
+        let mut reference = catalog.video_configs().next().unwrap().clone();
+        reference.container = Container::cmaf(1000, 1);
+        catalog.video.as_mut().unwrap().renditions.clear();
+        catalog.insert_video("video1", reference.clone());
+        reference.container = Container::cmaf(2000, 3);
+        catalog.insert_video("video3", reference);
+        let text = crate::catalog::TextConfig { codec: "wvtt".into(), container: Container::cmaf(1000, 100),
+            language: "en".into(), label: None, config: "WEBVTT".into() };
+        catalog.insert_text("text100", text);
+        let mut segmenter = StreamSegmenter::new(&catalog);
+        let wanted = crate::text::Cue { start: 0, end: 300, text: "continuous".into(), id: None, settings: None };
+        let text_samples = crate::text::canonical_samples(&[wanted.clone()], 0, 300).unwrap();
+        let make_frame = |tid, dt, duration, sync, payload: &[u8]| {
+            let info = FrameInfo { duration, size: payload.len() as u32, is_sync: sync, cts_offset: 0 };
+            let mut data = Vec::new();
+            let mut progress = TrackProgress::starting_at(dt);
+            write_frame_fragment(&mut data, tid, &mut progress, &info, payload).unwrap();
+            let moof_size = u32::from_be_bytes(data[..4].try_into().unwrap());
+            Frame { track_id: tid, is_sync: sync, duration, size: info.size, cts_offset: 0,
+                decode_time: dt, moof_size, data }
+        };
+        segmenter.push_frame(&make_frame(100, 0, 300, true, &text_samples[0].data)).unwrap();
+        segmenter.push_frame(&make_frame(1, 0, 100, true, &[1])).unwrap();
+        segmenter.push_frame(&make_frame(1, 100, 100, false, &[2])).unwrap();
+        let first = segmenter.push_frame(&make_frame(3, 1800, 200, true, &[3])).unwrap().pop().unwrap();
+        assert_eq!(first.reference_end_ms, Some(200), "other track's 900 ms cut must not move the reference");
+        assert_eq!(first.first_decode_times[&100], 0);
+        assert_eq!(first.durations[&100], 200);
+        let mut clipped = wanted.clone();
+        clipped.end = 200;
+        assert_eq!(crate::text::cues_from_fragments(&first.tracks[&100], 1000).unwrap(), vec![clipped]);
+        segmenter.push_frame(&make_frame(1, 200, 100, false, &[4])).unwrap();
+        let second = segmenter.finish().unwrap().pop().unwrap();
+        assert_eq!(second.first_decode_times[&100], 200);
+        assert_eq!(second.durations[&100], 100);
+        let mut tail = wanted;
+        tail.start = 200;
+        assert_eq!(crate::text::cues_from_fragments(&second.tracks[&100], 1000).unwrap(), vec![tail]);
     }
 
     #[test]

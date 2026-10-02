@@ -105,6 +105,11 @@ pub struct TrackPlan {
     pub start_offset_ticks: u64,
     /// Samples in decode order.
     pub samples: Vec<Sample>,
+    /// Discontinuous source text decode times, keyed by sample index. Absent
+    /// entries continue the previous sample's clock. Normalization consumes
+    /// these into explicit `vtte` gaps (§ Timed Text (WebVTT) → Samples).
+    /// AV plans leave this empty, retaining their compact per-sample layout.
+    pub decode_time_overrides: std::collections::BTreeMap<usize, u64>,
 }
 
 /// Per-sample metadata. 24 B/sample (plus align) — a 24 h/60 fps video
@@ -164,6 +169,7 @@ pub(crate) fn normalize_text<'a, R: crate::io::ReadAt + ?Sized>(
     let mut duration = 0u64;
     let text_only = source.catalog.text_configs().any(|t|t.track_id()==reference.track_id);
     for (i,sample) in reference.samples.iter().enumerate() {
+        dt = reference.decode_time_overrides.get(&i).copied().unwrap_or(dt);
         if i>0 && ((reference.is_video && sample.is_sync) || (!reference.is_video && !text_only && duration >= reference.timescale as u64)) {
             let end=ticks_to_ms(dt,reference.timescale);
             if end>start { spans.push((start,end)); }
@@ -180,7 +186,8 @@ pub(crate) fn normalize_text<'a, R: crate::io::ReadAt + ?Sized>(
         let mut cues=Vec::new();
         let mut dt=plan.start_offset_ticks;
         let mut bytes=Vec::new();
-        for sample in &plan.samples {
+        for (i, sample) in plan.samples.iter().enumerate() {
+            dt = plan.decode_time_overrides.get(&i).copied().unwrap_or(dt);
             bytes.resize(sample.size as usize,0);
             input.read_exact_at(sample.input_offset,&mut bytes)?;
             cues.extend(crate::text::cues_from_sample(&bytes,ticks_to_ms(dt,plan.timescale),ticks_to_ms(dt+sample.duration as u64,plan.timescale))?);
@@ -198,6 +205,7 @@ pub(crate) fn normalize_text<'a, R: crate::io::ReadAt + ?Sized>(
         normalized.timescale=1000;
         normalized.start_offset_ticks=spans.first().map_or(0,|s|s.0);
         normalized.samples=samples;
+        normalized.decode_time_overrides.clear();
     }
     crate::segment::normalize_text_catalog(&mut result.catalog);
     Ok((result,payloads))

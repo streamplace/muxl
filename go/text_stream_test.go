@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"reflect"
 	"testing"
+	"time"
 
 	muxl "github.com/streamplace/muxl/go"
 )
@@ -122,4 +123,131 @@ func TestSignSegmentTextErrorKeepsTrackContinuous(t *testing.T) {
 		return
 	}
 	t.Fatal("second GoP missing")
+}
+
+func TestSignSegmentLateTextRefreshesInit(t *testing.T) {
+	eng := newEngine(t)
+	in := signerInput(t)
+	calls := 0
+	track := muxl.TextTrack{TrackID: 100, Language: "en-US", Label: "late"}
+	var want muxl.TextCue
+	in.TextFn = func(_ context.Context, req muxl.TextRequest) (*muxl.TextAttachment, error) {
+		calls++
+		if calls == 1 {
+			return nil, nil
+		}
+		want = muxl.TextCue{Start: req.StartMs, End: req.EndMs, Text: "declared later"}
+		return &muxl.TextAttachment{Tracks: []muxl.TextTrackAttachment{{TextTrack: track, Cues: []muxl.TextCue{want}}}}, nil
+	}
+	events, err := collectEvents(func(ch chan<- *muxl.Event) error {
+		return eng.SignSegment(context.Background(), bytes.NewReader(readFile(t, fixtureFmp4)), in, nil, nil, ch)
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var current *muxl.Event
+	var stream bytes.Buffer
+	for _, ev := range events {
+		if ev.Type == "init" {
+			current = ev
+			continue
+		}
+		if ev.Type != "signed-segment" {
+			continue
+		}
+		if data, ok := ev.Tracks["100"]; ok {
+			if current == nil || current.Catalog == nil || current.Catalog.Text == nil {
+				t.Fatal("late text segment has no preceding text Init catalog")
+			}
+			config := current.Catalog.Text.Renditions["text100"]
+			if config.Language != track.Language || config.Label != track.Label {
+				t.Fatalf("late Init config=%+v", config)
+			}
+			init := current.TrackInits["100"]
+			playable := append(append([]byte(nil), init...), data...)
+			gotTracks, err := eng.TextTracks(context.Background(), bytes.NewReader(init))
+			if err != nil || !reflect.DeepEqual(gotTracks, []muxl.TextTrack{track}) {
+				t.Fatalf("late per-track HLS init cannot initialize captions: %+v %v", gotTracks, err)
+			}
+			combinedTracks, err := eng.TextTracks(context.Background(), bytes.NewReader(current.Data))
+			if err != nil || !reflect.DeepEqual(combinedTracks, []muxl.TextTrack{track}) {
+				t.Fatalf("combined refreshed Init lost late text: %+v %v", combinedTracks, err)
+			}
+			got, err := eng.ReadTextCues(context.Background(), bytes.NewReader(playable), 100)
+			if err != nil || !reflect.DeepEqual(got, []muxl.TextCue{want}) {
+				t.Fatalf("late initialized captions=%+v %v", got, err)
+			}
+		}
+		for _, id := range []string{"1", "2", "100"} {
+			stream.Write(ev.Tracks[id])
+		}
+	}
+	if calls != 2 {
+		t.Fatalf("callback calls=%d", calls)
+	}
+	// muxl's unwrap path discovers late tracks from their own catalogs.
+	gotTracks, err := eng.TextTracks(context.Background(), bytes.NewReader(stream.Bytes()))
+	if err != nil || !reflect.DeepEqual(gotTracks, []muxl.TextTrack{track}) {
+		t.Fatalf("late canonical track unreachable: %+v %v", gotTracks, err)
+	}
+}
+
+func TestSignSegmentMissingReferenceSkipsMediaCallbacks(t *testing.T) {
+	eng := newEngine(t)
+	ctx := context.Background()
+	original, err := collectEvents(func(ch chan<- *muxl.Event) error {
+		return eng.SegmentEvents(ctx, bytes.NewReader(readFile(t, fixtureFmp4)), ch)
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var sparse bytes.Buffer
+	for _, ev := range original {
+		if ev.Type == "init" {
+			sparse.Write(ev.Data) // Catalog still declares the absent video reference.
+		} else if ev.Type == "segment" {
+			sparse.Write(ev.Tracks["2"])
+		}
+	}
+	for _, withText := range []bool{false, true} {
+		t.Run(fmt.Sprint("text=", withText), func(t *testing.T) {
+			in := signerInput(t)
+			if withText {
+				in.TextFn = func(context.Context, muxl.TextRequest) (*muxl.TextAttachment, error) {
+					t.Error("TextFn received an invented reference span")
+					return nil, nil
+				}
+			}
+			in.SegmentTimeFn = func(uint64) time.Time {
+				t.Error("SegmentTimeFn received an invented reference start")
+				return time.Time{}
+			}
+			events, err := collectEvents(func(ch chan<- *muxl.Event) error {
+				return eng.SignSegment(ctx, bytes.NewReader(sparse.Bytes()), in, nil, nil, ch)
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			var signed []byte
+			for _, ev := range events {
+				if ev.Type == "signed-segment" {
+					signed = append(signed, ev.Tracks["2"]...)
+					if _, ok := ev.Tracks["100"]; ok {
+						t.Fatal("invented a text track without a reference span")
+					}
+				}
+			}
+			report, err := eng.Verify(ctx, bytes.NewReader(signed))
+			if err != nil {
+				t.Fatal(err)
+			}
+			var doc verifyDoc
+			if err := json.Unmarshal([]byte(report), &doc); err != nil {
+				t.Fatal(err)
+			}
+			if len(doc.Segments) != 1 || doc.Segments[0].ValidationState == "Invalid" {
+				t.Fatalf("sparse audio signing failed: %s", report)
+			}
+		})
+	}
 }

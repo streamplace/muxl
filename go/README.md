@@ -46,22 +46,38 @@ callers.
 
 `SignerInput.TextFn` is an optional per-GoP callback. It receives `TextRequest`
 with the reference AV GoP's absolute stream-millisecond interval `[StartMs,
-EndMs)`. Return `TextAttachment` containing `TextTrackAttachment` entries: an
+EndMs)`. The reference is the lowest-ID video track in the input catalog, or
+the lowest-ID audio track when there is no video. Return `TextAttachment`
+containing `TextTrackAttachment` entries: an
 immutable `TextTrack` configuration (`TrackID`, BCP 47 `Language`, `Label`) and
 its overlapping `TextCue`s. Reserve a text ID namespace distinct from input AV
 and downstream renditions; do not reuse another track's ID.
 
 The signer encodes WebVTT and gap-covering segments before signing, without
 changing AV bytes or playable duration. Once declared, a text track appears in
-every subsequent GoP, even when omitted from the callback result or when the
-callback fails. Language/label changes require a new track ID. Callbacks may
-block to await source captions; callers should decouple their media producer.
+every subsequent GoP with reference samples, even when omitted from the callback
+result or when the callback fails. Language/label changes require a new track
+ID. Callbacks may block to await source captions; callers should decouple their
+media producer.
 A nil callback preserves the pre-text signed bytes. Cue IDs should identify the
 session and remain stable across GoP boundaries so readers can coalesce them.
+
+On first declaration of any new text track, the signer emits a refreshed `init`
+event before the affected `signed-segment`. Each `init` is a complete snapshot:
+`Catalog`, `Data` (combined initialization), and `TrackInits` include every
+declared track. Consumers must process later snapshots as well as the first;
+per-track HLS initialization and archived text rendition discovery can continue
+to use these fields without parsing segment catalogs.
 
 `SignerInput.SegmentTimeFn` optionally maps each absolute media start in
 milliseconds to its signed UTC start time. Nil retains the existing signing-time
 stamp. It is independent of text and can be used for AV-only origins as well.
+
+If the reference track has no samples in a sparse GoP, neither `TextFn` nor
+`SegmentTimeFn` is invoked: there is no reference interval or start to report.
+Its AV tracks are still signed using signing time, without attaching text.
+The signer never substitutes a higher-ID track or audio for an absent video
+reference.
 
 `UnwrapEvents` preserves legacy AV numeric-wrap grouping, including sparse
 leading/trailing AV fragments in flat blobs. Text can precede its AV GoP;

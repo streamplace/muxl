@@ -914,7 +914,8 @@ pub fn cmd_text(args: TextArgs) -> crate::Result<()> {
                     let source=crate::read(&bytes)?;
                     let plan=source.plan.track(args.track_id).ok_or_else(||crate::Error::InvalidMp4("text plan not found".into()))?;
                     let mut dt=plan.start_offset_ticks;
-                    for sample in &plan.samples {
+                    for (i, sample) in plan.samples.iter().enumerate() {
+                        dt=plan.decode_time_overrides.get(&i).copied().unwrap_or(dt);
                         let start=crate::segment::ticks_to_ms(dt,plan.timescale);
                         dt+=sample.duration as u64;
                         let end=crate::segment::ticks_to_ms(dt,plan.timescale);

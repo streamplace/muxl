@@ -98,6 +98,22 @@ func textTrackSegment(t *testing.T, trackID uint32, decodeTimeMs uint64, duratio
 	return seg
 }
 
+// numericTrackIDs returns ev.Tracks' keys as track ids in ascending numeric
+// order (the keys are stringified, so a lexical sort would misorder 10 vs 2).
+func numericTrackIDs(t *testing.T, ev *muxl.Event) []uint32 {
+	t.Helper()
+	tids := make([]uint32, 0, len(ev.Tracks))
+	for key := range ev.Tracks {
+		n, err := strconv.ParseUint(key, 10, 32)
+		if err != nil {
+			t.Fatalf("track id %q: %v", key, err)
+		}
+		tids = append(tids, uint32(n))
+	}
+	sort.Slice(tids, func(i, j int) bool { return tids[i] < tids[j] })
+	return tids
+}
+
 // bareStreams segments the fixture and returns the canonical interleaved
 // stream, plus the same stream with one text-track segment appended to every
 // GoP, and the GoP count.
@@ -110,31 +126,24 @@ func bareStreams(t *testing.T, eng *muxl.WASMEngine) (baseline, withText []byte,
 	if err != nil {
 		t.Fatalf("SegmentEvents: %v", err)
 	}
-	var maxTID uint64
+	var maxTID uint32
 	for _, ev := range events {
-		for tid := range ev.Tracks {
-			n, err := strconv.ParseUint(tid, 10, 32)
-			if err != nil {
-				t.Fatalf("track id %q: %v", tid, err)
-			}
-			if n > maxTID {
-				maxTID = n
+		for _, tid := range numericTrackIDs(t, ev) {
+			if tid > maxTID {
+				maxTID = tid
 			}
 		}
 	}
-	textTID := uint32(maxTID + 1)
+	textTID := maxTID + 1
 	for _, ev := range events {
 		if ev.Type != "segment" {
 			continue
 		}
-		tids := make([]string, 0, len(ev.Tracks))
-		for tid := range ev.Tracks {
-			tids = append(tids, tid)
-		}
-		sort.Strings(tids)
-		for _, tid := range tids {
-			baseline = append(baseline, ev.Tracks[tid]...)
-			withText = append(withText, ev.Tracks[tid]...)
+		// Canonical interleave order: tracks ascend numerically within a GoP.
+		for _, tid := range numericTrackIDs(t, ev) {
+			seg := ev.Tracks[strconv.FormatUint(uint64(tid), 10)]
+			baseline = append(baseline, seg...)
+			withText = append(withText, seg...)
 		}
 		withText = append(withText, textTrackSegment(t, textTID, uint64(gops)*2000, 2000, fmt.Appendf(nil, "gop %d words", gops))...)
 		gops++

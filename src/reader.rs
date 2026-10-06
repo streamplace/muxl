@@ -138,12 +138,18 @@ fn push_segment<'a>(
 ) -> Result<()> {
     let data = &stream[start..end];
     let catalog = catalog::from_segment(data)?;
-    let track_id = catalog
+    // A segment whose catalog names no rendition this version understands
+    // (a track type introduced by a newer MUXL) is ignored, not an error —
+    // spec § uuid Body. A catalog that fails to decode at all is still an
+    // error above.
+    let Some(track_id) = catalog
         .video_configs()
         .map(|v| v.track_id())
         .chain(catalog.audio_configs().map(|a| a.track_id()))
         .next()
-        .ok_or_else(|| Error::InvalidMp4("segment catalog describes no track".into()))?;
+    else {
+        return Ok(());
+    };
     out.push(Segment {
         track_id,
         catalog,
@@ -292,7 +298,14 @@ where
     }
 
     /// Feed one verbatim canonical segment, in canonical interleave order.
+    /// Segments for track types this version doesn't understand are ignored
+    /// (spec § uuid Body); dropping members of an ascending track-id run
+    /// keeps it ascending, so GoP boundary detection is unaffected.
     fn push_segment(&mut self, seg: &[u8]) -> Result<()> {
+        let cat = crate::catalog::from_segment(seg)?;
+        if cat.is_empty() {
+            return Ok(());
+        }
         let (tid, ts, dts) = crate::present::segment_index(seg)?;
 
         // A track id <= the previous one closes the current GoP (tracks ascend
@@ -309,7 +322,6 @@ where
         // Fold this segment's single-track catalog into the running aggregate
         // (identical to aggregate_catalog's per-segment merge) and record its
         // timescale, so this GoP's duration_us and the next Init are correct.
-        let cat = crate::catalog::from_segment(seg)?;
         merge_segment_catalog(&mut self.running, &cat);
         for v in cat.video_configs() {
             self.timescales.insert(v.track_id(), v.timescale());
@@ -1234,6 +1246,77 @@ mod tests {
         // A moof with no preceding uuid is not a canonical segment stream.
         let bytes = b"\x00\x00\x00\x08moof".to_vec();
         assert!(unwrap(&bytes).is_err());
+    }
+
+    /// Interleaved streams from a fixture: the baseline, and the same stream
+    /// with one segment for an unknown track group (a `text` track, id one
+    /// past the fixture's highest) appended to every GoP.
+    fn streams_with_text_track(data: &[u8]) -> (Vec<u8>, Vec<u8>, usize) {
+        let mut gops = Vec::new();
+        crate::segment::segment_fmp4(&mut Cursor::new(data), |gop| {
+            gops.push(gop);
+            Ok(())
+        })
+        .unwrap();
+        let text_tid = gops
+            .iter()
+            .flat_map(|g| g.tracks.keys().copied())
+            .max()
+            .unwrap()
+            + 1;
+        let mut baseline = Vec::new();
+        let mut with_text = Vec::new();
+        for (gi, gop) in gops.iter().enumerate() {
+            for bytes in gop.tracks.values() {
+                baseline.extend_from_slice(bytes);
+                with_text.extend_from_slice(bytes);
+            }
+            with_text.extend_from_slice(&crate::segment::testutil::text_track_segment(
+                text_tid,
+                gi as u64 * 2000,
+                2000,
+                format!("gop {gi} words").as_bytes(),
+            ));
+        }
+        (baseline, with_text, gops.len())
+    }
+
+    /// A segment whose catalog names only a track group this version doesn't
+    /// know (spec § uuid Body) is skipped by `unwrap`, leaving the known
+    /// segments exactly as they were. The injected segment is itself a valid
+    /// canonical segment — only its track group is foreign.
+    #[test]
+    fn unwrap_ignores_unknown_track_group_segments() {
+        let data = read_fixture("h264-opus-frag.mp4");
+        let (baseline, with_text, n_gops) = streams_with_text_track(&data);
+        assert!(n_gops > 1, "fixture must span several GoPs");
+
+        let text = crate::segment::testutil::text_track_segment(7, 0, 2000, b"hello");
+        assert!(catalog::from_segment(&text).unwrap().is_empty());
+        assert_eq!(crate::present::segment_index(&text).unwrap().0, 7);
+
+        let expected = unwrap(&baseline).unwrap();
+        let got = unwrap(&with_text).unwrap();
+        assert_eq!(got.len(), expected.len(), "ignored segments must not be counted");
+        for (g, e) in got.iter().zip(&expected) {
+            assert_eq!(g.track_id, e.track_id);
+            assert_eq!(g.catalog, e.catalog);
+            assert_eq!(g.data, e.data);
+        }
+    }
+
+    /// The re-derived event stream over a wrapper carrying unknown-track
+    /// segments is byte-identical to the stream over the same wrapper without
+    /// them — the Init catalog, GoP grouping, and per-GoP durations never
+    /// see the foreign track. Holds for the slurp and streaming paths alike.
+    #[test]
+    fn events_ignore_unknown_track_group_segments() {
+        let data = read_fixture("h264-opus-frag.mp4");
+        let (baseline, with_text, _) = streams_with_text_track(&data);
+        let expected = drisl_slurp(&baseline);
+        assert!(!expected.is_empty());
+        assert_eq!(drisl_slurp(&with_text), expected);
+        assert_eq!(drisl_stream(&with_text, 7), expected);
     }
 
     /// Build a flat MP4 (ftyp+moov+mdat envelope) from a fixture, the shape a

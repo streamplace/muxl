@@ -57,9 +57,16 @@ The leading uuid is _always_ present — never omitted — so segment boundaries
 
 ### uuid Body
 
-The `uuid` box body is a single DRISL-encoded MUXL catalog ([[drisl]]) describing exactly one track — one entry in `video.renditions` _or_ one entry in `audio.renditions`, never both. The catalog is the entire body of the box; no JSON-LD wrapper, no c2pa manifest, no signature claim.
+The `uuid` box body is a single DRISL-encoded MUXL catalog ([[drisl]]) describing exactly one track — one entry in `video.renditions` _or_ one entry in `audio.renditions` (or, in a later revision, one entry in another track group), never more than one. The catalog is the entire body of the box; no JSON-LD wrapper, no c2pa manifest, no signature claim.
 
 DRISL canonical CBOR encoding makes the uuid body byte-deterministic: any two MUXL implementations producing a canonical segment for the same track configuration produce byte-identical uuid box bytes.
+
+**Forward compatibility.** The catalog's top-level groups are open: a later revision may add groups for other track types (a text/transcript track, say) with the same per-rendition `container` shape. A reader that decodes a segment's catalog and finds no rendition it understands MUST ignore that segment rather than fail. Ignoring means:
+
+- The segment is omitted from recovered segment lists (`unwrap`), re-derived event streams, and any storage-format file the reader assembles itself, so a player never sees a `moof` for a track the synthesized `moov` does not declare.
+- Where the reader does _not_ control the body — a flat MP4 header synthesized from per-segment metafiles over a stored blob — the ignored segment's bytes are still there, so its metafile is still emitted and its byte size still displaces every later sample's `co64` entry. Only its `trak` is omitted.
+
+A catalog that fails to decode at all remains an error; only a well-formed catalog with no recognizable rendition is ignored.
 
 ### Tamper Resistance
 

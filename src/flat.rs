@@ -448,11 +448,19 @@ pub fn build_synth_flat_header(
         }
     }
 
-    let mut track_ids: Vec<u32> = per_track_samples.keys().copied().collect();
+    // Tracks the catalog doesn't describe — a track type introduced by a
+    // newer MUXL (spec § uuid Body) — get no `trak`. Their bytes are still
+    // in the body the caller serves, so they stay in `track_byte_sizes` and
+    // keep displacing every later sample's `co64` entry below.
+    let mut track_ids: Vec<u32> = per_track_samples
+        .keys()
+        .copied()
+        .filter(|&tid| catalog.track_timescale(tid).is_some())
+        .collect();
     track_ids.sort();
     if track_ids.is_empty() {
         return Err(Error::InvalidMp4(
-            "build_synth_flat_header: no segments / no tracks".into(),
+            "build_synth_flat_header: no segments / no tracks the catalog describes".into(),
         ));
     }
 
@@ -462,21 +470,7 @@ pub fn build_synth_flat_header(
     let first_seg = &segments[0];
     let mut plans: Vec<TrackPlan> = Vec::with_capacity(track_ids.len());
     for &tid in &track_ids {
-        let timescale = catalog
-            .video_configs()
-            .find(|v| v.track_id() == tid)
-            .map(|v| v.timescale())
-            .or_else(|| {
-                catalog
-                    .audio_configs()
-                    .find(|a| a.track_id() == tid)
-                    .map(|a| a.timescale())
-            })
-            .ok_or_else(|| {
-                Error::InvalidMp4(format!(
-                    "build_synth_flat_header: track {tid} not in catalog"
-                ))
-            })?;
+        let timescale = catalog.track_timescale(tid).expect("filtered above");
         let is_video = catalog.video_configs().any(|v| v.track_id() == tid);
         let start_offset_ticks = first_seg
             .first_decode_times
@@ -1046,19 +1040,9 @@ pub fn write_flat_mp4<R: ReadAt + ?Sized, W: Write>(
     let mut track_info: std::collections::BTreeMap<u32, FlatTrackInfo> =
         std::collections::BTreeMap::new();
     for (ti, trk) in ordered.iter().enumerate() {
-        let timescale = catalog
-            .video_configs()
-            .find(|v| v.track_id() == trk.track_id)
-            .map(|v| v.timescale())
-            .or_else(|| {
-                catalog
-                    .audio_configs()
-                    .find(|a| a.track_id() == trk.track_id)
-                    .map(|a| a.timescale())
-            })
-            .ok_or_else(|| {
-                Error::InvalidMp4(format!("track {} not in catalog", trk.track_id))
-            })?;
+        let timescale = catalog.track_timescale(trk.track_id).ok_or_else(|| {
+            Error::InvalidMp4(format!("track {} not in catalog", trk.track_id))
+        })?;
         track_info.insert(
             trk.track_id,
             FlatTrackInfo {

@@ -230,6 +230,29 @@ impl Catalog {
         self.audio.iter_mut().flat_map(|a| a.renditions.values_mut())
     }
 
+    /// Whether this catalog names no rendition this version understands.
+    ///
+    /// Unknown top-level groups are dropped on deserialize, so a segment
+    /// minted by a newer MUXL for a track type this version lacks (a text
+    /// track, say) decodes to an empty catalog. Readers use this to ignore
+    /// such segments rather than fail — spec `canonical-form.md § uuid Body`.
+    pub fn is_empty(&self) -> bool {
+        self.video_configs().next().is_none() && self.audio_configs().next().is_none()
+    }
+
+    /// Media timescale of the rendition carrying `track_id`, or `None` if no
+    /// rendition in this catalog has that id.
+    pub fn track_timescale(&self, track_id: u32) -> Option<u32> {
+        self.video_configs()
+            .find(|v| v.track_id() == track_id)
+            .map(|v| v.timescale())
+            .or_else(|| {
+                self.audio_configs()
+                    .find(|a| a.track_id() == track_id)
+                    .map(|a| a.timescale())
+            })
+    }
+
     /// Insert a video rendition, creating the `Video` wrapper if missing.
     pub fn insert_video(&mut self, name: impl Into<String>, config: VideoConfig) {
         let video = self.video.get_or_insert_with(|| Video {

@@ -361,6 +361,52 @@ pub(crate) fn audio_only_boundary(
     }
 }
 
+/// Test support: mint canonical segments for a track group this version of
+/// MUXL does not understand, to exercise the forward-compatibility rule in
+/// spec § uuid Body.
+#[cfg(test)]
+pub(crate) mod testutil {
+    use super::MUXL_UUID;
+    use crate::fragment::{FrameInfo, TrackProgress, write_frame_fragment};
+
+    /// One canonical segment for a `text` track (Hang's `TextConfig` shape,
+    /// which no current MUXL reader knows): a MUXL `uuid` whose catalog has
+    /// only a `text` group, then one single-sample `moof+mdat` for `track_id`
+    /// at `decode_time_ms` lasting `duration_ms` (timescale 1000).
+    pub fn text_track_segment(track_id: u32, decode_time_ms: u64, duration_ms: u32, payload: &[u8]) -> Vec<u8> {
+        let catalog = serde_json::json!({
+            "text": {
+                "renditions": {
+                    format!("text{track_id}"): {
+                        "format": "muxl-transcript",
+                        "role": "caption",
+                        "lang": "en",
+                        "container": { "kind": "cmaf", "timescale": 1000, "trackId": track_id },
+                    }
+                }
+            }
+        });
+        let mut drisl = Vec::new();
+        dasl::drisl::to_writer(&mut drisl, &catalog).unwrap();
+
+        let mut out = Vec::new();
+        out.extend_from_slice(&((24 + drisl.len()) as u32).to_be_bytes());
+        out.extend_from_slice(b"uuid");
+        out.extend_from_slice(&MUXL_UUID);
+        out.extend_from_slice(&drisl);
+
+        let mut progress = TrackProgress::starting_at(decode_time_ms);
+        let frame = FrameInfo {
+            duration: duration_ms,
+            size: payload.len() as u32,
+            is_sync: true,
+            cts_offset: 0,
+        };
+        write_frame_fragment(&mut out, track_id, &mut progress, &frame, payload).unwrap();
+        out
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -15,6 +15,8 @@
 
 use std::io::Read;
 
+use dasl::drisl::Value;
+
 use crate::catalog::{self, Catalog};
 use crate::error::{Error, Result};
 use crate::segment::MUXL_UUID;
@@ -138,12 +140,11 @@ fn push_segment<'a>(
 ) -> Result<()> {
     let data = &stream[start..end];
     let catalog = catalog::from_segment(data)?;
-    let track_id = catalog
-        .video_configs()
-        .map(|v| v.track_id())
-        .chain(catalog.audio_configs().map(|a| a.track_id()))
-        .next()
-        .ok_or_else(|| Error::InvalidMp4("segment catalog describes no track".into()))?;
+    // Any track group counts — a newer type this version can't decode still
+    // names its track through the shared `container` (spec § uuid Body).
+    let Some(track_id) = catalog.tracks().next().map(|t| t.track_id) else {
+        return Err(Error::InvalidMp4("segment catalog describes no track".into()));
+    };
     out.push(Segment {
         track_id,
         catalog,
@@ -167,7 +168,9 @@ pub fn aggregate_catalog(segments: &[Segment<'_>]) -> Catalog {
 
 /// Fold one segment's single-track catalog into a running aggregate. Renditions
 /// dedupe by name (same track → same config); video `display`/`rotation`/`flip`
-/// are taken from the first segment that carries them.
+/// are taken from the first segment that carries them. Groups this version
+/// doesn't interpret merge the same way: renditions by name, every other field
+/// from the first segment that carries the group.
 pub(crate) fn merge_segment_catalog(agg: &mut Catalog, cat: &Catalog) {
     if let Some(v) = &cat.video {
         for (name, cfg) in &v.renditions {
@@ -182,6 +185,20 @@ pub(crate) fn merge_segment_catalog(agg: &mut Catalog, cat: &Catalog) {
     if let Some(a) = &cat.audio {
         for (name, cfg) in &a.renditions {
             agg.insert_audio(name.clone(), cfg.clone());
+        }
+    }
+    for (key, group) in &cat.other {
+        let Some(existing) = agg.other.get_mut(key) else {
+            agg.other.insert(key.clone(), group.clone());
+            continue;
+        };
+        if let (Value::Map(into), Value::Map(from)) = (existing, group)
+            && let (Some(Value::Map(into)), Some(Value::Map(from))) =
+                (into.get_mut("renditions"), from.get("renditions"))
+        {
+            for (name, cfg) in from {
+                into.insert(name.clone(), cfg.clone());
+            }
         }
     }
 }
@@ -292,7 +309,10 @@ where
     }
 
     /// Feed one verbatim canonical segment, in canonical interleave order.
+    /// Segments for track groups this version doesn't decode flow through like
+    /// any other track (spec § uuid Body); they just get no `TrackInits` entry.
     fn push_segment(&mut self, seg: &[u8]) -> Result<()> {
+        let cat = crate::catalog::from_segment(seg)?;
         let (tid, ts, dts) = crate::present::segment_index(seg)?;
 
         // A track id <= the previous one closes the current GoP (tracks ascend
@@ -309,13 +329,9 @@ where
         // Fold this segment's single-track catalog into the running aggregate
         // (identical to aggregate_catalog's per-segment merge) and record its
         // timescale, so this GoP's duration_us and the next Init are correct.
-        let cat = crate::catalog::from_segment(seg)?;
         merge_segment_catalog(&mut self.running, &cat);
-        for v in cat.video_configs() {
-            self.timescales.insert(v.track_id(), v.timescale());
-        }
-        for a in cat.audio_configs() {
-            self.timescales.insert(a.track_id(), a.timescale());
+        for t in cat.tracks() {
+            self.timescales.insert(t.track_id, t.timescale);
         }
         if !self.emitted_tids.contains(&tid) {
             self.pending_new_tid = true;
@@ -361,12 +377,7 @@ where
             })?;
             self.init_emitted = true;
             self.pending_new_tid = false;
-            self.emitted_tids = self
-                .running
-                .video_configs()
-                .map(|v| v.track_id())
-                .chain(self.running.audio_configs().map(|a| a.track_id()))
-                .collect();
+            self.emitted_tids = self.running.tracks().map(|t| t.track_id).collect();
         }
         (self.emit)(CborEvent::Segment {
             tracks: g.tracks,
@@ -1234,6 +1245,188 @@ mod tests {
         // A moof with no preceding uuid is not a canonical segment stream.
         let bytes = b"\x00\x00\x00\x08moof".to_vec();
         assert!(unwrap(&bytes).is_err());
+    }
+
+    /// Interleaved streams from a fixture: the baseline, the same stream with
+    /// one segment for a track group no current reader decodes (a `text`
+    /// track, id one past the fixture's highest) closing every GoP, and those
+    /// text segments in order. Each cue spans its GoP, in milliseconds.
+    fn streams_with_text_track(data: &[u8]) -> (Vec<u8>, Vec<u8>, Vec<Vec<u8>>, u32) {
+        let mut gops = Vec::new();
+        crate::segment::segment_fmp4(&mut Cursor::new(data), |gop| {
+            gops.push(gop);
+            Ok(())
+        })
+        .unwrap();
+        let text_tid = gops
+            .iter()
+            .flat_map(|g| g.tracks.keys().copied())
+            .max()
+            .unwrap()
+            + 1;
+        let mut baseline = Vec::new();
+        let mut with_text = Vec::new();
+        let mut texts = Vec::new();
+        let mut start_ms = 0u64;
+        for (gi, gop) in gops.iter().enumerate() {
+            for bytes in gop.tracks.values() {
+                baseline.extend_from_slice(bytes);
+                with_text.extend_from_slice(bytes);
+            }
+            let dur_ms = (gop.duration_us / 1000) as u32;
+            let text = crate::segment::testutil::text_track_segment(
+                text_tid,
+                start_ms,
+                dur_ms,
+                format!("gop {gi} words").as_bytes(),
+            );
+            start_ms += dur_ms as u64;
+            with_text.extend_from_slice(&text);
+            texts.push(text);
+        }
+        assert!(texts.len() > 1, "fixture must span several GoPs");
+        (baseline, with_text, texts, text_tid)
+    }
+
+    fn events_of(wrapper: &[u8]) -> Vec<crate::cbor::CborEvent> {
+        let mut out = Vec::new();
+        segment_events_streaming(wrapper, |ev| {
+            out.push(ev);
+            Ok(())
+        })
+        .unwrap();
+        out
+    }
+
+    /// A segment of a track group this version doesn't decode (spec § uuid
+    /// Body) still unwraps: verbatim, in stream order, under the track id its
+    /// catalog's `container` names. The known segments are untouched.
+    #[test]
+    fn unwrap_passes_unknown_track_group_segments_through() {
+        let data = read_fixture("h264-opus-frag.mp4");
+        let (baseline, with_text, texts, text_tid) = streams_with_text_track(&data);
+
+        let got = unwrap(&with_text).unwrap();
+        let joined: Vec<u8> = got.iter().flat_map(|s| s.data.iter().copied()).collect();
+        assert_eq!(joined, with_text, "every segment recovered verbatim, in order");
+
+        let (text_segs, known): (Vec<_>, Vec<_>) = got.iter().partition(|s| s.track_id == text_tid);
+        let expected = unwrap(&baseline).unwrap();
+        assert_eq!(known.len(), expected.len());
+        for (g, e) in known.iter().zip(&expected) {
+            assert_eq!((g.track_id, &g.catalog, g.data), (e.track_id, &e.catalog, e.data));
+        }
+        assert_eq!(text_segs.len(), texts.len());
+        for (s, text) in text_segs.iter().zip(&texts) {
+            assert_eq!(s.data, text.as_slice());
+            let t = s.catalog.track(text_tid).expect("text track in its own catalog");
+            assert_eq!((t.group, t.timescale, t.is_known()), ("text", 1000, false));
+        }
+    }
+
+    /// The re-derived event stream carries unknown-track segments like any
+    /// other track — bytes, ticks, sample count, body size — so a consumer
+    /// summing event bytes stays aligned with the stored blob. The Init's
+    /// `moov` and `track_inits` stay known-only; its catalog keeps the group.
+    /// The streaming path emits the same bytes as the slurp path.
+    #[test]
+    fn events_carry_unknown_track_group_segments() {
+        use crate::cbor::CborEvent;
+        let data = read_fixture("h264-opus-frag.mp4");
+        let (baseline, with_text, texts, text_tid) = streams_with_text_track(&data);
+        let key = text_tid.to_string();
+
+        let want = events_of(&baseline);
+        let got = events_of(&with_text);
+        assert_eq!(got.len(), want.len(), "the text track joins the first GoP, adding no Init");
+        let mut texts = texts.iter();
+        for (g, w) in got.iter().zip(&want) {
+            match (g, w) {
+                (
+                    CborEvent::Init { data: gd, catalog: Some(gc), track_inits: gi, .. },
+                    CborEvent::Init { data: wd, catalog: Some(wc), track_inits: wi, .. },
+                ) => {
+                    assert_eq!(gd, wd, "moov declares only known tracks");
+                    assert_eq!(gi.keys().collect::<Vec<_>>(), wi.keys().collect::<Vec<_>>());
+                    assert_eq!((gc.video.as_ref(), gc.audio.as_ref()), (wc.video.as_ref(), wc.audio.as_ref()));
+                    assert_eq!(gc.track(text_tid).map(|t| t.group), Some("text"));
+                }
+                (
+                    CborEvent::Segment {
+                        tracks: gt,
+                        durations: gdur,
+                        sample_counts: gn,
+                        body_size: gb,
+                        duration_us: gus,
+                        ..
+                    },
+                    CborEvent::Segment {
+                        tracks: wt,
+                        durations: wdur,
+                        body_size: wb,
+                        duration_us: wus,
+                        ..
+                    },
+                ) => {
+                    let text = texts.next().expect("one text segment per GoP");
+                    assert_eq!(gt[&key].0, *text);
+                    for (tid, bytes) in wt {
+                        assert_eq!(gt[tid].0, bytes.0, "known track {tid} unchanged");
+                    }
+                    assert_eq!(gn[&key], 1);
+                    assert_eq!(gdur.len(), wdur.len() + 1);
+                    assert_eq!(*gb, wb + text.len() as u64);
+                    assert_eq!(gus, wus, "a cue spanning its GoP doesn't stretch it");
+                }
+                _ => panic!("event kinds diverged"),
+            }
+        }
+        assert_eq!(drisl_stream(&with_text, 7), drisl_slurp(&with_text));
+    }
+
+    /// Flat-wrapping keeps unknown-track segments inside the `mdat` envelope
+    /// (as bytes no `trak` references), so unwrapping the result recovers the
+    /// full input — while the `moov` declares only the tracks it can describe.
+    #[test]
+    fn flat_wrap_round_trips_unknown_track_group_segments() {
+        let data = read_fixture("h264-opus-frag.mp4");
+        let (baseline, with_text, _, text_tid) = streams_with_text_track(&data);
+        let segs = unwrap(&with_text).unwrap();
+        let slices: Vec<&[u8]> = segs.iter().map(|s| s.data).collect();
+        let mut flat = Vec::new();
+        crate::present::write_flat_from_m4s(&aggregate_catalog(&segs), &slices, &mut flat).unwrap();
+
+        let back = unwrap(&flat).unwrap();
+        let joined: Vec<u8> = back.iter().flat_map(|s| s.data.iter().copied()).collect();
+        assert_eq!(joined, with_text);
+
+        let moov = crate::init::read_moov(&mut Cursor::new(&flat)).unwrap();
+        let trak_ids: Vec<u32> = moov.trak.iter().map(|t| t.tkhd.track_id).collect();
+        let known: std::collections::BTreeSet<u32> =
+            unwrap(&baseline).unwrap().iter().map(|s| s.track_id).collect();
+        assert_eq!(trak_ids, known.into_iter().collect::<Vec<_>>());
+        assert!(!trak_ids.contains(&text_tid));
+    }
+
+    /// The library fMP4 writer — not just the CLI — leaves out segments of a
+    /// group its `moov` can't declare, so re-wrapping what `unwrap` recovered
+    /// with its aggregate catalog yields the same playable file as the stream
+    /// without them.
+    #[test]
+    fn fmp4_wrap_omits_unknown_track_group_segments() {
+        let data = read_fixture("h264-opus-frag.mp4");
+        let (baseline, with_text, texts, _) = streams_with_text_track(&data);
+        let wrap = |stream: &[u8]| {
+            let segs = unwrap(stream).unwrap();
+            let mut out = Vec::new();
+            let n = crate::present::write_fmp4(&aggregate_catalog(&segs), segs.iter().map(|s| s.data), &mut out)
+                .unwrap();
+            (out, segs.len() - n)
+        };
+        let (want, _) = wrap(&baseline);
+        let (got, omitted) = wrap(&with_text);
+        assert_eq!(omitted, texts.len());
+        assert_eq!(got, want);
     }
 
     /// Build a flat MP4 (ftyp+moov+mdat envelope) from a fixture, the shape a

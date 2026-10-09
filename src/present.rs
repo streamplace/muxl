@@ -58,16 +58,28 @@ pub fn flat_header(catalog: &Catalog, segments: &[SegmentMetadata]) -> Result<Ve
 /// hash/signature over them is preserved. This is the live/appendable
 /// presentation format: further segments can be byte-appended after the
 /// header with no rewrite, and the file is valid at every moment.
+///
+/// Segments of a track group this version can't declare in the `moov` are
+/// left out (spec § uuid Body): a `moof` naming an undeclared track makes
+/// players reject the whole file. Returns the number of segments written.
 pub fn write_fmp4<'a, W: Write>(
     catalog: &Catalog,
     segments: impl IntoIterator<Item = &'a [u8]>,
     out: &mut W,
-) -> Result<()> {
+) -> Result<usize> {
     out.write_all(&init(catalog)?)?;
+    let mut written = 0;
     for seg in segments {
-        out.write_all(seg)?;
+        let declared = crate::catalog::from_segment(seg)?
+            .tracks()
+            .next()
+            .is_some_and(|t| t.is_known());
+        if declared {
+            out.write_all(seg)?;
+            written += 1;
+        }
     }
-    Ok(())
+    Ok(written)
 }
 
 /// Finalize a flat MP4 from GoP segments. Each [`GopSegment`] carries its

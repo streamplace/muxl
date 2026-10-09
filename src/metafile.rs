@@ -337,4 +337,75 @@ mod tests {
         .unwrap();
         assert_eq!(got, expected);
     }
+
+    /// A stored blob may interleave segments of a track group this version
+    /// doesn't decode (spec § uuid Body). Their metafiles are emitted with the
+    /// group's catalog intact, the synthesized `moov` omits their track, and
+    /// every known sample's `co64` entry still lands on the right bytes —
+    /// proven by decoding the assembled file and comparing each sample's
+    /// payload against the baseline flat MP4.
+    #[test]
+    fn synth_header_omits_unknown_track_but_keeps_its_bytes() {
+        let flat = flat_wrapper("h264-opus-frag.mp4");
+        let segs = reader::unwrap(&flat).unwrap();
+        let known_tracks = segs.iter().map(|s| s.track_id).collect::<std::collections::BTreeSet<_>>();
+        let text_tid = known_tracks.iter().max().unwrap() + 1;
+
+        // Append a text segment after each GoP (a GoP ends when the next
+        // track id is <= the current one).
+        let mut body = Vec::new();
+        let mut n_text = 0usize;
+        for (i, s) in segs.iter().enumerate() {
+            body.extend_from_slice(s.data);
+            let gop_ends = segs.get(i + 1).is_none_or(|n| n.track_id <= s.track_id);
+            if gop_ends {
+                body.extend_from_slice(&crate::segment::testutil::text_track_segment(
+                    text_tid,
+                    n_text as u64 * 2000,
+                    2000,
+                    format!("gop {n_text} words").as_bytes(),
+                ));
+                n_text += 1;
+            }
+        }
+        assert!(n_text > 1);
+
+        let mut metas: Vec<MetafileSegment> = Vec::new();
+        metafiles_stream(Cursor::new(&body), |m| {
+            metas.push(m);
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(metas.len(), segs.len() + n_text, "unknown-track segments still get metafiles");
+        let text_metas = metas.iter().filter(|m| m.catalog.track(text_tid).is_some_and(|t| t.group == "text"));
+        assert_eq!(text_metas.count(), n_text);
+
+        let header = synthesize_flat_header(&metas).unwrap();
+        assert_eq!(header.segments.len(), metas.len());
+        assert_eq!(header.total_body, body.len() as u64);
+
+        let mut assembled = header.bytes.clone();
+        assembled.extend_from_slice(&body);
+        let moov = crate::init::read_moov(&mut Cursor::new(&assembled)).unwrap();
+        let trak_ids: std::collections::BTreeSet<u32> =
+            moov.trak.iter().map(|t| t.tkhd.track_id).collect();
+        assert_eq!(trak_ids, known_tracks, "moov declares exactly the known tracks");
+
+        // Every known sample resolves to the same payload bytes as in the
+        // baseline flat MP4, so the co64 displacement for the foreign bytes
+        // is exact.
+        let got = crate::read(&assembled).unwrap();
+        let want = crate::read(&flat).unwrap();
+        assert_eq!(got.plan.tracks.len(), want.plan.tracks.len());
+        for w in &want.plan.tracks {
+            let g = got.plan.track(w.track_id).expect("track present");
+            assert_eq!(g.samples.len(), w.samples.len(), "track {}", w.track_id);
+            for (gs, ws) in g.samples.iter().zip(&w.samples) {
+                assert_eq!(gs.size, ws.size);
+                let gb = &assembled[gs.input_offset as usize..][..gs.size as usize];
+                let wb = &flat[ws.input_offset as usize..][..ws.size as usize];
+                assert_eq!(gb, wb, "track {} sample payload", w.track_id);
+            }
+        }
+    }
 }

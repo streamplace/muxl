@@ -448,11 +448,23 @@ pub fn build_synth_flat_header(
         }
     }
 
-    let mut track_ids: Vec<u32> = per_track_samples.keys().copied().collect();
-    track_ids.sort();
-    if track_ids.is_empty() {
+    // Tracks of a group this version can't describe in a `moov` (spec § uuid
+    // Body, Forward compatibility) get no `trak`. Their bytes are still in the
+    // body the caller serves, so they stay in `track_byte_sizes` and keep
+    // displacing every later sample's `co64` entry below.
+    // `next_track_id` stays above every id in the body, declared or not, so a
+    // later writer can't collide with an unknown track.
+    let max_track_id = per_track_samples.keys().copied().max().unwrap_or(0);
+    let mut known: Vec<(u32, u32, bool)> = per_track_samples
+        .keys()
+        .filter_map(|&tid| catalog.track(tid))
+        .filter(|t| t.is_known())
+        .map(|t| (t.track_id, t.timescale, t.group == "video"))
+        .collect();
+    known.sort();
+    if known.is_empty() {
         return Err(Error::InvalidMp4(
-            "build_synth_flat_header: no segments / no tracks".into(),
+            "build_synth_flat_header: no segments / no tracks a moov can declare".into(),
         ));
     }
 
@@ -460,24 +472,8 @@ pub fn build_synth_flat_header(
     // build_canonical_elst, etc.). start_offset_ticks comes from the first
     // segment's first_decode_times; if absent, defaults to 0.
     let first_seg = &segments[0];
-    let mut plans: Vec<TrackPlan> = Vec::with_capacity(track_ids.len());
-    for &tid in &track_ids {
-        let timescale = catalog
-            .video_configs()
-            .find(|v| v.track_id() == tid)
-            .map(|v| v.timescale())
-            .or_else(|| {
-                catalog
-                    .audio_configs()
-                    .find(|a| a.track_id() == tid)
-                    .map(|a| a.timescale())
-            })
-            .ok_or_else(|| {
-                Error::InvalidMp4(format!(
-                    "build_synth_flat_header: track {tid} not in catalog"
-                ))
-            })?;
-        let is_video = catalog.video_configs().any(|v| v.track_id() == tid);
+    let mut plans: Vec<TrackPlan> = Vec::with_capacity(known.len());
+    for (tid, timescale, is_video) in known {
         let start_offset_ticks = first_seg
             .first_decode_times
             .get(&tid)
@@ -555,7 +551,6 @@ pub fn build_synth_flat_header(
         .map(|(md, ts)| rescale_to_movie(*md, *ts))
         .max()
         .unwrap_or(0);
-    let max_track_id = track_ids.iter().copied().max().unwrap_or(0);
     let mvhd = Mvhd {
         creation_time: 0,
         modification_time: 0,
@@ -1046,19 +1041,9 @@ pub fn write_flat_mp4<R: ReadAt + ?Sized, W: Write>(
     let mut track_info: std::collections::BTreeMap<u32, FlatTrackInfo> =
         std::collections::BTreeMap::new();
     for (ti, trk) in ordered.iter().enumerate() {
-        let timescale = catalog
-            .video_configs()
-            .find(|v| v.track_id() == trk.track_id)
-            .map(|v| v.timescale())
-            .or_else(|| {
-                catalog
-                    .audio_configs()
-                    .find(|a| a.track_id() == trk.track_id)
-                    .map(|a| a.timescale())
-            })
-            .ok_or_else(|| {
-                Error::InvalidMp4(format!("track {} not in catalog", trk.track_id))
-            })?;
+        let timescale = catalog.track(trk.track_id).map(|t| t.timescale).ok_or_else(|| {
+            Error::InvalidMp4(format!("track {} not in catalog", trk.track_id))
+        })?;
         track_info.insert(
             trk.track_id,
             FlatTrackInfo {

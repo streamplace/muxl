@@ -1408,6 +1408,27 @@ mod tests {
         assert!(!trak_ids.contains(&text_tid));
     }
 
+    /// The library fMP4 writer — not just the CLI — leaves out segments of a
+    /// group its `moov` can't declare, so re-wrapping what `unwrap` recovered
+    /// with its aggregate catalog yields the same playable file as the stream
+    /// without them.
+    #[test]
+    fn fmp4_wrap_omits_unknown_track_group_segments() {
+        let data = read_fixture("h264-opus-frag.mp4");
+        let (baseline, with_text, texts, _) = streams_with_text_track(&data);
+        let wrap = |stream: &[u8]| {
+            let segs = unwrap(stream).unwrap();
+            let mut out = Vec::new();
+            let n = crate::present::write_fmp4(&aggregate_catalog(&segs), segs.iter().map(|s| s.data), &mut out)
+                .unwrap();
+            (out, segs.len() - n)
+        };
+        let (want, _) = wrap(&baseline);
+        let (got, omitted) = wrap(&with_text);
+        assert_eq!(omitted, texts.len());
+        assert_eq!(got, want);
+    }
+
     /// Build a flat MP4 (ftyp+moov+mdat envelope) from a fixture, the shape a
     /// finalized VOD blob has, plus the fragment-relative offset of each
     /// canonical segment within it.

@@ -566,21 +566,15 @@ pub fn cmd_wrap(args: WrapArgs) -> crate::Result<()> {
 
     match format {
         WrapFormat::Fmp4 => {
-            // A moof must name a track the moov declares, so segments of a
-            // group this version can't describe are left out of the fMP4
-            // (spec § uuid Body). The flat path keeps them in its envelope.
-            let kept: Vec<&[u8]> = segments
-                .iter()
-                .filter(|s| s.catalog.track(s.track_id).is_some_and(|t| t.is_known()))
-                .map(|s| s.data)
-                .collect();
-            crate::present::write_fmp4(&catalog, kept.iter().copied(), &mut out)?;
+            // write_fmp4 leaves out segments of track groups the moov can't
+            // declare (spec § uuid Body); the flat path keeps them.
+            let written =
+                crate::present::write_fmp4(&catalog, segments.iter().map(|s| s.data), &mut out)?;
             out.flush()?;
             eprintln!(
-                "fMP4: wrapped {} segments from {} input(s){}",
-                kept.len(),
+                "fMP4: wrapped {written} segments from {} input(s){}",
                 buffers.len(),
-                match segments.len() - kept.len() {
+                match segments.len() - written {
                     0 => String::new(),
                     n => format!("; omitted {n} segments of unknown track types"),
                 }

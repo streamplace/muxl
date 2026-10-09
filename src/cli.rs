@@ -566,12 +566,24 @@ pub fn cmd_wrap(args: WrapArgs) -> crate::Result<()> {
 
     match format {
         WrapFormat::Fmp4 => {
-            crate::present::write_fmp4(&catalog, segments.iter().map(|s| s.data), &mut out)?;
+            // A moof must name a track the moov declares, so segments of a
+            // group this version can't describe are left out of the fMP4
+            // (spec § uuid Body). The flat path keeps them in its envelope.
+            let kept: Vec<&[u8]> = segments
+                .iter()
+                .filter(|s| s.catalog.track(s.track_id).is_some_and(|t| t.is_known()))
+                .map(|s| s.data)
+                .collect();
+            crate::present::write_fmp4(&catalog, kept.iter().copied(), &mut out)?;
             out.flush()?;
             eprintln!(
-                "fMP4: wrapped {} segments from {} input(s)",
-                segments.len(),
-                buffers.len()
+                "fMP4: wrapped {} segments from {} input(s){}",
+                kept.len(),
+                buffers.len(),
+                match segments.len() - kept.len() {
+                    0 => String::new(),
+                    n => format!("; omitted {n} segments of unknown track types"),
+                }
             );
         }
         WrapFormat::Flat => {
@@ -667,7 +679,8 @@ pub fn cmd_unwrap(args: UnwrapArgs) -> crate::Result<()> {
         write_segments_to_dir(&segments, &dir)?;
     } else {
         for (i, seg) in segments.iter().enumerate() {
-            eprintln!("segment {i}: track {} ({} bytes)", seg.track_id, seg.data.len());
+            let group = seg.catalog.track(seg.track_id).map_or("?", |t| t.group);
+            eprintln!("segment {i}: track {} {group} ({} bytes)", seg.track_id, seg.data.len());
         }
         eprintln!("{} segments total", segments.len());
     }
@@ -676,7 +689,8 @@ pub fn cmd_unwrap(args: UnwrapArgs) -> crate::Result<()> {
 
 /// Write recovered segments out as one `.m4s` per segment under `track<id>/`,
 /// with a per-track `init.mp4` synthesized from the first segment's embedded
-/// catalog.
+/// catalog. Tracks of a group this version can't describe get their segments
+/// but no `init.mp4`.
 fn write_segments_to_dir(segments: &[crate::reader::Segment<'_>], dir: &Path) -> crate::Result<()> {
     use std::collections::{BTreeMap, HashSet};
     let mut counters: BTreeMap<u32, u32> = BTreeMap::new();
@@ -685,7 +699,8 @@ fn write_segments_to_dir(segments: &[crate::reader::Segment<'_>], dir: &Path) ->
         let tid = seg.track_id;
         let track_dir = dir.join(format!("track{tid}"));
         fs::create_dir_all(&track_dir)?;
-        if inited.insert(tid) {
+        let known = seg.catalog.track(tid).is_some_and(|t| t.is_known());
+        if inited.insert(tid) && known {
             fs::write(track_dir.join("init.mp4"), crate::present::init(&seg.catalog)?)?;
         }
         let n = counters.entry(tid).or_default();

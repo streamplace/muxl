@@ -6,7 +6,6 @@ import (
 	"encoding/binary"
 	"fmt"
 	"io"
-	"reflect"
 	"sort"
 	"strconv"
 	"testing"
@@ -154,47 +153,73 @@ func bareStreams(t *testing.T, eng *muxl.WASMEngine) (baseline, withText []byte,
 	return baseline, withText, gops
 }
 
+// streamBytes concatenates every segment event's per-track bytes in canonical
+// interleave order — the layout a consumer summing event bytes for byte-range
+// offsets assumes the stored blob has.
+func streamBytes(t *testing.T, events []*muxl.Event) []byte {
+	t.Helper()
+	var out []byte
+	for _, ev := range events {
+		if ev.Type != "segment" {
+			continue
+		}
+		for _, tid := range numericTrackIDs(t, ev) {
+			out = append(out, ev.Tracks[strconv.FormatUint(uint64(tid), 10)]...)
+		}
+	}
+	return out
+}
+
 // The embedded wasm must apply the forward-compatibility rule (spec § uuid
-// Body): segments for a track group it doesn't know are ignored by wrap and
-// the event stream, while the metafile path keeps them so a synthesized flat
-// header still accounts for their bytes.
-func TestReadersIgnoreUnknownTrackGroupSegments(t *testing.T) {
+// Body): a segment of a track group it doesn't decode is an opaque track —
+// carried through events, metafiles, and the flat envelope, left out only of
+// the moov and the appendable fMP4.
+func TestReadersCarryUnknownTrackGroupSegments(t *testing.T) {
 	eng := newEngine(t)
 	ctx := context.Background()
 	baseline, withText, gops := bareStreams(t, eng)
 
-	for _, format := range []string{"fmp4", "flat"} {
-		var want, got bytes.Buffer
-		if err := eng.Wrap(ctx, bytes.NewReader(baseline), format, &want); err != nil {
-			t.Fatalf("Wrap(%s) baseline: %v", format, err)
+	unwrapEvents := func(name string, input []byte) []*muxl.Event {
+		t.Helper()
+		events, err := collectEvents(func(events chan<- *muxl.Event) error {
+			return eng.UnwrapEvents(ctx, bytes.NewReader(input), events)
+		})
+		if err != nil {
+			t.Fatalf("UnwrapEvents %s: %v", name, err)
 		}
-		if err := eng.Wrap(ctx, bytes.NewReader(withText), format, &got); err != nil {
-			t.Fatalf("Wrap(%s) with text track: %v", format, err)
-		}
-		if !bytes.Equal(want.Bytes(), got.Bytes()) {
-			t.Errorf("Wrap(%s): output with ignored text segments differs from baseline", format)
-		}
+		return events
 	}
 
-	wantEvents, err := collectEvents(func(events chan<- *muxl.Event) error {
-		return eng.UnwrapEvents(ctx, bytes.NewReader(baseline), events)
-	})
-	if err != nil {
-		t.Fatalf("UnwrapEvents baseline: %v", err)
+	wantEvents := unwrapEvents("baseline", baseline)
+	gotEvents := unwrapEvents("with text track", withText)
+	if got := streamBytes(t, gotEvents); !bytes.Equal(got, withText) {
+		t.Errorf("UnwrapEvents: segment bytes reassemble to %d bytes, want the %d-byte input", len(got), len(withText))
 	}
-	gotEvents, err := collectEvents(func(events chan<- *muxl.Event) error {
-		return eng.UnwrapEvents(ctx, bytes.NewReader(withText), events)
-	})
-	if err != nil {
-		t.Fatalf("UnwrapEvents with text track: %v", err)
+	if !bytes.Equal(gotEvents[0].Data, wantEvents[0].Data) {
+		t.Error("UnwrapEvents: Init moov changed; it must declare only known tracks")
 	}
-	if len(gotEvents) != len(wantEvents) {
-		t.Fatalf("UnwrapEvents: %d events with text track, %d baseline", len(gotEvents), len(wantEvents))
+	if len(gotEvents[0].TrackInits) != len(wantEvents[0].TrackInits) {
+		t.Errorf("UnwrapEvents: %d track inits, want %d (none for the text track)",
+			len(gotEvents[0].TrackInits), len(wantEvents[0].TrackInits))
 	}
-	for i := range wantEvents {
-		if !reflect.DeepEqual(gotEvents[i], wantEvents[i]) {
-			t.Errorf("UnwrapEvents: event %d differs with text track present", i)
-		}
+
+	var fmp4Want, fmp4Got bytes.Buffer
+	if err := eng.Wrap(ctx, bytes.NewReader(baseline), "fmp4", &fmp4Want); err != nil {
+		t.Fatalf("Wrap(fmp4) baseline: %v", err)
+	}
+	if err := eng.Wrap(ctx, bytes.NewReader(withText), "fmp4", &fmp4Got); err != nil {
+		t.Fatalf("Wrap(fmp4) with text track: %v", err)
+	}
+	if !bytes.Equal(fmp4Got.Bytes(), fmp4Want.Bytes()) {
+		t.Error("Wrap(fmp4): text segments must be left out of the appendable fMP4")
+	}
+
+	var flat bytes.Buffer
+	if err := eng.Wrap(ctx, bytes.NewReader(withText), "flat", &flat); err != nil {
+		t.Fatalf("Wrap(flat) with text track: %v", err)
+	}
+	if got := streamBytes(t, unwrapEvents("flat", flat.Bytes())); !bytes.Equal(got, withText) {
+		t.Error("Wrap(flat): unwrapping the flat MP4 must recover every segment, text included")
 	}
 
 	var metas bytes.Buffer
@@ -202,7 +227,7 @@ func TestReadersIgnoreUnknownTrackGroupSegments(t *testing.T) {
 		t.Fatalf("Metafiles with text track: %v", err)
 	}
 	dec := drisl.NewDecoder(bytes.NewReader(metas.Bytes()))
-	var n, empty int
+	var n, text int
 	for {
 		var m map[string]any
 		if err := dec.Decode(&m); err == io.EOF {
@@ -211,21 +236,18 @@ func TestReadersIgnoreUnknownTrackGroupSegments(t *testing.T) {
 			t.Fatalf("decode metafile %d: %v", n, err)
 		}
 		n++
-		if cat, _ := m["catalog"].(map[string]any); len(cat) == 0 {
-			empty++
+		if cat, _ := m["catalog"].(map[string]any); cat["text"] != nil {
+			text++
 		}
 	}
 	if wantN := len(wantEvents[0].TrackInits)*gops + gops; n != wantN {
 		t.Errorf("Metafiles: got %d metafiles, want %d (known tracks × GoPs + one text segment per GoP)", n, wantN)
 	}
-	if empty != gops {
-		t.Errorf("Metafiles: %d metafiles with an empty catalog, want %d (one per text segment)", empty, gops)
+	if text != gops {
+		t.Errorf("Metafiles: %d metafiles carry the text group, want %d", text, gops)
 	}
 	var header bytes.Buffer
 	if err := eng.SynthesizeFlatHeader(ctx, bytes.NewReader(metas.Bytes()), &header); err != nil {
 		t.Fatalf("SynthesizeFlatHeader over metafiles with a text track: %v", err)
-	}
-	if header.Len() == 0 {
-		t.Error("SynthesizeFlatHeader produced no header")
 	}
 }

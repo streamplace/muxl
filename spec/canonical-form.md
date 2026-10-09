@@ -61,12 +61,18 @@ The `uuid` box body is a single DRISL-encoded MUXL catalog ([[drisl]]) describin
 
 DRISL canonical CBOR encoding makes the uuid body byte-deterministic: any two MUXL implementations producing a canonical segment for the same track configuration produce byte-identical uuid box bytes.
 
-**Forward compatibility.** The catalog's top-level groups are open: a later revision may add groups for other track types (a text/transcript track, say) with the same per-rendition `container` shape. A reader that decodes a segment's catalog and finds no rendition it understands MUST ignore that segment rather than fail. Ignoring means:
+**Forward compatibility.** The catalog's top-level groups are open: a later revision may add a group for another track type (a text/transcript track, say). Every track group, known or not, has the same envelope — a `renditions` map whose entries each carry a CMAF `container`:
 
-- The segment is omitted from recovered segment lists (`unwrap`), re-derived event streams, and any storage-format file the reader assembles itself, so a player never sees a `moof` for a track the synthesized `moov` does not declare.
-- Where the reader does _not_ control the body — a flat MP4 header synthesized from per-segment metafiles over a stored blob — the ignored segment's bytes are still there, so its metafile is still emitted and its byte size still displaces every later sample's `co64` entry. Only its `trak` is omitted.
+```
+{ <group>: { renditions: { <name>: { container: { kind: "cmaf", timescale, trackId }, …type-specific… } } } }
+```
 
-A catalog that fails to decode at all remains an error; only a well-formed catalog with no recognizable rendition is ignored.
+So a reader that doesn't understand a group's type-specific fields still knows the track's id and timescale, and the `moof`s give it everything else (samples, durations, decode times, byte extents). Such a segment is an **opaque track**: a reader MUST carry it through every operation that only moves or indexes bytes, and leave it out only where describing the track is required.
+
+- **Carried through:** recovered segment lists (`unwrap`, including `--dir`, which writes the track's segments without an `init.mp4`), re-derived event streams (bytes, ticks, sample counts, and body sizes, so consumers summing event bytes stay aligned with the stored blob), metafiles, CIDs and signature verification, and the flat-MP4 `mdat` envelope — where the segment sits as bytes no `trak` references, and `unwrap` of the flat file recovers it. Catalog entries a reader doesn't interpret are retained verbatim, so re-encoding a catalog never changes its bytes, and aggregate catalogs merge newer groups' renditions by name.
+- **Left out:** the synthesized `moov` gets no `trak` for the track (its `stsd` can't be built), though its byte size still displaces every later sample's `co64` entry and `mvhd.next_track_id` stays above its id. An appendable fMP4 wrap omits its segments entirely, since a `moof` must name a track the `moov` declares (ffmpeg rejects the whole file otherwise).
+
+A top-level entry without a `renditions` map (Hang's `location`, `user`, …) is not a track group; it is retained but describes no track. A segment catalog that fails to decode, or decodes to no track at all, remains an error.
 
 ### Tamper Resistance
 
@@ -74,7 +80,7 @@ Modifying the catalog or any fragment changes the canonical segment's bytes, whi
 
 ### Segmentation Rule
 
-Segment boundaries are driven by video sync samples (keyframes). A new segment begins at each video keyframe. Audio samples are grouped with the video GoP they temporally overlap.
+Segment boundaries are driven by video sync samples (keyframes). A new segment begins at each video keyframe. Samples of every non-video track — audio, or a newer type such as text — are grouped with the video GoP they temporally overlap.
 
 For audio-only streams (no video reference), segments are 1-second wall-clock spans.
 

@@ -85,6 +85,10 @@ struct SegmentReport {
     video: Vec<VideoReport>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     audio: Vec<AudioReport>,
+    /// A track group this version of muxl doesn't decode (spec § uuid Body),
+    /// e.g. `"text"`. Its segments are still listed and verified.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    unknown_group: Option<String>,
     signing: SigningReport,
     /// Full embedded C2PA manifest store (only with `--manifests`, and only
     /// when the segment carries one).
@@ -172,6 +176,11 @@ fn build_report(bytes: &[u8], path: &Path, opts: InspectOptions) -> Result<Repor
             bytes: seg.data.len(),
             video: seg.catalog.video_configs().map(video_report).collect(),
             audio: seg.catalog.audio_configs().map(audio_report).collect(),
+            unknown_group: seg
+                .catalog
+                .track(seg.track_id)
+                .filter(|t| !t.is_known())
+                .map(|t| t.group.to_string()),
             signing,
             manifests,
         });
@@ -312,6 +321,9 @@ fn render_human<W: Write>(report: &Report, out: &mut W, s: &Style) -> Result<()>
         }
         for a in &seg.audio {
             render_audio(out, s, a)?;
+        }
+        if let Some(group) = &seg.unknown_group {
+            writeln!(out, "  {} {}", s.label("track:"), s.dim(format!("unknown group \"{group}\"")))?;
         }
         render_signing(out, s, &seg.signing)?;
         if let Some(manifests) = &seg.manifests {

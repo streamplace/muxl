@@ -338,14 +338,14 @@ mod tests {
         assert_eq!(got, expected);
     }
 
-    /// A stored blob may interleave segments for a track group this version
-    /// doesn't know (spec § uuid Body). Their metafiles are still emitted (the
-    /// bytes are in the body the caller serves), the synthesized `moov` omits
-    /// their track, and every known sample's `co64` entry still lands on the
-    /// right bytes — proven by decoding the assembled file and comparing each
-    /// sample's payload against the baseline flat MP4.
+    /// A stored blob may interleave segments of a track group this version
+    /// doesn't decode (spec § uuid Body). Their metafiles are emitted with the
+    /// group's catalog intact, the synthesized `moov` omits their track, and
+    /// every known sample's `co64` entry still lands on the right bytes —
+    /// proven by decoding the assembled file and comparing each sample's
+    /// payload against the baseline flat MP4.
     #[test]
-    fn synth_header_ignores_unknown_track_but_keeps_its_bytes() {
+    fn synth_header_omits_unknown_track_but_keeps_its_bytes() {
         let flat = flat_wrapper("h264-opus-frag.mp4");
         let segs = reader::unwrap(&flat).unwrap();
         let known_tracks = segs.iter().map(|s| s.track_id).collect::<std::collections::BTreeSet<_>>();
@@ -377,7 +377,8 @@ mod tests {
         })
         .unwrap();
         assert_eq!(metas.len(), segs.len() + n_text, "unknown-track segments still get metafiles");
-        assert_eq!(metas.iter().filter(|m| m.catalog.is_empty()).count(), n_text);
+        let text_metas = metas.iter().filter(|m| m.catalog.track(text_tid).is_some_and(|t| t.group == "text"));
+        assert_eq!(text_metas.count(), n_text);
 
         let header = synthesize_flat_header(&metas).unwrap();
         assert_eq!(header.segments.len(), metas.len());

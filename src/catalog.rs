@@ -25,6 +25,7 @@
 
 use std::collections::BTreeMap;
 
+use dasl::drisl::Value;
 use serde::{Deserialize, Serialize};
 
 use crate::error::{Error, Result};
@@ -33,17 +34,68 @@ use crate::error::{Error, Result};
 /// serialize as absent fields (not as empty objects), so an audio-only
 /// stream produces `{"audio": {...}}` with no `video` key.
 ///
-/// Hang's top-level catalog also carries `location`, `user`, `chat`,
-/// `capabilities`, `preview` etc. MUXL doesn't emit or interpret those
-/// but unknown fields are ignored on deserialize, so a Hang catalog with
-/// extras still round-trips through MUXL lossily-but-safely (the extras
-/// are dropped).
+/// Every other top-level entry is kept verbatim in [`Catalog::other`] and
+/// re-serialized unchanged: a track group introduced by a newer MUXL (spec
+/// `canonical-form.md § uuid Body`, Forward compatibility), and Hang's
+/// non-track keys (`location`, `user`, `chat`, …) alike.
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 pub struct Catalog {
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub video: Option<Video>,
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub audio: Option<Audio>,
+    /// Top-level entries this version doesn't interpret. A newer track group
+    /// still exposes its tracks through [`Catalog::tracks`].
+    #[serde(flatten)]
+    pub other: BTreeMap<String, Value>,
+}
+
+/// One track as every reader sees it, whether or not this version
+/// understands its type: the group and rendition naming it, plus the CMAF
+/// `container` fields every track group shares.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TrackRef<'a> {
+    /// Top-level catalog key: `"video"`, `"audio"`, or a newer group.
+    pub group: &'a str,
+    pub rendition: &'a str,
+    pub track_id: u32,
+    pub timescale: u32,
+}
+
+impl TrackRef<'_> {
+    /// Whether this version can describe the track in a `moov` (`trak` +
+    /// `stsd`). Unknown tracks still unwrap, segment, and occupy bytes; only
+    /// header synthesis leaves them out.
+    pub fn is_known(&self) -> bool {
+        matches!(self.group, "video" | "audio")
+    }
+}
+
+/// The `renditions` map of a track group in [`Catalog::other`], or `None` if
+/// the entry isn't shaped like one.
+fn group_renditions(group: &Value) -> Option<&BTreeMap<String, Value>> {
+    match group {
+        Value::Map(g) => match g.get("renditions") {
+            Some(Value::Map(r)) => Some(r),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// `(trackId, timescale)` from a rendition's CMAF `container`, or `None` if it
+/// has no CMAF container.
+fn cmaf_container(rendition: &Value) -> Option<(u32, u32)> {
+    let Value::Map(r) = rendition else { return None };
+    let Some(Value::Map(c)) = r.get("container") else { return None };
+    if !matches!(c.get("kind"), Some(Value::Text(k)) if k == "cmaf") {
+        return None;
+    }
+    let int = |key: &str| match c.get(key) {
+        Some(Value::Integer(n)) => u32::try_from(*n).ok(),
+        _ => None,
+    };
+    Some((int("trackId")?, int("timescale")?))
 }
 
 /// Video group. `renditions` is a name→config map (not an array) so
@@ -230,27 +282,38 @@ impl Catalog {
         self.audio.iter_mut().flat_map(|a| a.renditions.values_mut())
     }
 
-    /// Whether this catalog names no rendition this version understands.
-    ///
-    /// Unknown top-level groups are dropped on deserialize, so a segment
-    /// minted by a newer MUXL for a track type this version lacks (a text
-    /// track, say) decodes to an empty catalog. Readers use this to ignore
-    /// such segments rather than fail — spec `canonical-form.md § uuid Body`.
-    pub fn is_empty(&self) -> bool {
-        self.video_configs().next().is_none() && self.audio_configs().next().is_none()
+    /// Every track in the catalog — known groups first, then any newer group
+    /// whose renditions carry a CMAF `container`.
+    pub fn tracks(&self) -> impl Iterator<Item = TrackRef<'_>> {
+        let video = self.video.iter().flat_map(|v| v.renditions.iter()).map(|(name, c)| TrackRef {
+            group: "video",
+            rendition: name,
+            track_id: c.track_id(),
+            timescale: c.timescale(),
+        });
+        let audio = self.audio.iter().flat_map(|a| a.renditions.iter()).map(|(name, c)| TrackRef {
+            group: "audio",
+            rendition: name,
+            track_id: c.track_id(),
+            timescale: c.timescale(),
+        });
+        let other = self.other.iter().flat_map(|(group, value)| {
+            group_renditions(value).into_iter().flatten().filter_map(move |(name, r)| {
+                let (track_id, timescale) = cmaf_container(r)?;
+                Some(TrackRef {
+                    group,
+                    rendition: name,
+                    track_id,
+                    timescale,
+                })
+            })
+        });
+        video.chain(audio).chain(other)
     }
 
-    /// Media timescale of the rendition carrying `track_id`, or `None` if no
-    /// rendition in this catalog has that id.
-    pub fn track_timescale(&self, track_id: u32) -> Option<u32> {
-        self.video_configs()
-            .find(|v| v.track_id() == track_id)
-            .map(|v| v.timescale())
-            .or_else(|| {
-                self.audio_configs()
-                    .find(|a| a.track_id() == track_id)
-                    .map(|a| a.timescale())
-            })
+    /// The track with `track_id`, from any group.
+    pub fn track(&self, track_id: u32) -> Option<TrackRef<'_>> {
+        self.tracks().find(|t| t.track_id == track_id)
     }
 
     /// Insert a video rendition, creating the `Video` wrapper if missing.
@@ -278,7 +341,9 @@ impl Catalog {
     /// `{type}{track_id}` naming invariant — relied on by
     /// [`crate::reader::aggregate_catalog`] (which keys by rendition name)
     /// and per-track init naming — is preserved. Renditions whose track_id
-    /// is absent from `map` are left untouched.
+    /// is absent from `map` are left untouched, as are groups in
+    /// [`Catalog::other`]: remapping applies to catalogs read from a `moov`,
+    /// which only ever holds known track types.
     ///
     /// Used when minting a fresh canonical segment at a chosen track id: e.g.
     /// giving a transcoded audio rendition a free id so it can be
@@ -314,10 +379,9 @@ impl Catalog {
     }
 
     /// Return a new catalog containing only the rendition whose `track_id`
-    /// matches. The matching rendition's wrapping `Video` or `Audio` is
-    /// retained (with its other-rendition entries stripped); the opposite
-    /// track-type wrapper is dropped entirely. If no rendition matches,
-    /// both wrappers are `None`.
+    /// matches. The group holding it is retained (with its other renditions
+    /// stripped); every other group is dropped. If no rendition matches, the
+    /// result is empty.
     pub fn filter_to_track(&self, track_id: u32) -> Catalog {
         let video = self.video.as_ref().and_then(|v| {
             let renditions: BTreeMap<String, VideoConfig> = v
@@ -350,7 +414,25 @@ impl Catalog {
                 Some(Audio { renditions })
             }
         });
-        Catalog { video, audio }
+        let other = self
+            .other
+            .iter()
+            .filter_map(|(key, group)| {
+                let Value::Map(g) = group else { return None };
+                let kept: BTreeMap<String, Value> = group_renditions(group)?
+                    .iter()
+                    .filter(|(_, r)| cmaf_container(r).is_some_and(|(tid, _)| tid == track_id))
+                    .map(|(name, r)| (name.clone(), r.clone()))
+                    .collect();
+                if kept.is_empty() {
+                    return None;
+                }
+                let mut g = g.clone();
+                g.insert("renditions".into(), Value::Map(kept));
+                Some((key.clone(), Value::Map(g)))
+            })
+            .collect();
+        Catalog { video, audio, other }
     }
 }
 
@@ -609,17 +691,40 @@ mod tests {
     }
 
     #[test]
-    fn hang_json_ignores_unknown_top_level_fields() {
-        // Hang catalogs carry extras like `location`, `user`, `chat`. MUXL
-        // doesn't use them but shouldn't error on their presence.
+    fn unknown_top_level_entries_round_trip_verbatim() {
+        // A newer track group (`text`) and Hang's non-track keys (`user`,
+        // `capabilities`) survive decode → re-encode byte-for-byte in DRISL,
+        // and the newer group's track is visible through `tracks()` while the
+        // non-track keys yield none.
         let json = r#"{
             "video": { "renditions": {} },
+            "text": { "renditions": { "text3": {
+                "format": "muxl-transcript", "lang": "en",
+                "container": { "kind": "cmaf", "timescale": 1000, "trackId": 3 }
+            } } },
             "user": { "name": "alice" },
             "capabilities": {}
         }"#;
         let catalog = from_hang_json(json).unwrap();
         assert!(catalog.video.is_some());
-        assert!(catalog.audio.is_none());
+        assert_eq!(catalog.other.keys().collect::<Vec<_>>(), ["capabilities", "text", "user"]);
+        let tracks: Vec<TrackRef> = catalog.tracks().collect();
+        assert_eq!(
+            tracks,
+            [TrackRef { group: "text", rendition: "text3", track_id: 3, timescale: 1000 }]
+        );
+        assert!(!tracks[0].is_known());
+
+        let drisl = to_drisl(&catalog).unwrap();
+        let decoded = from_drisl(&drisl).unwrap();
+        assert_eq!(decoded, catalog);
+        assert_eq!(to_drisl(&decoded).unwrap(), drisl);
+        assert_eq!(from_hang_json(&to_hang_json(&catalog).unwrap()).unwrap(), catalog);
+
+        let single = catalog.filter_to_track(3);
+        assert_eq!(single.tracks().map(|t| t.track_id).collect::<Vec<_>>(), [3]);
+        assert_eq!(single.other.keys().collect::<Vec<_>>(), ["text"]);
+        assert!(catalog.filter_to_track(9).other.is_empty());
     }
 
     #[test]

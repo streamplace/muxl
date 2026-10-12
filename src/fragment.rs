@@ -19,7 +19,7 @@ use mp4_atom::{
 
 use crate::catalog::Catalog;
 use crate::error::{Error, Result};
-use crate::init::{catalog_from_moov, read_moov};
+use crate::init::{catalog_from_moov_with_source_track_meta, read_moov};
 
 // ---------------------------------------------------------------------------
 // Shared: write a single-sample moof+mdat fragment
@@ -301,19 +301,22 @@ impl<R: Read> FMP4Reader<R> {
     /// Like [`FMP4Reader::new`], but relabels track ids: the catalog and every
     /// minted fragment are rewritten per `remap` (input id → output id).
     pub fn with_remap(
-        mut reader: R,
+        reader: R,
         remap: std::collections::BTreeMap<u32, u32>,
     ) -> Result<Self> {
+        Self::with_options(reader, crate::catalog::TrackOptions { remap, ..Default::default() })
+    }
+
+    /// Read with optional source metadata and explicit output audio metadata.
+    pub fn with_options(mut reader: R, options: crate::catalog::TrackOptions) -> Result<Self> {
         let moov = read_moov_streaming(&mut reader)?;
-        let mut catalog = catalog_from_moov(&moov)?;
-        if !remap.is_empty() {
-            catalog.remap_track_ids(&remap);
-        }
+        let mut catalog = catalog_from_moov_with_source_track_meta(&moov, options.source_track_meta)?;
+        options.apply(&mut catalog)?;
         Ok(FMP4Reader {
             reader,
             moov,
             catalog,
-            remap,
+            remap: options.remap,
             track_state: std::collections::HashMap::new(),
             pending: Vec::new(),
         })

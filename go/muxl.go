@@ -122,6 +122,7 @@ type CanonicalizeOption func(*canonicalizeConfig)
 
 type canonicalizeConfig struct {
 	trackRemap map[uint32]uint32
+	trackMeta  map[uint32]TrackMeta
 }
 
 // WithTrackRemap reassigns track IDs in the canonical output: each source
@@ -135,11 +136,26 @@ func WithTrackRemap(remap map[uint32]uint32) CanonicalizeOption {
 	return func(c *canonicalizeConfig) { c.trackRemap = remap }
 }
 
+// TrackMeta identifies an audio track's alternative group and human-readable
+// label. Zero/empty fields clear source metadata; IDs refer to output tracks
+// after any remapping. Metadata for unknown or non-audio tracks is an error.
+type TrackMeta struct {
+	AlternateGroup uint32
+	Label          string
+}
+
+// WithTrackMeta sets audio metadata in the canonical catalog and MP4 init.
+func WithTrackMeta(meta map[uint32]TrackMeta) CanonicalizeOption {
+	return func(c *canonicalizeConfig) { c.trackMeta = meta }
+}
+
 // SegmentEventsOption configures [Engine.SegmentEvents].
 type SegmentEventsOption func(*segmentEventsConfig)
 
 type segmentEventsConfig struct {
-	trackRemap map[uint32]uint32
+	trackRemap      map[uint32]uint32
+	trackMeta       map[uint32]TrackMeta
+	sourceTrackMeta bool
 }
 
 // WithSegmentTrackRemap relabels track IDs while segmenting: each source id
@@ -149,6 +165,18 @@ type segmentEventsConfig struct {
 // canonicalize pass. Source ids absent from the map are left as-is.
 func WithSegmentTrackRemap(remap map[uint32]uint32) SegmentEventsOption {
 	return func(c *segmentEventsConfig) { c.trackRemap = remap }
+}
+
+// WithSegmentTrackMeta sets audio metadata by output track ID, overriding
+// metadata read from the source when [WithSegmentSourceTrackMeta] is enabled.
+func WithSegmentTrackMeta(meta map[uint32]TrackMeta) SegmentEventsOption {
+	return func(c *segmentEventsConfig) { c.trackMeta = meta }
+}
+
+// WithSegmentSourceTrackMeta opts into reading source tkhd.alternate_group and
+// trak/udta/name. By default they are ignored because muxers disagree on them.
+func WithSegmentSourceTrackMeta() SegmentEventsOption {
+	return func(c *segmentEventsConfig) { c.sourceTrackMeta = true }
 }
 
 // SignerInput is the signing bundle for [Engine.SignSegment]. Exactly one of
@@ -183,6 +211,8 @@ type SignerInput struct {
 	WrapperManifest   []byte
 	WrapperManifestFn func() ([]byte, error)
 	Alg               string
+	// SourceTrackMeta opts into source audio groups and labels while signing.
+	SourceTrackMeta bool
 }
 
 // TranscodeInput is the signing bundle for [Engine.SignTranscode]. Exactly one
@@ -329,6 +359,8 @@ type AudioConfig struct {
 	Container        Container `cbor:"container"`
 	SampleRate       uint32    `cbor:"sampleRate"`
 	NumberOfChannels uint32    `cbor:"numberOfChannels"`
+	AlternateGroup   uint32    `cbor:"alternateGroup,omitempty"`
+	Label            string    `cbor:"label,omitempty"`
 }
 
 // Container is the tagged-union container descriptor. Kind is "cmaf" (the

@@ -74,6 +74,41 @@ So a reader that doesn't understand a group's type-specific fields still knows t
 
 A top-level entry without a `renditions` map (Hang's `location`, `user`, …) is not a track group; it is retained but describes no track. A segment catalog that fails to decode, or decodes to no track at all, remains an error.
 
+### Audio Track Metadata
+
+Audio rendition configs MAY include `alternateGroup` (unsigned 32-bit integer)
+and `label` (UTF-8 string). The JSON and DRISL keys are exactly `alternateGroup`
+and `label`. Unset fields MUST be omitted, not encoded as null, zero or an empty
+string; existing unlabeled catalogs, segments, init bytes and CIDs are unchanged.
+Zero groups and empty labels are normalized to unset when decoding catalogs
+and omitted when encoding, even if a caller supplies explicit zero/empty values.
+An empty label never produces a `trak/udta/name` box.
+
+Tracks with the same nonzero `alternateGroup` carry alternative encodings of
+the same content (e.g. AAC and Opus for one mix). Different groups are independent
+tracks that can be played together. `label` is the human-readable name, e.g.
+`Music`. A group must fit the 16-bit ISOBMFF `tkhd.alternate_group` field when
+synthesizing a presentation; larger values are an error, never truncated.
+
+Source `tkhd.alternate_group` and `trak/udta/name` are ignored by default:
+ffmpeg writes group 1 on all audio tracks, while GStreamer writes 0. Honoring
+that muxer noise by default would make canonical bytes muxer-dependent.
+`--source-track-meta` explicitly opts into copying nonzero source audio groups
+and nonempty UTF-8 names into the catalog. It is available on `catalog`,
+`segment` (including the path used by Go `Canonicalize`), `sign-segment` and
+`hls` (for its primary and sidecar inputs).
+
+Repeatable `--track-meta ID:GROUP:LABEL` sets metadata by **output** audio track
+ID, after `--remap-track`. GROUP may be empty (unset), and LABEL is everything
+after the second colon, including any further colons; an empty label is unset.
+Explicit metadata replaces both source fields. Unknown IDs and non-audio IDs
+are errors. Options omitted means no change to the previous canonical form.
+
+Go exposes `TrackMeta { AlternateGroup uint32; Label string }`,
+`WithSegmentTrackMeta(map[uint32]TrackMeta)`, `WithTrackMeta(map[uint32]TrackMeta)`,
+`WithSegmentSourceTrackMeta()` and `SignerInput.SourceTrackMeta`. Metadata map
+arguments are emitted in ascending track-ID order for determinism.
+
 ### Tamper Resistance
 
 Modifying the catalog or any fragment changes the canonical segment's bytes, which changes its CID. Detection at the muxl layer is by content-address comparison alone. Cryptographic provenance (proving _who_ generated the bytes, not just _that they are these specific bytes_) is added by the signing layer.
@@ -230,7 +265,23 @@ Sorted by track_id ascending. No udta, meta, or iods.
 - **creation_time**: 0
 - **modification_time**: 0
 - **duration**: 0
-- **matrix, width/height, layer, alternate_group, volume**: from track config
+- **matrix, width/height, layer, volume**: from track config
+- **alternate_group**: audio catalog `alternateGroup`, or 0 when unset; 0 for video
+
+#### trak/udta/name
+
+For an audio config with `label`, `trak/udta` contains exactly one `name` box.
+The `name` payload is the UTF-8 label bytes, with no version/flags, length field,
+language code or terminator. This is ffmpeg's track-title writing convention
+(`mov_write_track_metadata`), not the QuickTime movie metadata convention.
+ffmpeg's demuxer does not necessarily export this box as a stream `title`;
+round-trip verification reads it with muxl and `--source-track-meta`.
+Unlabeled tracks have no `udta`. No other source `udta` children are retained.
+
+These rules also apply to per-track init segments, flat headers, metafile header
+synthesis and unwrapped events. Those headers are synthesized from the segment
+catalogs, so their labels and groups survive storage-format conversion without
+requiring source-metadata opt-in to unwrap existing canonical segments.
 
 #### mdhd
 
@@ -318,7 +369,7 @@ Source `elst` patterns outside the leading-empty-edit shape — media-time offse
 
 The following are stripped entirely:
 
-- **udta**: tool tags are non-deterministic
+- **udta**: tool tags are non-deterministic; only catalog-derived audio `trak/udta/name` is emitted
 - **meta**: at moov and trak level
 - **free / skip**: padding boxes
 - **iods**: not needed

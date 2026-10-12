@@ -221,6 +221,8 @@ struct InspectArgs {
 struct SignSegmentArgs {
     #[command(flatten)]
     signing: SigningArgs,
+    #[command(flatten)]
+    tracks: muxl_cli::TrackArgs,
 }
 
 #[derive(clap::Args)]
@@ -357,13 +359,14 @@ pub fn cli_main() {
 
 fn cmd_sign_segment(args: SignSegmentArgs) -> Result<()> {
     let (signer, manifests) = args.signing.into_signer_and_manifests()?;
+    let options = args.tracks.into();
     let mut stdin = io::stdin().lock();
     let mut stdout = io::stdout().lock();
     match manifests {
         ManifestSource::Static { track, wrapper } => {
-            sign_segment_stream(&mut stdin, &mut stdout, &signer, &track, &wrapper)
+            sign_segment_stream(&mut stdin, &mut stdout, &signer, &track, &wrapper, options)
         }
-        ManifestSource::Host => sign_segment_stream_host(&mut stdin, &mut stdout, &signer),
+        ManifestSource::Host => sign_segment_stream_host(&mut stdin, &mut stdout, &signer, options),
     }
 }
 

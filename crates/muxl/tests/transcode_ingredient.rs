@@ -79,6 +79,7 @@ fn signed_source_segment() -> Vec<u8> {
         &signer(),
         MANIFEST,
         MANIFEST,
+        Default::default(),
     )
     .expect("sign_segment_stream");
 

@@ -42,6 +42,32 @@ All operations live behind the [`Engine`](muxl.go) interface, so the WASM
 backend can be swapped for a natively-linked Rust build later without touching
 callers.
 
+### Audio labels and alternative groups
+
+Audio catalogs expose `AudioConfig.AlternateGroup` and `AudioConfig.Label`.
+By default source MP4 groups/titles are ignored, preserving canonical bytes
+across muxers. Opt in with `WithSegmentSourceTrackMeta()` for `SegmentEvents`,
+or `SignerInput{SourceTrackMeta: true}` for `SignSegment`.
+
+To set metadata explicitly, use `WithSegmentTrackMeta` or `WithTrackMeta`
+(`Canonicalize`):
+
+```go
+meta := map[uint32]muxl.TrackMeta{
+    2: {AlternateGroup: 1, Label: "Full mix"},
+    3: {AlternateGroup: 2, Label: "Music"},
+}
+err = eng.SegmentEvents(ctx, fmp4Reader, events, muxl.WithSegmentTrackMeta(meta))
+canonical, err := eng.Canonicalize(ctx, mp4Bytes, muxl.WithTrackMeta(meta))
+```
+
+IDs refer to output audio tracks after any track remapping. Explicit entries
+replace source metadata; zero group/empty label clears the corresponding field.
+Unknown/non-audio IDs and groups that do not fit `tkhd`'s 16-bit field are errors.
+Catalog-derived groups and `trak/udta/name` labels survive wrap, unwrap and flat
+header synthesis. Reading the synthesized init back with
+`WithSegmentSourceTrackMeta()` recovers them.
+
 ### Transcode provenance
 
 `SignTranscode` signs a transcoded output segment so its C2PA manifest names the

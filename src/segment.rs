@@ -128,9 +128,18 @@ pub fn segment_fmp4<R: Read>(
 pub fn segment_fmp4_with_remap<R: Read>(
     reader: &mut R,
     remap: BTreeMap<u32, u32>,
+    on_gop: impl FnMut(GopSegment) -> Result<()>,
+) -> Result<Catalog> {
+    segment_fmp4_with_options(reader, crate::catalog::TrackOptions { remap, ..Default::default() }, on_gop)
+}
+
+/// Segment with remapping, opt-in source metadata, and explicit audio metadata.
+pub fn segment_fmp4_with_options<R: Read>(
+    reader: &mut R,
+    options: crate::catalog::TrackOptions,
     mut on_gop: impl FnMut(GopSegment) -> Result<()>,
 ) -> Result<Catalog> {
-    let mut fmp4 = FMP4Reader::with_remap(reader, remap)?;
+    let mut fmp4 = FMP4Reader::with_options(reader, options)?;
     let catalog = fmp4.catalog().clone();
 
     // Determine which track IDs are video (for keyframe detection)

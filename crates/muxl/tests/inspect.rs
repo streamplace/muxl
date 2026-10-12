@@ -89,6 +89,7 @@ fn signed_m4s_stream(fixture: &str) -> Vec<u8> {
         &signer,
         SEGMENT_MANIFEST,
         WRAPPER_MANIFEST,
+        Default::default(),
     )
     .expect("sign_segment_stream");
 

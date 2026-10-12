@@ -29,7 +29,7 @@ blake3 = "1"
 clap = { version = "4", features = ["derive"] }
 dasl = "0.2"
 hex = "0.4"
-mp4-atom = { git = "https://github.com/streamplace/mp4-atom.git", branch = "streamplace" }
+mp4-atom = { git = "https://github.com/streamplace/mp4-atom.git", branch = "opus55/udta-name" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_bytes = "0.11"

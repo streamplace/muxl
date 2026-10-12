@@ -31,6 +31,12 @@ pub fn catalog_from_mp4<RS: Read + Seek>(mut input: RS) -> Result<Catalog> {
 
 /// Extract a Catalog from an already-parsed Moov box.
 pub fn catalog_from_moov(moov: &Moov) -> Result<Catalog> {
+    catalog_from_moov_with_source_track_meta(moov, false)
+}
+
+/// Opt into source audio metadata; muxer-specific groups/titles are ignored
+/// by default so canonical bytes do not depend on the source muxer.
+pub fn catalog_from_moov_with_source_track_meta(moov: &Moov, source_track_meta: bool) -> Result<Catalog> {
     let mut catalog = Catalog::default();
 
     let mut traks: Vec<&Trak> = moov.trak.iter().collect();
@@ -47,7 +53,17 @@ pub fn catalog_from_moov(moov: &Moov) -> Result<Catalog> {
                 }
             }
             b"soun" => {
-                if let Some(config) = extract_audio_config(trak)? {
+                if let Some(mut config) = extract_audio_config(trak)? {
+                    if source_track_meta {
+                        config.alternate_group = (trak.tkhd.alternate_group != 0)
+                            .then_some(u32::from(trak.tkhd.alternate_group));
+                        if let Some(name) = trak.udta.as_ref().and_then(|u| u.name.as_ref())
+                            .filter(|n| !n.value.is_empty()) {
+                            config.label = Some(std::str::from_utf8(&name.value)
+                                .map_err(|e| Error::InvalidMp4(format!("invalid UTF-8 track label: {e}")))?
+                                .to_owned());
+                        }
+                    }
                     catalog.insert_audio(format!("audio{}", track_id), config);
                 }
             }
@@ -334,6 +350,8 @@ fn extract_audio_config(trak: &Trak) -> Result<Option<AudioConfig>> {
                     number_of_channels: opus.audio.channel_count as u32,
                     bitrate: None,
                     jitter: None,
+                    alternate_group: None,
+                    label: None,
                 }));
             }
             Codec::Mp4a(mp4a) => {
@@ -348,6 +366,8 @@ fn extract_audio_config(trak: &Trak) -> Result<Option<AudioConfig>> {
                     number_of_channels: mp4a.audio.channel_count as u32,
                     bitrate: None,
                     jitter: None,
+                    alternate_group: None,
+                    label: None,
                 }));
             }
             _ => continue,
@@ -528,7 +548,8 @@ pub(crate) fn build_audio_trak(config: &AudioConfig) -> Result<Trak> {
             track_id: config.track_id(),
             duration: 0,
             layer: 0,
-            alternate_group: 0,
+            alternate_group: u16::try_from(config.alternate_group.unwrap_or(0))
+                .map_err(|_| Error::InvalidMp4("alternate group out of tkhd range".into()))?,
             enabled: true,
             in_movie: true,
             in_preview: false,
@@ -565,7 +586,10 @@ pub(crate) fn build_audio_trak(config: &AudioConfig) -> Result<Trak> {
         },
         senc: None,
         tref: None,
-        udta: None,
+        udta: config.label.as_ref().filter(|label| !label.is_empty()).map(|label| mp4_atom::Udta {
+            name: Some(mp4_atom::TrackName { value: label.as_bytes().to_vec() }),
+            ..Default::default()
+        }),
     })
 }
 

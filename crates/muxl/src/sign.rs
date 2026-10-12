@@ -343,6 +343,7 @@ pub fn sign_segment_stream<R: Read, W: Write>(
     signer: &SignerKey,
     segment_manifest: &str,
     wrapper_manifest: &str,
+    options: muxl::catalog::TrackOptions,
 ) -> Result<()> {
     // Static path: pre-parse the manifest once and reuse the same base for every
     // GoP. Each per-segment clone still gets its own signing-time stamp.
@@ -351,7 +352,7 @@ pub fn sign_segment_stream<R: Read, W: Write>(
     let mut fetch_track = move || -> Result<serde_json::Value> { Ok(segment_base.clone()) };
     let wrapper = wrapper_manifest.to_owned();
     let mut fetch_wrapper = move || -> Result<String> { Ok(wrapper.clone()) };
-    sign_segment_stream_with(input, output, signer, &mut fetch_track, &mut fetch_wrapper)
+    sign_segment_stream_with(input, output, signer, &mut fetch_track, &mut fetch_wrapper, options)
 }
 
 /// Stream-sign an fMP4 source like [`sign_segment_stream`], but fetch a fresh
@@ -365,6 +366,7 @@ pub fn sign_segment_stream_host<R: Read, W: Write>(
     input: &mut R,
     output: &mut W,
     signer: &SignerKey,
+    options: muxl::catalog::TrackOptions,
 ) -> Result<()> {
     let mut fetch_track = || -> Result<serde_json::Value> {
         let json = host_get_manifest_callback(0).map_err(|e| {
@@ -379,7 +381,7 @@ pub fn sign_segment_stream_host<R: Read, W: Write>(
             Error::C2pa(c2pa::Error::BadParam(format!("host wrapper manifest: {e}")))
         })
     };
-    sign_segment_stream_with(input, output, signer, &mut fetch_track, &mut fetch_wrapper)
+    sign_segment_stream_with(input, output, signer, &mut fetch_track, &mut fetch_wrapper, options)
 }
 
 /// Shared streaming-sign loop. `next_track` and `next_wrapper` are invoked
@@ -391,10 +393,11 @@ fn sign_segment_stream_with<R: Read, W: Write>(
     signer: &SignerKey,
     next_track: &mut dyn FnMut() -> Result<serde_json::Value>,
     next_wrapper: &mut dyn FnMut() -> Result<String>,
+    options: muxl::catalog::TrackOptions,
 ) -> Result<()> {
     init_default_settings();
     let c2pa_signer = signer.build()?;
-    let mut segmenter = Segmenter::new();
+    let mut segmenter = Segmenter::with_options(options);
     let mut init_seen = false;
     let mut buf = [0u8; 64 * 1024];
 

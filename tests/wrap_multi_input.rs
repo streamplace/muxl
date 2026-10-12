@@ -244,7 +244,7 @@ fn segment_flat_accepts_flat_input_and_roundtrips() {
         fmp4: None,
         stdout: false,
         flat: Some(out.clone()),
-        remap_track: vec![],
+        tracks: Default::default(),
     })
     .unwrap();
 
@@ -275,7 +275,7 @@ fn segment_fmp4_interleaves_per_gop_not_per_track() {
         fmp4: Some(out.clone()),
         stdout: false,
         flat: None,
-        remap_track: vec![],
+        tracks: Default::default(),
     })
     .unwrap();
 
@@ -307,7 +307,7 @@ fn segment_fmp4_accepts_flat_input() {
         fmp4: Some(out.clone()),
         stdout: false,
         flat: None,
-        remap_track: vec![],
+        tracks: Default::default(),
     })
     .unwrap();
 
@@ -340,7 +340,7 @@ fn segment_fmp4_file_matches_streaming() {
         fmp4: Some(via_segment.clone()),
         stdout: false,
         flat: None,
-        remap_track: vec![],
+        tracks: Default::default(),
     })
     .unwrap();
 

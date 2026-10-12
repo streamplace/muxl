@@ -99,6 +99,7 @@ fn segment_stream_signs_each_gop() {
         &signer,
         SEGMENT_MANIFEST,
         WRAPPER_MANIFEST,
+        Default::default(),
     )
     .expect("sign_segment_stream");
     assert!(!output.is_empty(), "stream produced no output");

@@ -177,6 +177,51 @@ pub struct AudioConfig {
     pub bitrate: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub jitter: Option<u64>,
+    #[serde(skip_serializing_if = "alternate_group_unset", deserialize_with = "deserialize_alternate_group", default)]
+    pub alternate_group: Option<u32>,
+    #[serde(skip_serializing_if = "label_unset", deserialize_with = "deserialize_label", default)]
+    pub label: Option<String>,
+}
+
+fn alternate_group_unset(value: &Option<u32>) -> bool {
+    matches!(value, None | Some(0))
+}
+
+fn label_unset(value: &Option<String>) -> bool {
+    value.as_deref().unwrap_or_default().is_empty()
+}
+
+fn deserialize_alternate_group<'de, D: serde::Deserializer<'de>>(deserializer: D) -> std::result::Result<Option<u32>, D::Error> {
+    Option::<u32>::deserialize(deserializer).map(|value| value.filter(|group| *group != 0))
+}
+
+fn deserialize_label<'de, D: serde::Deserializer<'de>>(deserializer: D) -> std::result::Result<Option<String>, D::Error> {
+    Option::<String>::deserialize(deserializer).map(|value| value.filter(|label| !label.is_empty()))
+}
+
+/// Explicit audio metadata keyed by output track id (after remapping).
+/// Zero/empty fields clear source metadata.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TrackMeta {
+    pub alternate_group: u32,
+    pub label: String,
+}
+
+/// Catalog options shared by pull/push readers and canonicalization.
+#[derive(Debug, Clone, Default)]
+pub struct TrackOptions {
+    pub remap: BTreeMap<u32, u32>,
+    pub source_track_meta: bool,
+    pub track_meta: BTreeMap<u32, TrackMeta>,
+}
+
+impl TrackOptions {
+    pub(crate) fn apply(&self, catalog: &mut Catalog) -> Result<()> {
+        if !self.remap.is_empty() {
+            catalog.remap_track_ids(&self.remap);
+        }
+        catalog.set_track_meta(&self.track_meta)
+    }
 }
 
 /// Container / transport framing. MUXL only produces CMAF, but the
@@ -316,6 +361,20 @@ impl Catalog {
         self.tracks().find(|t| t.track_id == track_id)
     }
 
+    /// Apply explicit audio metadata after track-id remapping.
+    pub fn set_track_meta(&mut self, meta: &BTreeMap<u32, TrackMeta>) -> Result<()> {
+        for (&id, meta) in meta {
+            let audio = self.audio_configs_mut().find(|a| a.track_id() == id)
+                .ok_or_else(|| Error::InvalidMp4(format!("track metadata requires an audio track: {id}")))?;
+            // tkhd stores a 16-bit group; never silently truncate the catalog.
+            u16::try_from(meta.alternate_group)
+                .map_err(|_| Error::InvalidMp4(format!("alternate group out of tkhd range: {}", meta.alternate_group)))?;
+            audio.alternate_group = (meta.alternate_group != 0).then_some(meta.alternate_group);
+            audio.label = (!meta.label.is_empty()).then(|| meta.label.clone());
+        }
+        Ok(())
+    }
+
     /// Insert a video rendition, creating the `Video` wrapper if missing.
     pub fn insert_video(&mut self, name: impl Into<String>, config: VideoConfig) {
         let video = self.video.get_or_insert_with(|| Video {
@@ -444,9 +503,16 @@ impl Catalog {
 /// reading only the `moov` box. Cheaper than [`crate::read`] when you
 /// only need codec info — no per-sample plan is built.
 pub fn from_input<R: crate::io::ReadAt + ?Sized>(input: &R) -> Result<Catalog> {
+    from_input_with_options(input, &TrackOptions::default())
+}
+
+/// Extract a catalog with opt-in source audio metadata and explicit overrides.
+pub fn from_input_with_options<R: crate::io::ReadAt + ?Sized>(input: &R, options: &TrackOptions) -> Result<Catalog> {
     let mut cursor = crate::io::ReadAtCursor::new(input).map_err(Error::Io)?;
     let moov = crate::init::read_moov(&mut cursor)?;
-    crate::init::catalog_from_moov(&moov)
+    let mut catalog = crate::init::catalog_from_moov_with_source_track_meta(&moov, options.source_track_meta)?;
+    options.apply(&mut catalog)?;
+    Ok(catalog)
 }
 
 /// Extract the single-track catalog embedded in a MUXL canonical segment's
@@ -610,6 +676,8 @@ mod tests {
                 number_of_channels: 2,
                 bitrate: None,
                 jitter: None,
+                alternate_group: None,
+                label: None,
             },
         );
         c
@@ -742,6 +810,8 @@ mod tests {
                 number_of_channels: 2,
                 bitrate: None,
                 jitter: None,
+                alternate_group: None,
+                label: None,
             },
         );
         let drisl = to_drisl(&c).unwrap();
@@ -764,6 +834,8 @@ mod tests {
                 number_of_channels: 2,
                 bitrate: None,
                 jitter: None,
+                alternate_group: None,
+                label: None,
             },
         );
         let json = to_hang_json(&c).unwrap();

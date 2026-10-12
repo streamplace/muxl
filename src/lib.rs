@@ -24,7 +24,7 @@ mod wasm_io;
 pub use error::{Error, Result};
 pub use source::{Plan, Sample, Source, TrackPlan};
 pub use push::{Segmenter, SegmenterEvent};
-pub use segment::{GopSegment, Segment, segment_fmp4, segment_fmp4_with_remap};
+pub use segment::{GopSegment, Segment, segment_fmp4, segment_fmp4_with_remap, segment_fmp4_with_options};
 
 // Fragment primitives kept for power users (`Frame`, per-track directory
 // emitter, stats). The common fMP4 streaming reader now lives at

@@ -63,15 +63,28 @@ use crate::source::{Plan, Source};
 /// Read a flat MP4 into a [`Source`]. Auto-detects fMP4-bodied inputs and
 /// delegates to [`crate::fmp4::read`] for those.
 pub fn read<R: ReadAt + ?Sized>(input: &R) -> Result<Source> {
+    read_with_options(input, &crate::catalog::TrackOptions::default())
+}
+
+/// Read and canonicalize catalog metadata, applying overrides after remapping.
+pub fn read_with_options<R: ReadAt + ?Sized>(
+    input: &R,
+    options: &crate::catalog::TrackOptions,
+) -> Result<Source> {
     let (catalog, tracks) = if detect_is_fmp4(input)? {
-        plan_from_fmp4(input)?
+        plan_from_fmp4_with_source_track_meta(input, options.source_track_meta)?
     } else {
-        plan_from_flat_mp4(input)?
+        plan_from_flat_mp4_with_source_track_meta(input, options.source_track_meta)?
     };
-    Ok(Source {
+    let mut source = Source {
         catalog,
         plan: Plan::new(tracks),
-    })
+    };
+    if !options.remap.is_empty() {
+        source.remap_track_ids(&options.remap);
+    }
+    source.catalog.set_track_meta(&options.track_meta)?;
+    Ok(source)
 }
 
 /// Write a [`Source`] as a canonical MUXL flat MP4.
@@ -718,6 +731,13 @@ fn detect_is_fmp4<R: ReadAt + ?Sized>(input: &R) -> Result<bool> {
 pub fn plan_from_fmp4<R: ReadAt + ?Sized>(
     input: &R,
 ) -> Result<(Catalog, Vec<TrackPlan>)> {
+    plan_from_fmp4_with_source_track_meta(input, false)
+}
+
+fn plan_from_fmp4_with_source_track_meta<R: ReadAt + ?Sized>(
+    input: &R,
+    source_track_meta: bool,
+) -> Result<(Catalog, Vec<TrackPlan>)> {
     use mp4_atom::{Atom, FourCC, Header, Moof, ReadAtom, ReadFrom};
     use std::io::{Seek, SeekFrom};
 
@@ -726,7 +746,7 @@ pub fn plan_from_fmp4<R: ReadAt + ?Sized>(
 
     // Parse moov to get catalog + trex defaults.
     let moov = read_moov(&mut cursor)?;
-    let catalog = crate::init::catalog_from_moov(&moov)?;
+    let catalog = crate::init::catalog_from_moov_with_source_track_meta(&moov, source_track_meta)?;
     let video_ids: std::collections::HashSet<u32> =
         catalog.video_configs().map(|v| v.track_id()).collect();
 
@@ -877,9 +897,16 @@ pub fn plan_from_fmp4<R: ReadAt + ?Sized>(
 pub fn plan_from_flat_mp4<R: ReadAt + ?Sized>(
     input: &R,
 ) -> Result<(Catalog, Vec<TrackPlan>)> {
+    plan_from_flat_mp4_with_source_track_meta(input, false)
+}
+
+fn plan_from_flat_mp4_with_source_track_meta<R: ReadAt + ?Sized>(
+    input: &R,
+    source_track_meta: bool,
+) -> Result<(Catalog, Vec<TrackPlan>)> {
     let mut cursor = ReadAtCursor::new(input).map_err(Error::Io)?;
     let moov = read_moov(&mut cursor)?;
-    let catalog = crate::init::catalog_from_moov(&moov)?;
+    let catalog = crate::init::catalog_from_moov_with_source_track_meta(&moov, source_track_meta)?;
 
     let video_ids: std::collections::HashSet<u32> =
         catalog.video_configs().map(|v| v.track_id()).collect();

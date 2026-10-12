@@ -44,6 +44,8 @@ pub struct CatalogArgs {
     /// Machine-readable output format. Omit for a human-readable summary.
     #[arg(long, value_enum)]
     pub format: Option<CatalogFormat>,
+    #[command(flatten)]
+    pub tracks: TrackArgs,
 }
 
 /// Parse a `OLD:NEW` track-id remap pair for `--remap-track`.
@@ -60,6 +62,44 @@ fn parse_remap_pair(s: &str) -> std::result::Result<(u32, u32), String> {
         .parse::<u32>()
         .map_err(|e| format!("invalid target track id {:?}: {e}", new.trim()))?;
     Ok((old, new))
+}
+
+/// Parse ID:GROUP:LABEL, preserving all label bytes after the second colon.
+fn parse_track_meta(s: &str) -> std::result::Result<(u32, crate::catalog::TrackMeta), String> {
+    let mut parts = s.splitn(3, ':');
+    let id = parts.next().unwrap_or_default().parse::<u32>()
+        .map_err(|e| format!("invalid track id: {e}"))?;
+    let group = parts.next().ok_or("expected ID:GROUP:LABEL")?;
+    let label = parts.next().ok_or("expected ID:GROUP:LABEL")?;
+    let alternate_group = if group.is_empty() { 0 } else {
+        group.parse::<u32>().map_err(|e| format!("invalid alternate group: {e}"))?
+    };
+    Ok((id, crate::catalog::TrackMeta { alternate_group, label: label.into() }))
+}
+
+/// Shared catalog options for every source-MP4 canonicalization path.
+#[derive(Args, Default)]
+pub struct TrackArgs {
+    /// Relabel a source track id as OLD:NEW (repeatable).
+    #[arg(long = "remap-track", value_name = "OLD:NEW", value_parser = parse_remap_pair)]
+    pub remap_track: Vec<(u32, u32)>,
+    /// Read source audio alternate_group and trak/udta/name (normally ignored).
+    #[arg(long)]
+    pub source_track_meta: bool,
+    /// Override audio metadata by OUTPUT track id, after remapping (repeatable).
+    /// Empty GROUP/LABEL clears that field; LABEL may contain colons.
+    #[arg(long, value_name = "ID:GROUP:LABEL", value_parser = parse_track_meta)]
+    pub track_meta: Vec<(u32, crate::catalog::TrackMeta)>,
+}
+
+impl From<TrackArgs> for crate::catalog::TrackOptions {
+    fn from(args: TrackArgs) -> Self {
+        Self {
+            remap: args.remap_track.into_iter().collect(),
+            source_track_meta: args.source_track_meta,
+            track_meta: args.track_meta.into_iter().collect(),
+        }
+    }
 }
 
 #[derive(Args)]
@@ -86,12 +126,8 @@ pub struct SegmentArgs {
     /// or fragmented input — the one-shot "any MP4 → canonical flat MP4" path.
     #[arg(long, value_name = "FILE")]
     pub flat: Option<PathBuf>,
-    /// Relabel a track id in the output, given as `OLD:NEW` (repeatable). The
-    /// emitted catalog and every minted fragment are minted at the new id —
-    /// e.g. to give a transcoded rendition a free id so it concatenates
-    /// alongside the tracks it derives from without colliding.
-    #[arg(long = "remap-track", value_name = "OLD:NEW", value_parser = parse_remap_pair)]
-    pub remap_track: Vec<(u32, u32)>,
+    #[command(flatten)]
+    pub tracks: TrackArgs,
 }
 
 #[derive(Args)]
@@ -174,6 +210,9 @@ pub struct HlsArgs {
     /// Also generate static HLS playlists (master.m3u8, per-track media playlists).
     #[arg(long)]
     pub playlists: bool,
+    /// Read source audio alternate groups and labels for all input files.
+    #[arg(long)]
+    pub source_track_meta: bool,
 }
 
 #[derive(Args)]
@@ -205,11 +244,11 @@ pub struct FlatHeaderArgs {
 }
 
 pub fn cmd_catalog(args: CatalogArgs) -> crate::Result<()> {
-    let CatalogArgs { input, format } = args;
+    let CatalogArgs { input, format, tracks } = args;
     // Open with FileReadAt so arbitrarily-long inputs don't load into memory —
     // catalog extraction reads only the moov box.
     let input_reader = crate::io::FileReadAt::open(&input)?;
-    let catalog = crate::catalog::from_input(&input_reader)?;
+    let catalog = crate::catalog::from_input_with_options(&input_reader, &tracks.into())?;
 
     match format {
         Some(CatalogFormat::Drisl) => {
@@ -255,7 +294,7 @@ pub fn cmd_catalog(args: CatalogArgs) -> crate::Result<()> {
 }
 
 pub fn cmd_segment(args: SegmentArgs) -> crate::Result<()> {
-    let remap: std::collections::BTreeMap<u32, u32> = args.remap_track.into_iter().collect();
+    let options = args.tracks.into();
 
     // --flat and --fmp4 emit a single bounded presentation file. Given a
     // seekable input they read with random access — which builds the full
@@ -264,7 +303,7 @@ pub fn cmd_segment(args: SegmentArgs) -> crate::Result<()> {
     // further down take a plain Read (fragmented input only): that's the
     // live-ingest path, minting segments from chunks as they arrive.
     if let Some(flat_out) = &args.flat {
-        return cmd_segment_presentation(&args.input, flat_out, remap, Presentation::Flat);
+        return cmd_segment_presentation(&args.input, flat_out, options, Presentation::Flat);
     }
     // A seekable --fmp4 input takes the same random-access path: byte-identical
     // to the streaming segmenter for fragmented input, plus it handles flat.
@@ -272,7 +311,7 @@ pub fn cmd_segment(args: SegmentArgs) -> crate::Result<()> {
     // preserving live fMP4 minting from a pipe.
     if let Some(fmp4_out) = &args.fmp4 {
         if args.input != "-" {
-            return cmd_segment_presentation(&args.input, fmp4_out, remap, Presentation::Fmp4);
+            return cmd_segment_presentation(&args.input, fmp4_out, options, Presentation::Fmp4);
         }
     }
 
@@ -283,13 +322,13 @@ pub fn cmd_segment(args: SegmentArgs) -> crate::Result<()> {
     };
 
     if let Some(dir) = args.dir {
-        cmd_segment_dir(&mut input, &dir, remap)
+        cmd_segment_dir(&mut input, &dir, options)
     } else if let Some(file) = args.fmp4 {
         // Reached only for stdin (a seekable file took the random-access path
         // above): stream-segment the fragmented pipe into one fMP4.
-        cmd_segment_fmp4_stream(&mut input, &file, remap)
+        cmd_segment_fmp4_stream(&mut input, &file, options)
     } else if args.stdout {
-        cmd_segment_stdout(&mut input, remap)
+        cmd_segment_stdout(&mut input, options)
     } else {
         // clap's ArgGroup guarantees one mode is set; unreachable in practice.
         unreachable!("segment requires --dir, --fmp4, --stdout, or --flat")
@@ -316,7 +355,7 @@ enum Presentation {
 fn cmd_segment_presentation(
     input: &str,
     output: &Path,
-    remap: std::collections::BTreeMap<u32, u32>,
+    options: crate::catalog::TrackOptions,
     fmt: Presentation,
 ) -> crate::Result<()> {
     let sink: Box<dyn Write> = if output.as_os_str() == "-" {
@@ -342,10 +381,7 @@ fn cmd_segment_presentation(
         &file_reader
     };
 
-    let mut source = crate::read(reader)?;
-    if !remap.is_empty() {
-        source.remap_track_ids(&remap);
-    }
+    let source = crate::flat::read_with_options(reader, &options)?;
 
     let (label, tracks) = match fmt {
         Presentation::Flat => (
@@ -389,11 +425,11 @@ impl<W: Write> Write for CountingWriter<W> {
 fn cmd_segment_dir(
     input: &mut impl Read,
     output_dir: &Path,
-    remap: std::collections::BTreeMap<u32, u32>,
+    options: crate::catalog::TrackOptions,
 ) -> crate::Result<()> {
     fs::create_dir_all(output_dir)?;
 
-    let catalog = crate::segment_fmp4_with_remap(input, remap, |gop| {
+    let catalog = crate::segment_fmp4_with_options(input, options, |gop| {
         for (&track_id, data) in &gop.tracks {
             let track_dir = output_dir.join(format!("track{}", track_id));
             fs::create_dir_all(&track_dir)?;
@@ -425,11 +461,11 @@ fn cmd_segment_dir(
 /// Uses the push-based segmenter so init is emitted first (before segments).
 fn cmd_segment_stdout(
     input: &mut impl Read,
-    remap: std::collections::BTreeMap<u32, u32>,
+    options: crate::catalog::TrackOptions,
 ) -> crate::Result<()> {
     let mut stdout = io::stdout().lock();
     let mut buf = [0u8; 64 * 1024];
-    let mut segmenter = crate::Segmenter::with_remap(remap);
+    let mut segmenter = crate::Segmenter::with_options(options);
 
     loop {
         let n = input.read(&mut buf)?;
@@ -474,10 +510,12 @@ pub fn cmd_hls(args: HlsArgs) -> crate::Result<()> {
         output_dir,
         sidecars,
         playlists,
+        source_track_meta,
     } = args;
     let opts = crate::hls::HlsOpts {
         sidecars,
         write_playlists: playlists,
+        source_track_meta,
     };
     crate::hls::emit(&input, &output_dir, &opts)?;
     Ok(())
@@ -807,11 +845,11 @@ pub fn cmd_flat_header(args: FlatHeaderArgs) -> crate::Result<()> {
 fn cmd_segment_fmp4_stream(
     input: &mut impl Read,
     output_path: &Path,
-    remap: std::collections::BTreeMap<u32, u32>,
+    options: crate::catalog::TrackOptions,
 ) -> crate::Result<()> {
     let mut gops = Vec::new();
 
-    let catalog = crate::segment_fmp4_with_remap(input, remap, |gop| {
+    let catalog = crate::segment_fmp4_with_options(input, options, |gop| {
         let total: usize = gop.tracks.values().map(|d| d.len()).sum();
         eprintln!(
             "segment {:4}: {} tracks, {} bytes",
@@ -851,4 +889,34 @@ fn cmd_segment_fmp4_stream(
     );
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser;
+
+    #[derive(Parser)]
+    struct TrackCli {
+        #[command(flatten)]
+        tracks: TrackArgs,
+    }
+
+    #[test]
+    fn track_meta_parsing_preserves_label_and_empty_fields() {
+        let cli = TrackCli::try_parse_from([
+            "muxl", "--source-track-meta", "--remap-track", "2:9",
+            "--track-meta", "9::Music: 音楽", "--track-meta", "3:2:",
+        ]).unwrap();
+        let opts: crate::catalog::TrackOptions = cli.tracks.into();
+        assert!(opts.source_track_meta);
+        assert_eq!(opts.remap[&2], 9);
+        assert_eq!(opts.track_meta[&9].alternate_group, 0);
+        assert_eq!(opts.track_meta[&9].label, "Music: 音楽");
+        assert_eq!(opts.track_meta[&3].alternate_group, 2);
+        assert_eq!(opts.track_meta[&3].label, "");
+        for bad in ["2", "2:1", "bad:1:title", "2:bad:title"] {
+            assert!(TrackCli::try_parse_from(["muxl", "--track-meta", bad]).is_err());
+        }
+    }
 }

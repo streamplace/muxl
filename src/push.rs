@@ -29,7 +29,7 @@ use mp4_atom::{Header, Moof, Moov, ReadAtom, ReadFrom};
 use crate::catalog::Catalog;
 use crate::error::{Error, Result};
 use crate::fragment::{self, Frame};
-use crate::init::{build_init_segment, catalog_from_moov};
+use crate::init::{build_init_segment, catalog_from_moov_with_source_track_meta};
 use crate::segment::{GopSegment, TrackSamples, audio_only_boundary, flush_track_bufs, record_frame};
 
 /// Events emitted by the push-based segmenter.
@@ -53,9 +53,7 @@ pub enum SegmenterEvent {
 pub struct Segmenter {
     buffer: Vec<u8>,
     state: State,
-    /// Track-id remap (input id → output id) applied to the catalog and the
-    /// minted fragments. Empty = identity.
-    remap: BTreeMap<u32, u32>,
+    options: crate::catalog::TrackOptions,
 }
 
 enum State {
@@ -103,10 +101,15 @@ impl Segmenter {
     /// Like [`Segmenter::new`], but relabels track ids: the emitted catalog and
     /// every minted fragment are rewritten per `remap` (input id → output id).
     pub fn with_remap(remap: BTreeMap<u32, u32>) -> Self {
+        Self::with_options(crate::catalog::TrackOptions { remap, ..Default::default() })
+    }
+
+    /// Configure track remapping and optional audio groups/labels.
+    pub fn with_options(options: crate::catalog::TrackOptions) -> Self {
         Segmenter {
             buffer: Vec::new(),
             state: State::WaitingForInit,
-            remap,
+            options,
         }
     }
 
@@ -142,10 +145,8 @@ impl Segmenter {
                             .map_err(mp4_err)?
                             .ok_or_else(|| Error::InvalidMp4("empty moov header".into()))?;
                         let moov = Moov::read_atom(&header, &mut cursor).map_err(mp4_err)?;
-                        let mut catalog = catalog_from_moov(&moov)?;
-                        if !self.remap.is_empty() {
-                            catalog.remap_track_ids(&self.remap);
-                        }
+                        let mut catalog = catalog_from_moov_with_source_track_meta(&moov, self.options.source_track_meta)?;
+                        self.options.apply(&mut catalog)?;
                         let init_data = build_init_segment(&catalog)?;
 
                         let video_track_ids: HashSet<u32> =
@@ -178,7 +179,7 @@ impl Segmenter {
                             segment_number: 0,
                             seen_first_keyframe: false,
                             pending_moof: None,
-                            remap: self.remap.clone(),
+                            remap: self.options.remap.clone(),
                         });
                     }
                     // Skip ftyp, free, etc.

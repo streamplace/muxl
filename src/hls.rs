@@ -66,6 +66,8 @@ pub struct HlsOpts {
     /// Emit a master `.m3u8` plus per-track media playlists alongside
     /// the blob and JSON metadata.
     pub write_playlists: bool,
+    /// Opt into source audio alternate groups and trak/udta/name.
+    pub source_track_meta: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -80,7 +82,7 @@ pub fn emit(primary: &Path, output_dir: &Path, opts: &HlsOpts) -> Result<Vec<Blo
     fs::create_dir_all(output_dir)?;
     let blobs_dir = Some(output_dir);
 
-    let mut all_tracks: Vec<BlobTrack> = analyze_input(primary, blobs_dir)?;
+    let mut all_tracks: Vec<BlobTrack> = analyze_input(primary, blobs_dir, opts.source_track_meta)?;
     let primary_blob_cid = all_tracks
         .first()
         .map(|t| t.blob_cid.clone())
@@ -88,7 +90,7 @@ pub fn emit(primary: &Path, output_dir: &Path, opts: &HlsOpts) -> Result<Vec<Blo
     let primary_blob_size = all_tracks.first().map(|t| t.blob_size).unwrap_or(0);
 
     for sidecar in &opts.sidecars {
-        let sidecar_tracks = analyze_input(sidecar, blobs_dir)?;
+        let sidecar_tracks = analyze_input(sidecar, blobs_dir, opts.source_track_meta)?;
         all_tracks.extend(sidecar_tracks);
     }
 
@@ -163,17 +165,19 @@ struct TrackEntry {
 /// Canonicalize an input MP4 to flat form on disk, hash it for a blob
 /// CID, write the blob + per-track init segments into `blobs_dir`, and
 /// return per-track metadata.
-fn analyze_input(path: &Path, blobs_dir: Option<&Path>) -> Result<Vec<BlobTrack>> {
+fn analyze_input(path: &Path, blobs_dir: Option<&Path>, source_track_meta: bool) -> Result<Vec<BlobTrack>> {
     // Canonicalize to flat — single blob serves both "download as MP4"
     // and "HLS byte-range CMAF source".
     let tmp = tempfile::NamedTempFile::new()?;
-    let info = {
+    let (info, catalog) = {
         let input = FileReadAt::open(path)?;
-        let source = crate::read(&input)?;
+        let source = crate::flat::read_with_options(&input, &crate::catalog::TrackOptions {
+            source_track_meta, ..Default::default()
+        })?;
         let mut output = BufWriter::new(tmp.as_file());
         let info = crate::flat::write(&source, &input, &mut output)?;
         std::io::Write::flush(&mut output)?;
-        info
+        (info, source.catalog)
     };
 
     let blob_cid = cid::from_file(tmp.path())?;
@@ -186,13 +190,9 @@ fn analyze_input(path: &Path, blobs_dir: Option<&Path>) -> Result<Vec<BlobTrack>
         }
     }
 
-    // Extract the catalog from the canonical blob so init segments
-    // derive from the final form — idempotent regardless of input layout.
-    let blob_reader = FileReadAt::open(tmp.path())?;
-    let catalog = crate::catalog::from_input(&blob_reader)?;
+    // Use the canonical catalog directly; re-reading moov without opt-in would
+    // discard the intentional audio metadata before per-track init synthesis.
     let track_inits = crate::fmp4::init_segments_per_track(&catalog)?;
-    drop(blob_reader);
-
     let mut tracks: Vec<BlobTrack> = Vec::new();
     for (&tid, track_info) in &info.tracks {
         let segments = if track_info.is_video {

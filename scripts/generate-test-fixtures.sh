@@ -90,4 +90,13 @@ ffmpeg -y -f lavfi -i "$VSRC" -f lavfi -i "$ASRC" \
   -movflags +frag_keyframe+empty_moov+default_base_moof \
   "$OUTDIR/h264-opus-frag.mp4" 2>/dev/null
 
+# Two AAC alternatives with ffmpeg's raw trak/udta/name title metadata.
+echo "  aac-two-track-labeled-frag.mp4"
+ffmpeg -y -f lavfi -i "$ASRC" \
+  -f lavfi -i "sine=frequency=880:duration=2:sample_rate=48000" \
+  -map 0:a -map 1:a -t 2 -c:a aac \
+  -metadata:s:a:1 title=Music \
+  -movflags +frag_keyframe+empty_moov \
+  "$OUTDIR/aac-two-track-labeled-frag.mp4" 2>/dev/null
+
 echo "Done. Generated $(ls "$OUTDIR"/*.mp4 | wc -l) fixtures in $OUTDIR"

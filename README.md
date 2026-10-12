@@ -59,9 +59,22 @@ muxl segment input.fmp4 --fmp4 output.mp4
 # Stream CBOR events to stdout (for piping to other programs)
 muxl segment input.fmp4 --stdout
 
+# Preserve intentional audio groups and track titles from an OBS/ffmpeg source
+muxl segment input.fmp4 --stdout --source-track-meta
+
+# Set audio metadata explicitly by output track ID (after any remapping)
+muxl segment input.fmp4 --stdout --remap-track 2:9 --track-meta '9:2:Music'
+
 # Read from stdin
 cat input.fmp4 | muxl segment - --stdout
 ```
+
+Source audio `alternate_group` and `trak/udta/name` are normally ignored because
+muxers disagree on their defaults. `--source-track-meta` opts in on `catalog`,
+`segment`, `sign-segment` and `hls`. Explicit `--track-meta ID:GROUP:LABEL` entries
+replace source metadata; empty group/label clears that field. Labels and groups
+are carried in each segment's catalog and synthesized into every presentation
+init/header. See [the canonical form specification](spec/canonical-form.md#audio-track-metadata).
 
 ## Library
 
